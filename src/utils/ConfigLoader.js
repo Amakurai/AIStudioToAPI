@@ -9,6 +9,33 @@ const fs = require("fs");
 const path = require("path");
 const { getProxySummaryFromEnv } = require("./ProxyUtils");
 
+const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/d31dbffc-6199-4f09-9da5-45de7684ab8a";
+
+function parseAiStudioAppUrl(value) {
+    const rawValue = String(value || "").trim();
+    if (!rawValue) return null;
+
+    try {
+        const url = new URL(rawValue);
+        const pathSegments = url.pathname.split("/").filter(Boolean);
+        if (
+            url.protocol !== "https:" ||
+            url.hostname !== "ai.studio" ||
+            url.username ||
+            url.password ||
+            url.search ||
+            url.hash ||
+            pathSegments.length !== 2 ||
+            pathSegments[0] !== "apps"
+        ) {
+            return null;
+        }
+        return `https://ai.studio/apps/${pathSegments[1]}`;
+    } catch {
+        return null;
+    }
+}
+
 /**
  * Configuration Loader Module
  * Responsible for loading system configuration from environment variables
@@ -20,6 +47,7 @@ class ConfigLoader {
 
     loadConfiguration() {
         const config = {
+            aiStudioAppUrl: DEFAULT_AI_STUDIO_APP_URL,
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
@@ -47,6 +75,17 @@ class ConfigLoader {
         };
 
         // Environment variable overrides
+        if (process.env.AI_STUDIO_APP_URL) {
+            const aiStudioAppUrl = parseAiStudioAppUrl(process.env.AI_STUDIO_APP_URL);
+            if (aiStudioAppUrl) {
+                config.aiStudioAppUrl = aiStudioAppUrl;
+            } else {
+                this.logger.warn(
+                    `[Config] Invalid AI_STUDIO_APP_URL "${process.env.AI_STUDIO_APP_URL}". ` +
+                        `Expected https://ai.studio/apps/<app-id>; using the default app.`
+                );
+            }
+        }
         if (process.env.PORT) {
             const parsed = parseInt(process.env.PORT, 10);
             config.httpPort = Number.isFinite(parsed) ? parsed : config.httpPort;
@@ -202,6 +241,7 @@ class ConfigLoader {
         this.logger.info("================ [ Active Configuration ] ================");
         this.logger.info(`  HTTP Server Port: ${config.httpPort}`);
         this.logger.info(`  Listening Address: ${config.host}`);
+        this.logger.info(`  AI Studio App URL: ${config.aiStudioAppUrl}`);
         this.logger.info(`  Streaming Mode: ${config.streamingMode}`);
         this.logger.info(`  Stream Timeout: ${config.streamTimeoutMs}ms`);
         this.logger.info(`  Fake/Non-Stream Timeout: ${config.fakeStreamTimeoutMs}ms`);

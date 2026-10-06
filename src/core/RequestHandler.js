@@ -4439,12 +4439,16 @@ class RequestHandler {
         // Pre-process native Google requests
         // 1. Ensure thoughtSignature for functionCall (not functionResponse)
         // 2. Sanitize tools (remove unsupported fields, convert type to uppercase)
+        // 3. Normalize responseSchema type values to Google Type enums
         if (req.method === "POST" && bodyObj) {
             if (bodyObj.contents) {
                 this.formatConverter.ensureThoughtSignature(bodyObj);
             }
             if (bodyObj.tools) {
                 this.formatConverter.sanitizeGeminiTools(bodyObj);
+            }
+            if (bodyObj.generationConfig?.responseSchema) {
+                this.formatConverter.normalizeGeminiResponseSchema(bodyObj);
             }
         }
 

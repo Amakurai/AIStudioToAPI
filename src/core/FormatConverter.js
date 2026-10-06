@@ -317,19 +317,16 @@ class FormatConverter {
     }
 
     /**
-     * Sanitize tools in native Gemini requests by removing unsupported JSON Schema fields
-     * like $schema and additionalProperties
+     * Normalize schema type values in native Gemini tool declarations.
      * @param {object} geminiBody - Gemini format request body
-     * @returns {object} - Modified request body with sanitized tools
+     * @returns {object} - Modified request body with normalized tool schema types
      */
     sanitizeGeminiTools(geminiBody) {
         if (!geminiBody || !geminiBody.tools || !Array.isArray(geminiBody.tools)) {
             return geminiBody;
         }
 
-        // Helper function to recursively sanitize schema:
-        // 1. Remove unsupported fields ($schema, additionalProperties)
-        // 2. Convert lowercase type to uppercase (object -> OBJECT, string -> STRING, etc.)
+        // Convert lowercase type values to Google Type enums recursively.
         const sanitizeSchema = obj => {
             if (!obj || typeof obj !== "object") return obj;
 
@@ -364,6 +361,40 @@ class FormatConverter {
             }
         }
 
+        return geminiBody;
+    }
+
+    /**
+     * Normalize type values in a native Gemini responseSchema to Google's Type enum values.
+     * @param {object} geminiBody - Gemini format request body
+     * @returns {object} - Modified request body with normalized responseSchema types
+     */
+    normalizeGeminiResponseSchema(geminiBody) {
+        const responseSchema = geminiBody?.generationConfig?.responseSchema;
+        if (!responseSchema || typeof responseSchema !== "object") {
+            return geminiBody;
+        }
+
+        const normalizeSchemaTypes = schema => {
+            if (!schema || typeof schema !== "object") {
+                return;
+            }
+
+            if (Array.isArray(schema)) {
+                schema.forEach(normalizeSchemaTypes);
+                return;
+            }
+
+            for (const [key, value] of Object.entries(schema)) {
+                if (key === "type" && typeof value === "string") {
+                    schema[key] = value.toUpperCase();
+                } else if (value && typeof value === "object") {
+                    normalizeSchemaTypes(value);
+                }
+            }
+        };
+
+        normalizeSchemaTypes(responseSchema);
         return geminiBody;
     }
 

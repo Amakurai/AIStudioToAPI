@@ -430,6 +430,19 @@ class RequestProcessor {
         return removedCount;
     }
 
+    _removeStructuredOutputConfig(bodyObj) {
+        const generationConfig = bodyObj.generationConfig;
+        if (!generationConfig) {
+            return;
+        }
+
+        ["responseMimeType", "responseSchema", "responseJsonSchema", "responseFormat"].forEach(key => {
+            if (Object.prototype.hasOwnProperty.call(generationConfig, key)) {
+                delete generationConfig[key];
+            }
+        });
+    }
+
     _buildRequestConfig(requestSpec, signal) {
         const config = {
             headers: this._sanitizeHeaders(requestSpec.headers, requestSpec),
@@ -467,12 +480,7 @@ class RequestProcessor {
                         if (bodyObj.systemInstruction) {
                             delete bodyObj.systemInstruction;
                         }
-                        if (bodyObj.generationConfig?.responseMimeType) {
-                            delete bodyObj.generationConfig.responseMimeType;
-                        }
-                        if (bodyObj.generationConfig?.responseJsonSchema) {
-                            delete bodyObj.generationConfig.responseJsonSchema;
-                        }
+                        this._removeStructuredOutputConfig(bodyObj);
                     }
 
                     // --- Module 1.5: responseModalities Handling ---
@@ -523,12 +531,7 @@ class RequestProcessor {
                         }
                     }
                     if (isImageModel || isComputerUseModel || isRoboticsModel) {
-                        if (bodyObj.generationConfig?.responseMimeType) {
-                            delete bodyObj.generationConfig.responseMimeType;
-                        }
-                        if (bodyObj.generationConfig?.responseJsonSchema) {
-                            delete bodyObj.generationConfig.responseJsonSchema;
-                        }
+                        this._removeStructuredOutputConfig(bodyObj);
                     }
                     if (isComputerUseModel || isRoboticsModel) {
                         if (bodyObj.generationConfig?.responseModalities) {

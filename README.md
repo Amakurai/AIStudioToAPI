@@ -274,6 +274,7 @@ services:
 | `IMMEDIATE_SWITCH_STATUS_CODES` | 触发立即切换帐户的 HTTP 状态码（逗号分隔，设为空值以禁用）。                                                                                                        | `429,503` |
 | `RATE_LIMIT_COOLDOWN_MS` | 429 后已换下账号重新参与分发前的间隔（毫秒，必须为正数）。有可用账号时立即换号重试，不等待此间隔。 | `60000` |
 | `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
+| `AI_STUDIO_APP_URL`             | 要打开的 AI Studio 应用地址（可选），格式为 `https://ai.studio/apps/<应用 ID>`；留空时使用内置应用。[教程](docs/zh/create-ai-studio-app.md)                         | 内置应用  |
 | `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |
 | `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
 | `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |

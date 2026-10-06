@@ -381,7 +381,7 @@
         },
         {
             "name": "models/gemini-3.8-flash",
-            "version": "3.8-flash-09-2026",
+            "version": "3.0",
             "displayName": "Gemini 3.8 Flash",
             "description": "Gemini 3.8 Flash",
             "inputTokenLimit": 1048576,
@@ -535,7 +535,7 @@
         },
         {
             "name": "models/gemini-3.8-flash-抗截断",
-            "version": "3.8-flash-09-2026",
+            "version": "3.0",
             "displayName": "Gemini 3.8 Flash 抗截断",
             "description": "Suffix-enabled bidirectional tool text transport with bounded continuation and repair. Ordinary text output by default; text-only, no client tools.",
             "inputTokenLimit": 1048576,
