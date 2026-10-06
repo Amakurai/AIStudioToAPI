@@ -5,6 +5,7 @@
  * Author: Ellinav, iBenzene, bbbugg
  */
 
+const AntiTruncation = require("./AntiTruncation");
 const axios = require("axios");
 const mime = require("mime-types");
 
@@ -1004,6 +1005,7 @@ class FormatConverter {
             }
         }
 
+        this._applyTrailingUserTurnGuard(googleRequest, cleanModelName);
         this._finalizeGoogleRequest(googleRequest, {
             forceCodeExecution: modelForceCodeExecution,
             forceWebSearch: modelForceWebSearch,
@@ -1103,6 +1105,32 @@ class FormatConverter {
         googleRequest.safetySettings = this.getDefaultSafetySettings();
 
         this.logger.debug(`[Adapter] Debug: Final Gemini Request = ${JSON.stringify(googleRequest, null, 2)}`);
+    }
+
+    /**
+     * Gemini 3.6+ Flash rejects requests whose final content is a model turn.
+     * OpenAI/Claude histories can legitimately end with the previous assistant
+     * response (or a function response), so add a minimal user turn to make the
+     * next generation turn explicit. Older models retain their previous behavior.
+     * @param {object} googleRequest Gemini request body
+     * @param {string} model Clean Gemini model name
+     * @private
+     */
+    _applyTrailingUserTurnGuard(googleRequest, model) {
+        if (!googleRequest || !Array.isArray(googleRequest.contents)) return;
+        const modelLower = (AntiTruncation.baseModel(model) || String(model || "")).toLowerCase();
+        if (!["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"].includes(modelLower)) return;
+        if (googleRequest.contents.length === 0) return;
+
+        const last = googleRequest.contents[googleRequest.contents.length - 1];
+        if (!last || typeof last !== "object") return;
+        const role = String(last.role || "").toLowerCase();
+        const parts = Array.isArray(last.parts) ? last.parts : [];
+        const hasFunctionTurn = parts.some(part => part && (part.functionCall || part.functionResponse));
+        if (role !== "user" || hasFunctionTurn) {
+            googleRequest.contents.push({ parts: [{ text: "\n" }], role: "user" });
+            this.logger.debug(`[Adapter] Added trailing user turn for ${model} compatibility.`);
+        }
     }
 
     /**
@@ -1259,7 +1287,7 @@ class FormatConverter {
             if (streamState.hasFunctionCall) {
                 finishReason = "tool_calls";
             } else {
-                finishReason = this._mapFinishReason(candidate.finishReason);
+                finishReason = this._mapFinishReason(candidate.finishReason, modelName);
             }
 
             const finalResponse = {
@@ -1507,9 +1535,9 @@ class FormatConverter {
             });
         };
 
-        const finalizeMessageItem = () => {
+        const finalizeMessageItem = (status = "completed") => {
             if (!streamState.messageItem) return;
-            if (streamState.messageItem.status === "completed") return;
+            if (streamState.messageItem.status !== "in_progress") return;
 
             const itemId = streamState.messageItem.id;
             const outputIndex = streamState.messageItem.output_index;
@@ -1544,11 +1572,11 @@ class FormatConverter {
                 ],
                 id: itemId,
                 role: "assistant",
-                status: "completed",
+                status,
                 type: "message",
             };
 
-            streamState.messageItem.status = "completed";
+            streamState.messageItem.status = status;
             streamState.messageItem.content = completedItem.content;
 
             streamState.outputItemsByIndex[outputIndex] = completedItem;
@@ -1709,8 +1737,9 @@ class FormatConverter {
 
             // Completion
             if (candidate.finishReason && !streamState.completed) {
+                const incompleteReason = this._antiTruncationIncompleteReason(candidate, modelName);
                 finalizeReasoningItem();
-                finalizeMessageItem();
+                finalizeMessageItem(incompleteReason ? "incomplete" : "completed");
 
                 const usage = streamState.usage || {
                     completion_tokens: 0,
@@ -1733,11 +1762,12 @@ class FormatConverter {
                 const completedAt = Math.floor(Date.now() / 1000);
                 const finalOutput = (streamState.outputItemsByIndex || []).filter(Boolean);
 
-                pushEvent("response.completed", {
+                pushEvent(incompleteReason ? "response.incomplete" : "response.completed", {
                     response: buildResponseObject({
-                        completed_at: completedAt,
+                        completed_at: incompleteReason ? null : completedAt,
+                        incomplete_details: incompleteReason ? { reason: incompleteReason } : null,
                         output: finalOutput,
-                        status: "completed",
+                        status: incompleteReason ? "incomplete" : "completed",
                         usage: responseUsage,
                     }),
                 });
@@ -1859,7 +1889,7 @@ class FormatConverter {
         if (tool_calls.length > 0) {
             finishReason = "tool_calls";
         } else {
-            finishReason = this._mapFinishReason(candidate.finishReason);
+            finishReason = this._mapFinishReason(candidate.finishReason, modelName);
         }
 
         return {
@@ -1898,6 +1928,7 @@ class FormatConverter {
         }
 
         const candidate = googleResponse.candidates?.[0];
+        const incompleteReason = this._antiTruncationIncompleteReason(candidate, modelName);
 
         if (!candidate) {
             this.logger.warn("[Adapter] No candidate found in Google response");
@@ -2011,7 +2042,7 @@ class FormatConverter {
                 ],
                 id: `msg_${this._generateRequestId()}`,
                 role: "assistant",
-                status: "completed",
+                status: incompleteReason ? "incomplete" : "completed",
                 type: "message",
             });
         }
@@ -2020,11 +2051,11 @@ class FormatConverter {
         const usage = this._parseUsage(googleResponse);
 
         return {
-            completed_at: Math.floor(Date.now() / 1000),
+            completed_at: incompleteReason ? null : Math.floor(Date.now() / 1000),
             created_at: Math.floor(Date.now() / 1000),
             error: null,
             id: `resp_${this._generateRequestId()}`,
-            incomplete_details: null,
+            incomplete_details: incompleteReason ? { reason: incompleteReason } : null,
             instructions: null,
             max_output_tokens: null,
             metadata: {},
@@ -2037,7 +2068,7 @@ class FormatConverter {
                 summary: null,
             },
             service_tier: "default",
-            status: "completed",
+            status: incompleteReason ? "incomplete" : "completed",
             temperature: 1.0,
             text: {
                 format: {
@@ -2065,12 +2096,22 @@ class FormatConverter {
         };
     }
 
+    _antiTruncationIncompleteReason(candidate, modelName) {
+        if (!AntiTruncation.baseModel(modelName)) return null;
+        if (candidate?.finishReason === "MAX_TOKENS") return "max_output_tokens";
+        if (AntiTruncation.BLOCKED_FINISH_REASONS.includes(candidate?.finishReason)) return "content_filter";
+        return null;
+    }
+
     /**
      * Map Gemini finishReason to OpenAI format
      * @param {string} geminiReason - Gemini finish reason
      * @returns {string} - OpenAI finish reason
      */
-    _mapFinishReason(geminiReason) {
+    _mapFinishReason(geminiReason, modelName = null) {
+        if (AntiTruncation.baseModel(modelName) && AntiTruncation.BLOCKED_FINISH_REASONS.includes(geminiReason)) {
+            return "content_filter";
+        }
         const reasonMap = {
             max_tokens: "length",
             other: "stop",
@@ -2658,6 +2699,7 @@ class FormatConverter {
             );
         }
 
+        this._applyTrailingUserTurnGuard(googleRequest, cleanModelName);
         this._finalizeGoogleRequest(googleRequest, {
             forceCodeExecution: modelForceCodeExecution,
             forceWebSearch: modelForceWebSearch,
@@ -3558,6 +3600,7 @@ class FormatConverter {
             }
         }
 
+        this._applyTrailingUserTurnGuard(googleRequest, cleanModelName);
         this._finalizeGoogleRequest(googleRequest, {
             forceCodeExecution: modelForceCodeExecution,
             forceWebSearch: modelForceWebSearch,

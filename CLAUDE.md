@@ -63,7 +63,8 @@ The system follows a modular architecture with clear separation of concerns:
 **BrowserManager** (`src/core/BrowserManager.js`)
 
 - Manages headless Firefox/Camoufox browser instances
-- Implements multi-context architecture: maintains a pool of browser contexts (Map: authIndex -> {context, page, healthMonitorInterval})
+- Implements multi-context architecture: maintains a pool of browser contexts (Map: authIndex -> {context, page, healthMonitorInterval, noButtonCount, wakeupRunning})
+- Runs per-context background services (health monitor + Launch/Rocket wakeup) so every pool account stays ready, not just the current account
 - Handles context switching between different Google accounts
 - Injects and manages the client-side script (`build.js`) that communicates with AI Studio
 - Supports background context initialization and rebalancing

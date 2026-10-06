@@ -43,6 +43,8 @@ server {
 
         # Disable buffering to support streaming responses
         proxy_buffering off;
+        # Preserve the application's buffering control for outer proxies
+        proxy_pass_header X-Accel-Buffering;
 
 	    # WebSocket support (required to access VNC)
         proxy_http_version 1.1;
@@ -69,6 +71,8 @@ sudo systemctl restart nginx
 
 ### 🌐 Multi-layer Proxy Configuration
 
+Every proxy must forward SSE promptly. Nginx hides upstream `X-Accel-*` response headers by default, so an outer proxy can buffer opening frames and heartbeats even when the inner proxy has buffering disabled. Use `proxy_pass_header X-Accel-Buffering;` to preserve the application's `X-Accel-Buffering: no`, and configure `proxy_buffering off;` at each layer. Verify through the public URL used by the client: opening frames and heartbeats must arrive before the generated body.
+
 **⚠ Important**: If using multiple Nginx proxies (e.g., Client -> Public Gateway -> Internal Gateway -> App), only use `proxy_set_header X-Real-IP $remote_addr` at the **outermost public-facing gateway**, inner proxies should use `$http_x_real_ip` to pass through, which **should NOT override** `X-Real-IP`:
 
 ```nginx
@@ -91,6 +95,7 @@ location / {
 
     # Disable buffering
     proxy_buffering off;
+    proxy_pass_header X-Accel-Buffering;
 
 	# WebSocket support (required to access VNC)
     proxy_http_version 1.1;

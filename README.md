@@ -272,10 +272,13 @@ services:
 | `SWITCH_ON_USES`                | 自动切换帐户前允许的请求次数（设为 `0` 禁用）。                                                                                                                     | `40`      |
 | `FAILURE_THRESHOLD`             | 切换帐户前允许的连续失败次数（设为 `0` 禁用）。                                                                                                                     | `3`       |
 | `IMMEDIATE_SWITCH_STATUS_CODES` | 触发立即切换帐户的 HTTP 状态码（逗号分隔，设为空值以禁用）。                                                                                                        | `429,503` |
+| `RATE_LIMIT_COOLDOWN_MS` | 429 后已换下账号重新参与分发前的间隔（毫秒，必须为正数）。有可用账号时立即换号重试，不等待此间隔。 | `60000` |
 | `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
 | `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |
 | `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
 | `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |
+
+普通模型和抗截断模型遇到 429 时，都会替换实际处理请求的账号，并从分发池中移出该限流账号、补入备用账号。抗截断只重试失败的当前一轮，保留已确认的输出和续写历史。每轮不会重复尝试同一账号；所有可用账号均失败后返回原错误。
 
 #### 🗒️ 其他配置
 
@@ -358,4 +361,16 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 如果你觉得 AIStudioToAPI 对你有帮助，欢迎给项目点一个 ⭐️！
 
-[![Star History Chart](https://api.star-history.com/svg?repos=iBUHub/AIStudioToAPI&type=date&legend=top-left)](https://www.star-history.com/#iBUHub/AIStudioToAPI&type=date&legend=top-left)
+## Star History
+
+<a href="https://star-history.dera.page/#iBUHub/AIStudioToAPI">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+ </picture>
+</a>
+
+### 抗截断模型
+
+直接选择 `gemini-3.7-flash-抗截断` 或 `gemini-3.8-flash-抗截断`，即自动启用工具输出抗截断：原始对话直接发送，模型通过工具按序交付正文，未完成时有限续写；单段完整回答可在一次上游调用内完成。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。

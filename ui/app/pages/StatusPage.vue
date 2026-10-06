@@ -833,6 +833,12 @@
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
                                         </span>
+                                        <span v-if="item.isReady" class="ready-badge">
+                                            {{ t("tagDispatchReady") }}
+                                        </span>
+                                        <span v-if="item.inFlightRequests > 0" class="inflight-badge">
+                                            {{ t("inFlightRequests") }}: {{ item.inFlightRequests }}
+                                        </span>
                                     </div>
                                 </el-tooltip>
                                 <div class="account-actions">
@@ -1581,6 +1587,46 @@
                                         :value="option.value"
                                     />
                                 </el-select>
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        style="margin-right: 6px; vertical-align: middle"
+                                    >
+                                        <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
+                                        <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
+                                    </svg>
+                                    <span>
+                                        {{ t("maxContexts") }}
+                                        <EnvVarTooltip env-var="MAX_CONTEXTS" doc-section="proxy-config" />
+                                        <span
+                                            style="
+                                                font-size: 0.8em;
+                                                color: var(--text-secondary);
+                                                font-weight: normal;
+                                                margin-left: 4px;
+                                            "
+                                            >({{ t("maxContextsHint") }})</span
+                                        >
+                                    </span>
+                                </span>
+                                <el-input-number
+                                    v-model="state.maxContexts"
+                                    :min="0"
+                                    :step="1"
+                                    step-strictly
+                                    style="width: 150px"
+                                    @change="handleMaxContextsChange"
+                                />
                             </div>
                         </div>
                     </div>
@@ -4263,6 +4309,34 @@ const handleSafetySettingsThresholdChange = async val => {
     }
 };
 
+const handleMaxContextsChange = async val => {
+    // Revert to server value when input is cleared or invalid
+    if (!Number.isInteger(val) || val < 0) {
+        updateContent();
+        return;
+    }
+
+    try {
+        const res = await fetch("/api/settings/max-contexts", {
+            body: JSON.stringify({ value: val }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+            ElMessage.success(t(data.message, { setting: t("maxContexts"), value: val }));
+            updateContent();
+        } else {
+            ElMessage.error(t(data.message || "settingFailed", { message: data.error || "" }));
+            updateContent();
+        }
+    } catch (err) {
+        ElMessage.error(t("settingFailed", { message: err.message || err }));
+        updateContent();
+    }
+};
+
 const handleLanguageChange = lang => {
     I18n.setLang(lang);
     state.currentLang = lang;
@@ -5534,6 +5608,28 @@ watchEffect(() => {
     font-size: 0.75rem;
     padding: 2px 8px;
     background: @error-color;
+    color: @text-on-primary;
+    border-radius: 12px;
+    flex-shrink: 0;
+    margin-left: 0;
+    margin-right: 6px;
+}
+
+.ready-badge {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    background: @primary-color;
+    color: @text-on-primary;
+    border-radius: 12px;
+    flex-shrink: 0;
+    margin-left: 0;
+    margin-right: 6px;
+}
+
+.inflight-badge {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    background: @warning-color;
     color: @text-on-primary;
     border-radius: 12px;
     flex-shrink: 0;

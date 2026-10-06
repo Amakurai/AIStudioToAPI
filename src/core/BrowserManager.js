@@ -47,6 +47,7 @@ class BrowserManager {
         this.abortedContexts = new Set(); // Indices that should be aborted during background init
         this._backgroundPreloadTask = null; // Current background preload task promise (only one at a time)
         this._backgroundPreloadAbort = false; // Flag to signal background task to abort
+        this._backgroundPreloadGeneration = 0; // Invalidates pending starts when refills overlap or are cancelled
 
         // Legacy single context references (for backward compatibility)
         this.context = null;
@@ -66,12 +67,9 @@ class BrowserManager {
         this._isSystemBusyProvider = null;
         this.pendingContextClosures = new Map();
 
-        // Background wakeup service status (instance-level, tracks this.page)
-        // Prevents multiple BackgroundWakeup instances from running simultaneously
-        this.backgroundWakeupRunning = false;
-
-        // Added for background wakeup logic from new core
-        this.noButtonCount = 0;
+        // Background wakeup state is tracked per context (contextData.wakeupRunning and
+        // contextData.noButtonCount), so every pool account gets its own wakeup loop
+        // instead of only the currently selected account.
 
         // WebSocket initialization state per context - prevents cross-contamination
         // between concurrent init/reconnect operations on different accounts
@@ -218,6 +216,9 @@ class BrowserManager {
     }
 
     _throwIfContextInitAborted(authIndex, isBackgroundTask = false, logPrefix = null, action = "Context init") {
+        if (isBackgroundTask && this.authSource.isAccountCoolingDown(authIndex)) {
+            throw new ContextAbortedError(authIndex, "account is cooling down");
+        }
         if (this.abortedContexts.has(authIndex)) {
             if (logPrefix) {
                 this.logger.info(`${logPrefix} ${action} aborted (context marked for deletion)`);
@@ -512,9 +513,16 @@ class BrowserManager {
      * Used to force wake up the Launch detection when a request comes in
      */
     notifyUserActivity() {
-        if (this.noButtonCount > 0) {
+        // Wake up every context's wakeup loop (multi-account dispatch)
+        let wokeAny = false;
+        for (const contextData of this.contexts.values()) {
+            if (contextData.noButtonCount > 0) {
+                contextData.noButtonCount = 0;
+                wokeAny = true;
+            }
+        }
+        if (wokeAny) {
             this.logger.info("[Browser] ⚡ User activity detected, forcing Launch detection wakeup...");
-            this.noButtonCount = 0;
         }
     }
 
@@ -774,9 +782,12 @@ class BrowserManager {
         this.context = ctx;
         this.page = pg;
         this._currentAuthIndex = authIndex;
-        this.noButtonCount = 0;
-        this._startHealthMonitor();
-        this._startBackgroundWakeup();
+        const contextData = this.contexts.get(authIndex);
+        if (contextData) {
+            contextData.noButtonCount = 0;
+        }
+        this._startHealthMonitor(authIndex);
+        this._startBackgroundWakeup(authIndex);
         this._sendActiveTrigger("[Browser]", pg);
     }
 
@@ -925,10 +936,11 @@ class BrowserManager {
     /**
      * Feature: Background Health Monitor (The "Scavenger")
      * Periodically cleans up popups and keeps the session alive.
-     * In multi-context mode, stores the interval in the context data.
+     * Runs per context: every pool account gets its own monitor so non-current
+     * accounts stay ready to serve multi-account dispatch.
+     * @param {number} authIndex - The account whose context should be monitored
      */
-    _startHealthMonitor() {
-        const authIndex = this._currentAuthIndex;
+    _startHealthMonitor(authIndex = this._currentAuthIndex) {
         if (authIndex < 0) {
             this.logger.warn("[Browser] Cannot start health monitor: no active auth index");
             return;
@@ -953,13 +965,6 @@ class BrowserManager {
         // Run every 4 seconds
         contextData.healthMonitorInterval = setInterval(async () => {
             try {
-                // Check if this is still the current active account
-                // This prevents background contexts from running healthMonitor unnecessarily
-                if (this._currentAuthIndex !== authIndex) {
-                    // Silently skip - this context is not active
-                    return;
-                }
-
                 const page = contextData.page;
                 // Double check page status
                 if (!page || page.isClosed()) {
@@ -1116,44 +1121,59 @@ class BrowserManager {
     /**
      * Feature: Background Wakeup & "Launch" Button Handler
      * Specifically handles the "Rocket/Launch" button which blocks model loading.
-     * This service is bound to this.page (instance-level), not individual contexts.
-     * Only one instance should run at a time, tracking the current active page.
+     * Runs one loop per context so every pool account stays awake and can serve
+     * multi-account dispatch, not just the currently selected account.
+     * @param {number} authIndex - The account whose context should be kept awake
      */
-    async _startBackgroundWakeup() {
-        // Prevent multiple instances from running simultaneously
-        if (this.backgroundWakeupRunning) {
-            this.logger.info("[Browser] BackgroundWakeup already running, skipping duplicate start.");
+    async _startBackgroundWakeup(authIndex = this._currentAuthIndex) {
+        if (authIndex < 0) {
+            this.logger.warn("[Browser] Cannot start background wakeup: no active auth index");
             return;
         }
 
-        this.logger.debug("[Browser] Starting BackgroundWakeup initialization...");
-        this.backgroundWakeupRunning = true;
+        const contextData = this.contexts.get(authIndex);
+        if (!contextData || !contextData.page) {
+            this.logger.warn(`[Browser] Cannot start background wakeup: context #${authIndex} not found`);
+            return;
+        }
+
+        // Prevent multiple instances for the same context
+        if (contextData.wakeupRunning) {
+            this.logger.info(`[Context#${authIndex}] BackgroundWakeup already running, skipping duplicate start.`);
+            return;
+        }
+
+        this.logger.debug(`[Context#${authIndex}] Starting BackgroundWakeup initialization...`);
+        contextData.wakeupRunning = true;
+
+        const currentPage = contextData.page;
 
         // Initial buffer - wait before starting the main loop to let page stabilize
         await new Promise(r => setTimeout(r, 1500));
 
         // Verify page is still valid after the initial delay
         try {
-            if (!this.page || this.page.isClosed()) {
-                this.backgroundWakeupRunning = false;
+            if (currentPage.isClosed() || this.contexts.get(authIndex) !== contextData) {
+                contextData.wakeupRunning = false;
                 this.logger.info(
-                    "[Browser] BackgroundWakeup stopped: page became null or closed during startup delay."
+                    `[Context#${authIndex}] BackgroundWakeup stopped: page closed or context replaced during startup delay.`
                 );
                 return;
             }
         } catch (error) {
-            this.backgroundWakeupRunning = false;
-            this.logger.warn(`[Browser] BackgroundWakeup stopped: error checking page status: ${error.message}`);
+            contextData.wakeupRunning = false;
+            this.logger.warn(
+                `[Context#${authIndex}] BackgroundWakeup stopped: error checking page status: ${error.message}`
+            );
             return;
         }
 
-        this.logger.info("[Browser] 🛡️ Background Wakeup Service (Rocket Handler) started...");
+        this.logger.info(`[Context#${authIndex}] 🛡️ Background Wakeup Service (Rocket Handler) started...`);
 
-        // Main loop: directly use this.page, automatically follows context switches
-        while (this.page && !this.page.isClosed()) {
+        // Main loop: bound to this context's own page; exits when the page is closed
+        // or the context has been removed/replaced
+        while (this.contexts.get(authIndex) === contextData && !currentPage.isClosed()) {
             try {
-                const currentPage = this.page; // Capture for this iteration
-
                 // 1. Force page wake-up
                 await currentPage.bringToFront().catch(() => {});
 
@@ -1233,7 +1253,9 @@ class BrowserManager {
 
                 // 3. Execute Click if found
                 if (targetInfo.found) {
-                    this.logger.info(`[Browser] 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`);
+                    this.logger.info(
+                        `[Context#${authIndex}] 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`
+                    );
 
                     // Physical Click
                     await currentPage.mouse.move(targetInfo.x, targetInfo.y, { steps: 5 });
@@ -1242,7 +1264,7 @@ class BrowserManager {
                     await new Promise(r => setTimeout(r, 400));
                     await currentPage.mouse.up();
 
-                    this.logger.info(`[Browser] 🖱️ Physical click executed. Verifying...`);
+                    this.logger.info(`[Context#${authIndex}] 🖱️ Physical click executed. Verifying...`);
                     await new Promise(r => setTimeout(r, 1500));
 
                     // Strategy B: JS Click (Fallback)
@@ -1258,7 +1280,9 @@ class BrowserManager {
                     });
 
                     if (isStillThere) {
-                        this.logger.warn(`[Browser] ⚠️ Physical click ineffective, attempting JS force click...`);
+                        this.logger.warn(
+                            `[Context#${authIndex}] ⚠️ Physical click ineffective, attempting JS force click...`
+                        );
                         await currentPage.evaluate(() => {
                             const candidates = Array.from(
                                 // eslint-disable-next-line no-undef
@@ -1274,23 +1298,23 @@ class BrowserManager {
                         });
                         await new Promise(r => setTimeout(r, 2000));
                     } else {
-                        this.logger.info(`[Browser] ✅ Click successful, button disappeared.`);
-                        // Long sleep on success, but check for context switches every second
+                        this.logger.info(`[Context#${authIndex}] ✅ Click successful, button disappeared.`);
+                        // Long sleep on success, but check for user activity every second
                         for (let i = 0; i < 60; i++) {
-                            if (this.noButtonCount === 0) {
-                                this.logger.info(`[Browser] ⚡ Woken up early due to user activity or context switch.`);
+                            if (contextData.noButtonCount === 0) {
+                                this.logger.info(`[Context#${authIndex}] ⚡ Woken up early due to user activity.`);
                                 break; // Wake up early if user activity detected
                             }
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     }
                 } else {
-                    this.noButtonCount++;
+                    contextData.noButtonCount++;
                     // Smart Sleep
-                    if (this.noButtonCount > 20) {
+                    if (contextData.noButtonCount > 20) {
                         // Long sleep, but check for user activity
                         for (let i = 0; i < 30; i++) {
-                            if (this.noButtonCount === 0) break; // Woken up by request
+                            if (contextData.noButtonCount === 0) break; // Woken up by request
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     } else {
@@ -1304,15 +1328,15 @@ class BrowserManager {
         }
 
         // Reset flag when loop exits
-        this.backgroundWakeupRunning = false;
+        contextData.wakeupRunning = false;
 
         // Log the reason for stopping
-        if (!this.page) {
-            this.logger.info("[Browser] Background Wakeup Service stopped: this.page is null.");
-        } else if (this.page.isClosed()) {
-            this.logger.info("[Browser] Background Wakeup Service stopped: this.page was closed.");
+        if (currentPage.isClosed()) {
+            this.logger.info(`[Context#${authIndex}] Background Wakeup Service stopped: page was closed.`);
         } else {
-            this.logger.info("[Browser] Background Wakeup Service stopped: unknown reason.");
+            this.logger.info(
+                `[Context#${authIndex}] Background Wakeup Service stopped: context was removed or replaced.`
+            );
         }
     }
 
@@ -1378,6 +1402,7 @@ class BrowserManager {
      * @returns {Promise<{firstReady: number|null}>}
      */
     async preloadContextPool(startupOrder, maxContexts) {
+        startupOrder = startupOrder.filter(index => !this.authSource.isAccountCoolingDown(index));
         const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
         this.logger.info(
             `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${startupOrder.join(", ")}])...`
@@ -1396,6 +1421,7 @@ class BrowserManager {
 
         for (let i = 0; i < startupOrder.length; i++) {
             const authIndex = startupOrder[i];
+            if (this.authSource.isAccountCoolingDown(authIndex)) continue;
 
             // If already initialized, use it directly
             if (this.contexts.has(authIndex)) {
@@ -1408,6 +1434,7 @@ class BrowserManager {
             if (this.initializingContexts.has(authIndex)) {
                 this.logger.info(`[ContextPool] Context #${authIndex} being initialized, waiting...`);
                 await this._waitForContextInit(authIndex);
+                if (this.authSource.isAccountCoolingDown(authIndex)) continue;
                 if (this.contexts.has(authIndex)) {
                     this.logger.info(`[ContextPool] Context #${authIndex} initialized successfully, reusing`);
                     firstReady = authIndex;
@@ -1421,6 +1448,10 @@ class BrowserManager {
             try {
                 this.logger.info(`[ContextPool] Initializing context #${authIndex}...`);
                 await this._initializeContext(authIndex);
+                if (this.authSource.isAccountCoolingDown(authIndex)) {
+                    await this._closeContextForPoolIfPossible(authIndex, "startup_account_cooling_down");
+                    continue;
+                }
                 firstReady = authIndex;
                 this.logger.info(`✅ [ContextPool] First context #${authIndex} ready.`);
                 break;
@@ -1444,7 +1475,7 @@ class BrowserManager {
 
         // Background: calculate remaining contexts using rotation order (same logic as rebalanceContextPool)
         // This ensures startup pool matches the rotation order used during account switching
-        const rotation = this.authSource.getRotationIndices();
+        const rotation = this.authSource.getAvailableRotationIndices();
         const currentCanonical = this.authSource.getCanonicalIndex(firstReady);
         const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
         const ordered = [];
@@ -1520,7 +1551,10 @@ class BrowserManager {
      * This is a public method that encapsulates access to internal preload state
      * @returns {Promise<void>} Resolves when the background task has been aborted and cleaned up
      */
-    async abortBackgroundPreload() {
+    async abortBackgroundPreload({ preserveScheduledStart = false } = {}) {
+        if (!preserveScheduledStart) {
+            this._backgroundPreloadGeneration++;
+        }
         if (!this._backgroundPreloadTask) {
             return; // No task to abort
         }
@@ -1545,8 +1579,12 @@ class BrowserManager {
      * @param {number} maxPoolSize - Stop when this.contexts.size reaches this limit (0 = no limit)
      */
     async _preloadBackgroundContexts(indices, maxPoolSize = 0) {
+        const generation = ++this._backgroundPreloadGeneration;
         // If there's an existing background task, abort it and wait for it to finish
-        await this.abortBackgroundPreload();
+        await this.abortBackgroundPreload({ preserveScheduledStart: true });
+        // Only the newest refill may start. A foreground abort invalidates queued starts too,
+        // preventing an untracked initializer from racing account switching after cleanup.
+        if (generation !== this._backgroundPreloadGeneration) return;
 
         // Reset abort flag and create new background task
         this._backgroundPreloadAbort = false;
@@ -1572,6 +1610,17 @@ class BrowserManager {
             return this.connectionRegistry.hasMessageQueueForAuth(authIndex);
         }
         return false;
+    }
+
+    _hasPoolCapacity(maxPoolSize) {
+        if (maxPoolSize === 0) return true;
+        const occupied = new Set([...this.contexts.keys(), ...this.initializingContexts]);
+        // Keep in-flight work alive while loading replacements, with a strict 2x ceiling.
+        // Only cooling, retired contexts borrow this temporary draining allowance.
+        const draining = [...occupied].filter(
+            index => this.pendingContextClosures.has(index) && this.authSource.isAccountCoolingDown(index)
+        ).length;
+        return occupied.size - draining < maxPoolSize && occupied.size < maxPoolSize * 2;
     }
 
     _cancelPendingContextClosure(authIndex, reason = "closure_cancelled") {
@@ -1615,7 +1664,7 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex) {
+        if (authIndex === this._currentAuthIndex && !this.authSource.isAccountCoolingDown(authIndex)) {
             this.logger.debug(
                 `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
             );
@@ -1689,6 +1738,8 @@ class BrowserManager {
                 break;
             }
 
+            if (this.authSource.isAccountCoolingDown(authIndex)) continue;
+
             // Check if browser is available, launch if needed
             if (!this.browser) {
                 this.logger.info(`[ContextPool] Browser not available, launching browser for background preload...`);
@@ -1704,7 +1755,7 @@ class BrowserManager {
             }
 
             // Check pool size limit
-            if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
+            if (!this._hasPoolCapacity(maxPoolSize)) {
                 this.logger.info(`[ContextPool] Pool size limit reached, stopping preload`);
                 break;
             }
@@ -1810,7 +1861,7 @@ class BrowserManager {
         // Priority 2: Expired accounts (not the target if target is expired)
         // Priority 3: Accounts in rotation, ordered by distance from target (farthest first)
 
-        const rotation = this.authSource.getRotationIndices();
+        const rotation = this.authSource.getAvailableRotationIndices();
         const targetCanonical = this.authSource.getCanonicalIndex(targetAuthIndex);
         const duplicateGroups = this.authSource.getDuplicateGroups();
         const expiredIndices = this.authSource.expiredIndices || [];
@@ -1853,6 +1904,13 @@ class BrowserManager {
 
         // Build removal priority list
         const removalPriority = [];
+
+        // Cooling accounts should leave the dispatch pool as soon as their queues drain.
+        for (const idx of allContextIndices) {
+            if (idx !== targetAuthIndex && this.authSource.isAccountCoolingDown(idx)) {
+                removalPriority.push(idx);
+            }
+        }
 
         // Special case: If target is an old duplicate, prioritize removing its canonical version
         // Because we're about to create the old duplicate, and they're the same account
@@ -1910,6 +1968,10 @@ class BrowserManager {
             this._scheduleContextClosureWhenIdle(entry.authIndex, "pre_cleanup_for_switch");
         }
 
+        if (this.contexts.size + this.initializingContexts.size >= maxContexts * 2) {
+            throw new Error("Context pool is waiting for in-flight requests to drain before another switch.");
+        }
+
         if (toDefer.length > 0) {
             this.logger.warn(
                 `[ContextPool] Allowing temporary MAX_CONTEXTS overflow while busy contexts drain before switch to #${targetAuthIndex}.`
@@ -1927,7 +1989,7 @@ class BrowserManager {
         const isUnlimited = maxContexts === 0;
 
         // Build full rotation ordered from current account
-        const rotation = this.authSource.getRotationIndices();
+        const rotation = this.authSource.getAvailableRotationIndices();
         const currentCanonical =
             this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
         const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
@@ -1941,7 +2003,9 @@ class BrowserManager {
         let targets;
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
-            const nonExpiredAvailable = this.authSource.availableIndices.filter(idx => !this.authSource.isExpired(idx));
+            const nonExpiredAvailable = this.authSource.availableIndices.filter(
+                idx => !this.authSource.isExpired(idx) && !this.authSource.isAccountCoolingDown(idx)
+            );
             targets = new Set(nonExpiredAvailable);
         } else {
             targets = new Set(ordered.slice(0, maxContexts));
@@ -1951,7 +2015,7 @@ class BrowserManager {
             this._cancelPendingContextClosure(idx, "rebalance_target");
         }
 
-        // Remove contexts not in targets (except current)
+        // Remove contexts not in targets, preserving only an eligible current account.
         // Special handling: if current account is a duplicate (old version), also remove its canonical version
         // BUT only in limited mode - in unlimited mode, keep all contexts
         const toRemove = [];
@@ -1962,8 +2026,7 @@ class BrowserManager {
             currentCanonicalIndex !== this._currentAuthIndex;
 
         for (const idx of this.contexts.keys()) {
-            // Skip current account
-            if (idx === this._currentAuthIndex) continue;
+            if (idx === this._currentAuthIndex && !this.authSource.isAccountCoolingDown(idx)) continue;
 
             // If current is a duplicate AND we're in limited mode, remove the canonical version (we're using the old one)
             if (!isUnlimited && isDuplicateAccount && idx === currentCanonicalIndex) {
@@ -2007,8 +2070,7 @@ class BrowserManager {
         }
 
         // Preload candidates if ready and initializing contexts still leave room in the pool
-        const poolOccupancy = this.contexts.size + this.initializingContexts.size;
-        if (candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
+        if (candidates.length > 0 && this._hasPoolCapacity(maxContexts)) {
             this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
         }
     }
@@ -2191,14 +2253,24 @@ class BrowserManager {
                 this.contexts.set(authIndex, {
                     context,
                     healthMonitorInterval: null,
+                    noButtonCount: 0,
                     page,
+                    wakeupRunning: false,
                 });
             } else {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
 
+            // Start per-context background services (health monitor + wakeup) so every
+            // pool account stays alive for multi-account dispatch, not just the current one
+            this._startHealthMonitor(authIndex);
+            this._startBackgroundWakeup(authIndex).catch(e => {
+                this.logger.warn(`[Context#${authIndex}] BackgroundWakeup exited with error: ${e.message}`);
+            });
+
             // Update auth file
             await this._updateAuthFile(authIndex);
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             return { context, page };
         } catch (error) {
@@ -2424,9 +2496,8 @@ class BrowserManager {
             this.context = null;
             this.page = null;
             this._currentAuthIndex = -1;
-            // DO NOT reset backgroundWakeupRunning here!
-            // If a BackgroundWakeup was running, it will detect this.page === null and exit on its own.
-            // Resetting the flag here could allow a new instance to start before the old one exits.
+            // The per-context wakeup loop detects the closed page / removed context
+            // and exits on its own - no flag to reset here.
 
             throw error;
         }
@@ -2542,9 +2613,12 @@ class BrowserManager {
             // Restart background tasks only if this is the current account
             if (isCurrentAccount) {
                 // Reset BackgroundWakeup state after reconnect
-                this.noButtonCount = 0;
-                this._startHealthMonitor();
-                this._startBackgroundWakeup(); // Internal check prevents duplicate instances
+                const contextData = this.contexts.get(targetAuthIndex);
+                if (contextData) {
+                    contextData.noButtonCount = 0;
+                }
+                this._startHealthMonitor(targetAuthIndex);
+                this._startBackgroundWakeup(targetAuthIndex); // Internal check prevents duplicate instances
             }
 
             return true;
@@ -2581,6 +2655,18 @@ class BrowserManager {
         }
     }
 
+    _canCloseEmptyBrowser() {
+        // A detached anti-truncation parent still owns an in-flight request while switching accounts.
+        // Keep the browser alive for its replacement context, including ordinary account switches.
+        return (
+            this.contexts.size === 0 &&
+            this.initializingContexts.size === 0 &&
+            this.browser &&
+            !this._isSystemBusy() &&
+            !(this.connectionRegistry?.messageQueues?.size > 0)
+        );
+    }
+
     /**
      * Close a single context for a specific account
      *
@@ -2610,7 +2696,7 @@ class BrowserManager {
             // Context doesn't exist (was never initialized or was aborted)
             // Still check if we need to close the browser
             // Only close if there are no contexts AND no contexts being initialized
-            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
+            if (this._canCloseEmptyBrowser()) {
                 this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
                 await this.closeBrowser();
             }
@@ -2648,9 +2734,8 @@ class BrowserManager {
             this.context = null;
             this.page = null;
             this._currentAuthIndex = -1;
-            // DO NOT reset backgroundWakeupRunning here!
-            // If a BackgroundWakeup was running, it will detect this.page === null and exit on its own.
-            // Resetting the flag here could allow a new instance to start before the old one exits.
+            // The per-context wakeup loop detects the removed context / closed page
+            // and exits on its own - no flag to reset here.
             this.logger.debug(`[Browser] Current context was closed, currentAuthIndex reset to -1.`);
         }
 
@@ -2667,7 +2752,7 @@ class BrowserManager {
         // If this was the last context, close the browser to free resources
         // This ensures a clean state when all accounts are deleted
         // Only close if there are no contexts AND no contexts being initialized
-        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
+        if (this._canCloseEmptyBrowser()) {
             this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
             await this.closeBrowser();
         }
@@ -2696,9 +2781,8 @@ class BrowserManager {
         this.context = null;
         this.page = null;
         this._currentAuthIndex = -1;
-        // DO NOT reset backgroundWakeupRunning here!
-        // If a BackgroundWakeup was running, it will detect this.page === null and exit on its own.
-        // Resetting the flag here could allow a new instance to start before the old one exits.
+        // Per-context wakeup loops detect the cleared contexts map / closed pages
+        // and exit on their own - no flag to reset here.
     }
 
     /**

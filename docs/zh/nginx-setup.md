@@ -42,6 +42,8 @@ server {
 
         # 禁用缓冲区以支持流式响应
         proxy_buffering off;
+        # 将应用的禁缓冲响应头继续传给外层代理
+        proxy_pass_header X-Accel-Buffering;
 
 	    # WebSocket 支持（访问 VNC 时需要）
         proxy_http_version 1.1;
@@ -68,6 +70,8 @@ sudo systemctl restart nginx
 
 ### 🌐 多层代理配置
 
+SSE 必须在每层代理中及时转发。Nginx 默认不向客户端透传上游的 `X-Accel-*` 响应头；即使内层已关闭缓冲，外层仍可能把起始帧和心跳扣到正文生成完成。使用 `proxy_pass_header X-Accel-Buffering;` 透传应用的 `X-Accel-Buffering: no`，并在每层配置 `proxy_buffering off;`。验证时应请求客户端实际使用的公网地址，检查正文到达前是否已收到 SSE 起始帧和心跳。
+
 **⚠ 重要**：如果使用多层 Nginx 代理（例如：客户端 -> 公网网关 -> 内网网关 -> 应用），仅在 **最外层公网入口** 使用 `proxy_set_header X-Real-IP $remote_addr` 即可，内层代理使用 `$http_x_real_ip` 透传，**不应覆盖** `X-Real-IP`：
 
 ```nginx
@@ -90,6 +94,7 @@ location / {
 
     # 禁用缓冲区
     proxy_buffering off;
+    proxy_pass_header X-Accel-Buffering;
 
 	# WebSocket 支持（访问 VNC 时需要）
     proxy_http_version 1.1;

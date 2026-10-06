@@ -270,10 +270,13 @@ Usage:
 | `SWITCH_ON_USES`                | Number of requests before automatically switching accounts (`0` to disable).                                                                                                                                                                                          | `40`      |
 | `FAILURE_THRESHOLD`             | Number of consecutive failures before switching accounts (`0` to disable).                                                                                                                                                                                            | `3`       |
 | `IMMEDIATE_SWITCH_STATUS_CODES` | HTTP status codes that trigger immediate account switching (comma-separated, set to empty to disable).                                                                                                                                                                | `429,503` |
+| `RATE_LIMIT_COOLDOWN_MS` | Delay in milliseconds before a replaced, rate-limited account becomes eligible again (positive values only). Requests retry immediately on an available account. | `60000` |
 | `MAX_CONTEXTS`                  | Maximum number of accounts that can be logged in simultaneously. Accounts logged in simultaneously can switch faster without re-login. Higher values consume more memory (approx: 1 account ~700MB, 2 accounts ~950MB, 3 accounts ~1100MB). Set to `0` for unlimited. | `1`       |
 | `HTTP_PROXY`                    | HTTP proxy address for accessing Google services.                                                                                                                                                                                                                     | None      |
 | `HTTPS_PROXY`                   | HTTPS proxy address for accessing Google services.                                                                                                                                                                                                                    | None      |
 | `NO_PROXY`                      | Comma-separated list of addresses to bypass the proxy. The project automatically bypasses local addresses (localhost, 127.0.0.1, ::, ::1 and 0.0.0.0), so manual local bypass configuration is usually not required.                                                  | None      |
+
+On 429, ordinary and anti-truncation models replace the account actually serving the request and refill the dispatch pool with standby accounts. Anti-truncation retries only the failed upstream round, preserving acknowledged output and continuation history. Each account is tried at most once per round; exhausting available accounts returns the upstream error.
 
 #### 🗒️ Other Configuration
 
@@ -356,4 +359,12 @@ We would like to thank all developers who have contributed their time, effort, a
 
 If you find AIStudioToAPI useful, consider giving it a ⭐️!
 
-[![Star History Chart](https://api.star-history.com/svg?repos=iBUHub/AIStudioToAPI&type=date&legend=top-left)](https://www.star-history.com/#iBUHub/AIStudioToAPI&type=date&legend=top-left)
+## Star History
+
+<a href="https://star-history.dera.page/#iBUHub/AIStudioToAPI">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+ </picture>
+</a>

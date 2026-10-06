@@ -26,6 +26,8 @@ class AuthSource {
         this.expiredIndices = [];
         this.initialIndices = [];
         this.accountNameMap = new Map();
+        // Runtime-only limits belong to the Google account, not an individual auth file.
+        this.accountCooldowns = new Map();
         // Map any valid index -> canonical (latest) index for the same account email
         this.canonicalIndexMap = new Map();
         // Duplicate groups (email -> kept + duplicates)
@@ -267,6 +269,35 @@ class AuthSource {
 
     getRotationIndices() {
         return this.rotationIndices;
+    }
+
+    _getCooldownKey(index) {
+        const email = this._normalizeEmailKey(this.accountNameMap.get(index));
+        return email ? `email:${email}` : `index:${index}`;
+    }
+
+    markAccountCoolingDown(index, durationMs = 60000) {
+        if (!Number.isInteger(index) || !this.availableIndices.includes(index)) return false;
+        const duration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 60000;
+        const key = this._getCooldownKey(index);
+        const until = Math.max(this.accountCooldowns.get(key) || 0, Date.now() + duration);
+        this.accountCooldowns.set(key, until);
+        return true;
+    }
+
+    isAccountCoolingDown(index) {
+        const key = this._getCooldownKey(index);
+        const until = this.accountCooldowns.get(key);
+        if (!until) return false;
+        if (until <= Date.now()) {
+            this.accountCooldowns.delete(key);
+            return false;
+        }
+        return true;
+    }
+
+    getAvailableRotationIndices() {
+        return this.rotationIndices.filter(index => !this.isAccountCoolingDown(index));
     }
 
     getCanonicalIndex(index) {

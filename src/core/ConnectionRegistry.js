@@ -416,10 +416,11 @@ class ConnectionRegistry extends EventEmitter {
      * @param {string} requestId - The unique request ID
      * @param {number} authIndex - The account index (must be a non-negative integer)
      * @param {string|null} [requestAttemptId=null] - Optional per-attempt identifier to discard stale retry messages
+     * @param {string|null} [parentRequestId=null] - Logical request owning an internal transport queue
      * @returns {MessageQueue} The created message queue
      * @throws {Error} If authIndex is invalid (undefined, negative, or not an integer)
      */
-    createMessageQueue(requestId, authIndex, requestAttemptId = null) {
+    createMessageQueue(requestId, authIndex, requestAttemptId = null, parentRequestId = null) {
         // Validate authIndex: must be a valid non-negative integer
         if (authIndex === undefined || authIndex < 0 || !Number.isInteger(authIndex)) {
             this.logger.error(
@@ -452,10 +453,28 @@ class ConnectionRegistry extends EventEmitter {
         this.messageQueues.set(requestId, {
             authIndex,
             createdAt: Date.now(),
+            parentRequestId,
             queue,
             requestAttemptId,
         });
         return queue;
+    }
+
+    /**
+     * Move a logical request to the account serving its next internal call without closing its queue.
+     * A null account temporarily detaches it while account recovery is in progress. The expected queue
+     * protects a replacement attempt from a delayed retry belonging to an older logical request.
+     */
+    setMessageQueueAuthIndex(requestId, authIndex, expectedQueue) {
+        if (authIndex !== null && (!Number.isInteger(authIndex) || authIndex < 0)) {
+            throw new Error(`Invalid authIndex: ${authIndex}. Must be null or a non-negative integer.`);
+        }
+        const entry = this.messageQueues.get(requestId);
+        if (!entry || entry.queue !== expectedQueue || entry.queue.closed) return false;
+        const previousAuthIndex = entry.authIndex;
+        entry.authIndex = authIndex;
+        if (previousAuthIndex !== authIndex) this._emitAuthQueuesDrainedIfNeeded(previousAuthIndex);
+        return true;
     }
 
     /**
@@ -505,6 +524,24 @@ class ConnectionRegistry extends EventEmitter {
             }
         }
         return false;
+    }
+
+    /**
+     * Get the number of logical requests belonging to a specific account
+     * Used by the request dispatcher for least-loaded account selection
+     * @param {number} authIndex - The account index to inspect
+     * @returns {number} Number of active message queues for the account
+     */
+    getQueueCountForAuth(authIndex) {
+        let count = 0;
+        for (const entry of this.messageQueues.values()) {
+            if (entry.authIndex === authIndex) {
+                const parent = entry.parentRequestId && this.messageQueues.get(entry.parentRequestId);
+                if (parent && !parent.queue.closed && parent.authIndex === authIndex) continue;
+                count++;
+            }
+        }
+        return count;
     }
 
     /**

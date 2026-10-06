@@ -385,7 +385,8 @@ class ProxyServerSystem extends EventEmitter {
                     "x-stainless-retry-count, x-stainless-timeout, sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, " +
                     "anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, " +
                     "x-goog-upload-protocol, x-goog-upload-command, x-goog-upload-header-content-length, " +
-                    "x-goog-upload-header-content-type, x-goog-upload-url, x-goog-upload-offset, x-goog-upload-status"
+                    "x-goog-upload-header-content-type, x-goog-upload-url, x-goog-upload-offset, x-goog-upload-status, " +
+                    "x-anti-truncation-mode, x-anti-truncation-output"
             );
 
             // Expose all common Headers, including upload related ones (matched from BuildProxy)
@@ -395,7 +396,7 @@ class ProxyServerSystem extends EventEmitter {
                 "x-goog-upload-url, x-goog-upload-status, x-goog-upload-chunk-granularity, " +
                     "x-goog-upload-control-url, x-goog-upload-command, x-goog-upload-content-type, " +
                     "x-goog-upload-protocol, x-goog-upload-file-name, x-goog-upload-offset, " +
-                    "date, content-type, content-length, location"
+                    "date, content-type, content-length, location, x-anti-truncation-mode, x-anti-truncation-output"
             );
 
             if (req.method === "OPTIONS") {

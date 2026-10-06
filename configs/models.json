@@ -380,6 +380,25 @@
             "thinking": true
         },
         {
+            "name": "models/gemini-3.8-flash",
+            "version": "3.8-flash-09-2026",
+            "displayName": "Gemini 3.8 Flash",
+            "description": "Gemini 3.8 Flash",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": [
+                "generateContent",
+                "countTokens",
+                "createCachedContent",
+                "batchGenerateContent"
+            ],
+            "temperature": 1,
+            "topP": 0.95,
+            "topK": 64,
+            "maxTemperature": 2,
+            "thinking": true
+        },
+        {
             "name": "models/gemini-3.1-flash-tts-preview",
             "version": "3.1-flash-tts-preview",
             "displayName": "Gemini 3.1 Flash TTS Preview",
@@ -499,6 +518,34 @@
             "inputTokenLimit": 480,
             "outputTokenLimit": 8192,
             "supportedGenerationMethods": ["predict"]
+        },
+        {
+            "name": "models/gemini-3.7-flash-抗截断",
+            "version": "3.7-flash-08-2026",
+            "displayName": "Gemini 3.7 Flash 抗截断",
+            "description": "Suffix-enabled bidirectional tool text transport with bounded continuation and repair. Ordinary text output by default; text-only, no client tools.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+            "temperature": 1,
+            "topP": 0.95,
+            "topK": 64,
+            "maxTemperature": 2,
+            "thinking": true
+        },
+        {
+            "name": "models/gemini-3.8-flash-抗截断",
+            "version": "3.8-flash-09-2026",
+            "displayName": "Gemini 3.8 Flash 抗截断",
+            "description": "Suffix-enabled bidirectional tool text transport with bounded continuation and repair. Ordinary text output by default; text-only, no client tools.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+            "temperature": 1,
+            "topP": 0.95,
+            "topK": 64,
+            "maxTemperature": 2,
+            "thinking": true
         }
     ]
 }

@@ -81,7 +81,8 @@ ARG VERSION
 RUN VERSION=${VERSION} npm run build:ui
 
 # Remove dev dependencies after build to reduce image size
-RUN npm prune --omit=dev && npm cache clean --force
+RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund \
+    && npm cache clean --force
 
 # TODO: Temporarily use the root user, and in the future we will switch to the node user
 USER root

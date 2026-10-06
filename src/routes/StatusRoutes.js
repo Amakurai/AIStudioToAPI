@@ -776,6 +776,26 @@ class StatusRoutes {
             });
         });
 
+        app.put("/api/settings/max-contexts", isAuthenticated, (req, res) => {
+            const newValue = Number(req.body?.value);
+
+            // Must be a non-negative integer (0 = unlimited)
+            if (!Number.isInteger(newValue) || newValue < 0) {
+                return res.status(400).json({ error: "Invalid max contexts value", message: "settingFailed" });
+            }
+
+            this.config.maxContexts = newValue;
+            this.logger.info(`[WebUI] Max contexts updated to: ${newValue === 0 ? "unlimited" : newValue}`);
+
+            // Apply immediately: rebalance the pool in the background
+            // (closes excess contexts, preloads missing ones; launches the browser if needed)
+            this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                this.logger.error(`[WebUI] Failed to rebalance context pool after max-contexts change: ${err.message}`);
+            });
+
+            return res.status(200).json({ message: "settingUpdateSuccess", setting: "maxContexts", value: newValue });
+        });
+
         app.put("/api/settings/debug-mode", isAuthenticated, (req, res) => {
             const currentLevel = LoggingService.getLevel();
             const newLevel = currentLevel === "DEBUG" ? "INFO" : "DEBUG";
@@ -972,6 +992,8 @@ class StatusRoutes {
         const allLogs = this.logger.logBuffer || [];
         const displayLogs = allLogs.slice(-limit);
         const accountNameMap = authSource.accountNameMap;
+        const readyIndexSet = new Set(requestHandler._getReadyAuthIndices());
+        const connectionRegistry = this.serverSystem.connectionRegistry;
         const accountDetails = initialIndices.map(index => {
             const isInvalid = invalidIndices.includes(index);
             const name = isInvalid ? null : accountNameMap.get(index) || null;
@@ -982,8 +1004,22 @@ class StatusRoutes {
             const isExpired = expiredIndices.includes(index);
 
             const hasContext = browserManager.contexts.has(index);
+            // Multi-account dispatch status: ready = can serve dispatched requests right now
+            const isReady = readyIndexSet.has(index);
+            const inFlightRequests = connectionRegistry.getQueueCountForAuth(index);
 
-            return { canonicalIndex, hasContext, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+            return {
+                canonicalIndex,
+                hasContext,
+                index,
+                inFlightRequests,
+                isDuplicate,
+                isExpired,
+                isInvalid,
+                isReady,
+                isRotation,
+                name,
+            };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;

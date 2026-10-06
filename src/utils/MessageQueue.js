@@ -104,6 +104,7 @@ class MessageQueue extends EventEmitter {
     }
 
     close(reason = "unknown") {
+        if (this.closed) return;
         this.closed = true;
         this.closeReason = reason;
         this.waitingResolvers.forEach(resolver => {
@@ -112,6 +113,7 @@ class MessageQueue extends EventEmitter {
         });
         this.waitingResolvers = [];
         this.messages = [];
+        this.emit("close", reason);
     }
 }
 

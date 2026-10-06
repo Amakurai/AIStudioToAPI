@@ -37,6 +37,7 @@ class ConfigLoader {
             immediateSwitchStatusCodes: [429, 503],
             maxContexts: 1,
             maxRetries: 3,
+            rateLimitCooldownMs: 60000,
             retryDelay: 2000,
             safetySettingsThreshold: "OFF",
             streamingMode: "real",
@@ -67,6 +68,10 @@ class ConfigLoader {
         if (process.env.RETRY_DELAY) {
             const parsed = parseInt(process.env.RETRY_DELAY, 10);
             config.retryDelay = Number.isFinite(parsed) ? Math.max(50, parsed) : config.retryDelay;
+        }
+        if (process.env.RATE_LIMIT_COOLDOWN_MS) {
+            const parsed = parseInt(process.env.RATE_LIMIT_COOLDOWN_MS, 10);
+            config.rateLimitCooldownMs = Number.isFinite(parsed) && parsed > 0 ? parsed : config.rateLimitCooldownMs;
         }
         if (process.env.STREAM_TIMEOUT_MS) {
             const parsed = parseInt(process.env.STREAM_TIMEOUT_MS, 10);
@@ -226,6 +231,7 @@ class ConfigLoader {
         );
         this.logger.info(`  Max Retries per Request: ${config.maxRetries} times`);
         this.logger.info(`  Retry Delay: ${config.retryDelay}ms`);
+        this.logger.info(`  Account 429 Cooldown: ${config.rateLimitCooldownMs}ms`);
         this.logger.info(`  API Key Source: ${config.apiKeySource}`);
 
         const proxySummary = getProxySummaryFromEnv();

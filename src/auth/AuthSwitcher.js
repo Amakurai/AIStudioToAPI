@@ -49,11 +49,16 @@ class AuthSwitcher {
     //     return available[nextIndexInArray];
     // }
 
-    async switchToNextAuth() {
-        const available = this.authSource.getRotationIndices();
+    async switchToNextAuth(options = {}) {
+        const excluded = new Set(
+            [...(options.excludeIndices || [])].map(index => this.authSource.getCanonicalIndex(index) ?? index)
+        );
+        const available = this.authSource
+            .getAvailableRotationIndices()
+            .filter(index => !excluded.has(this.authSource.getCanonicalIndex(index) ?? index));
 
         if (available.length === 0) {
-            throw new Error("No available authentication sources, cannot switch.");
+            return { reason: "No available authentication sources outside cooldown/exclusions.", success: false };
         }
 
         if (this.isSystemBusy) {
@@ -65,7 +70,7 @@ class AuthSwitcher {
 
         try {
             // Single account mode
-            if (available.length === 1) {
+            if (available.length === 1 && available[0] === this.authSource.getCanonicalIndex(this.currentAuthIndex)) {
                 const singleIndex = available[0];
                 this.logger.info("==================================================");
                 this.logger.info(
@@ -75,6 +80,9 @@ class AuthSwitcher {
                 this.logger.info("==================================================");
 
                 try {
+                    if (this.authSource.isAccountCoolingDown(singleIndex)) {
+                        return { reason: "Account entered cooldown before switching.", success: false };
+                    }
                     await this.browserManager.launchOrSwitchContext(singleIndex);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
@@ -130,8 +138,10 @@ class AuthSwitcher {
                 );
 
                 try {
+                    if (this.authSource.isAccountCoolingDown(accountIndex)) continue;
                     // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(accountIndex);
+                    if (this.authSource.isAccountCoolingDown(accountIndex)) continue;
                     await this.browserManager.switchAccount(accountIndex);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
@@ -157,7 +167,11 @@ class AuthSwitcher {
 
             // If we had a current account, try it as a final fallback
             // If we had no current account, we already tried all accounts, so skip fallback
-            if (hasCurrentAccount && originalStartAccount !== null) {
+            if (
+                hasCurrentAccount &&
+                originalStartAccount !== null &&
+                !this.authSource.isAccountCoolingDown(originalStartAccount)
+            ) {
                 this.logger.warn("==================================================");
                 this.logger.warn(
                     `⚠️ [Auth] All other accounts failed. Making final attempt with original starting account #${originalStartAccount}...`
@@ -167,6 +181,9 @@ class AuthSwitcher {
                 try {
                     // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(originalStartAccount);
+                    if (this.authSource.isAccountCoolingDown(originalStartAccount)) {
+                        return { reason: "Fallback account entered cooldown.", success: false };
+                    }
                     await this.browserManager.switchAccount(originalStartAccount);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
