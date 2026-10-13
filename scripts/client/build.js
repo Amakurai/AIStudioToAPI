@@ -387,60 +387,37 @@ class RequestProcessor {
         return finalUrl;
     }
 
-    _filterGeminiBuiltInTools(bodyObj, blockedToolKeys) {
-        if (!Array.isArray(bodyObj.tools)) {
-            return 0;
-        }
+    _removeStructuredOutputConfig(bodyObj, { preserveResponseFormat = false } = {}) {
+        const structuredOutputKeys = [
+            "responseMimeType",
+            "response_mime_type",
+            "responseSchema",
+            "response_schema",
+            "responseJsonSchema",
+            "response_json_schema",
+            "_responseJsonSchema",
+            "_response_json_schema",
+        ];
 
-        let removedCount = 0;
-        const filteredTools = [];
-
-        bodyObj.tools.forEach(tool => {
-            if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
-                filteredTools.push(tool);
-                return;
+        for (const generationConfig of [bodyObj.generationConfig, bodyObj.generation_config]) {
+            if (!generationConfig || typeof generationConfig !== "object") {
+                continue;
             }
 
-            const filteredTool = { ...tool };
-            blockedToolKeys.forEach(key => {
-                if (Object.prototype.hasOwnProperty.call(filteredTool, key)) {
-                    delete filteredTool[key];
-                    removedCount++;
+            structuredOutputKeys.forEach(key => delete generationConfig[key]);
+            for (const key of ["responseFormat", "response_format"]) {
+                const responseFormat = generationConfig[key];
+                if (!preserveResponseFormat) {
+                    delete generationConfig[key];
+                } else if (responseFormat && typeof responseFormat === "object") {
+                    // Preserve modality settings such as audio, but remove text structured output.
+                    delete responseFormat.text;
+                    if (Object.keys(responseFormat).length === 0) {
+                        delete generationConfig[key];
+                    }
                 }
-            });
-
-            if (Object.keys(filteredTool).length > 0) {
-                filteredTools.push(filteredTool);
-            }
-        });
-
-        if (filteredTools.length > 0) {
-            bodyObj.tools = filteredTools;
-        } else {
-            delete bodyObj.tools;
-        }
-
-        if (removedCount > 0 && bodyObj.toolConfig?.includeServerSideToolInvocations) {
-            delete bodyObj.toolConfig.includeServerSideToolInvocations;
-            if (Object.keys(bodyObj.toolConfig).length === 0) {
-                delete bodyObj.toolConfig;
             }
         }
-
-        return removedCount;
-    }
-
-    _removeStructuredOutputConfig(bodyObj) {
-        const generationConfig = bodyObj.generationConfig;
-        if (!generationConfig) {
-            return;
-        }
-
-        ["responseMimeType", "responseSchema", "responseJsonSchema", "responseFormat"].forEach(key => {
-            if (Object.prototype.hasOwnProperty.call(generationConfig, key)) {
-                delete generationConfig[key];
-            }
-        });
     }
 
     _buildRequestConfig(requestSpec, signal) {
@@ -459,15 +436,22 @@ class RequestProcessor {
                 try {
                     const bodyObj = JSON.parse(requestSpec.body);
 
-                    // --- Module 1: Embedding/TTS Model Filtering ---
+                    // --- Module 1: Embedding/TTS/Transcribe/Lyria Model Filtering ---
                     const requestPath = String(requestSpec.path || "");
                     const isImageModel = requestPath.includes("-image") || requestPath.includes("imagen");
                     const isGemini25ImageModel = isImageModel && requestPath.includes("2.5");
                     const isGemini31FlashLiteImageModel = requestPath.includes("gemini-3.1-flash-lite-image");
+                    const isGemini31FlashImageModel = requestPath.includes("gemini-3.1-flash-image");
+                    const isGemini3ProImageModel = requestPath.includes("gemini-3-pro-image");
                     const isEmbeddingModel = requestPath.includes("embedding");
                     const isTtsModel = requestPath.includes("tts");
+                    const isTranscribeModel = requestPath.includes("-transcribe");
+                    const isLyria3Model = requestPath.includes("lyria-3");
+                    const isGemini38TtsModel =
+                        requestPath.includes("gemini-3.8-flash-tts") ||
+                        requestPath.includes("gemini-3.8-flash-lite-tts");
                     const toolRelatedKeys = ["tools", "toolConfig", "tool_config", "toolChoice", "tool_choice"];
-                    if (isEmbeddingModel || isTtsModel) {
+                    if (isEmbeddingModel || isTtsModel || isTranscribeModel || isLyria3Model) {
                         // Remove tools
                         toolRelatedKeys.forEach(key => {
                             if (Object.prototype.hasOwnProperty.call(bodyObj, key)) delete bodyObj[key];
@@ -476,16 +460,19 @@ class RequestProcessor {
                         if (bodyObj.generationConfig?.thinkingConfig) {
                             delete bodyObj.generationConfig.thinkingConfig;
                         }
-                        // Remove systemInstruction
-                        if (bodyObj.systemInstruction) {
+                        // Lyria 3 models support systemInstruction.
+                        if (!isLyria3Model && bodyObj.systemInstruction) {
                             delete bodyObj.systemInstruction;
                         }
-                        this._removeStructuredOutputConfig(bodyObj);
+                        this._removeStructuredOutputConfig(bodyObj, {
+                            preserveResponseFormat: isGemini38TtsModel || isLyria3Model,
+                        });
                     }
 
                     // --- Module 1.5: responseModalities Handling ---
                     // Image: keep as-is (needed for image generation)
-                    // Embedding: remove
+                    // Embedding/Transcribe: remove
+                    // Lyria 3: keep
                     // TTS: force to ["AUDIO"]
                     if (isTtsModel) {
                         if (!bodyObj.generationConfig) {
@@ -493,15 +480,13 @@ class RequestProcessor {
                         }
                         bodyObj.generationConfig.responseModalities = ["AUDIO"];
                         Logger.output("TTS model detected, setting responseModalities to AUDIO");
-                    } else if (isEmbeddingModel) {
+                    } else if (isEmbeddingModel || isTranscribeModel) {
                         if (bodyObj.generationConfig?.responseModalities) {
                             delete bodyObj.generationConfig.responseModalities;
                         }
                     }
 
-                    // --- Module 2: Computer-Use Model Filtering ---
-                    // --- Module 3: Robotics Model Filtering ---
-                    const isComputerUseModel = requestSpec.path.includes("computer-use");
+                    // --- Module 2: Robotics Model Filtering ---
                     const isRoboticsModel = requestSpec.path.includes("robotics");
                     if (isGemini25ImageModel) {
                         toolRelatedKeys.forEach(key => {
@@ -512,51 +497,50 @@ class RequestProcessor {
                         }
                     }
                     if (isGemini31FlashLiteImageModel) {
-                        const removedBuiltInTools = this._filterGeminiBuiltInTools(bodyObj, [
-                            "codeExecution",
-                            "code_execution",
-                            "googleMaps",
-                            "google_maps",
-                            "googleSearch",
-                            "google_search",
-                            "googleSearchRetrieval",
-                            "google_search_retrieval",
-                            "urlContext",
-                            "url_context",
-                        ]);
-                        if (removedBuiltInTools > 0) {
-                            Logger.debug(
-                                `Gemini 3.1 Flash Lite Image detected, filtered unsupported built-in tools: ${removedBuiltInTools}`
-                            );
-                        }
-                    }
-                    if (isImageModel || isComputerUseModel || isRoboticsModel) {
-                        this._removeStructuredOutputConfig(bodyObj);
-                    }
-                    if (isComputerUseModel || isRoboticsModel) {
-                        if (bodyObj.generationConfig?.responseModalities) {
-                            delete bodyObj.generationConfig.responseModalities;
-                        }
-                    }
-
-                    // --- Module 4: Gemini 2 JSON Mode Tool Filtering ---
-                    // If model starts with gemini-2 and response format is JSON, remove tools/toolConfig
-                    // This prevents 400 errors as some Gemini 2 variants don't support combined Tool + Structured Output
-                    const isGemini2 = requestSpec.path.match(/\/models\/gemini-2/);
-                    const isJsonMode = bodyObj.generationConfig?.responseMimeType === "application/json";
-
-                    if (isGemini2 && isJsonMode) {
-                        let keysRemoved = 0;
                         toolRelatedKeys.forEach(key => {
                             if (Object.prototype.hasOwnProperty.call(bodyObj, key)) {
                                 delete bodyObj[key];
-                                keysRemoved++;
                             }
                         });
-                        if (keysRemoved > 0) {
-                            Logger.output(
-                                `Gemini 2/2.5 + JSON mode detected, automatically filtering tool parameter to prevent API error`
-                            );
+                    }
+                    if (isGemini31FlashImageModel || isGemini3ProImageModel) {
+                        if (Array.isArray(bodyObj.tools)) {
+                            const searchToolKeys = ["googleSearch", "google_search"];
+                            bodyObj.tools = bodyObj.tools
+                                .map(tool => {
+                                    if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+                                        return null;
+                                    }
+
+                                    return Object.fromEntries(
+                                        searchToolKeys
+                                            .filter(key => Object.prototype.hasOwnProperty.call(tool, key))
+                                            .map(key => [key, tool[key]])
+                                    );
+                                })
+                                .filter(tool => tool && Object.keys(tool).length > 0);
+
+                            if (bodyObj.tools.length === 0) {
+                                delete bodyObj.tools;
+                            }
+                        } else {
+                            delete bodyObj.tools;
+                        }
+
+                        toolRelatedKeys
+                            .filter(key => key !== "tools")
+                            .forEach(key => {
+                                if (Object.prototype.hasOwnProperty.call(bodyObj, key)) {
+                                    delete bodyObj[key];
+                                }
+                            });
+                    }
+                    if (isImageModel) {
+                        this._removeStructuredOutputConfig(bodyObj);
+                    }
+                    if (isRoboticsModel) {
+                        if (bodyObj.generationConfig?.responseModalities) {
+                            delete bodyObj.generationConfig.responseModalities;
                         }
                     }
 

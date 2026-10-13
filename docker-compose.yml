@@ -5,7 +5,7 @@ services:
     build:
       context: .
       args:
-        VERSION: "1.3.8"
+        VERSION: "1.4.0"
     image: aistudio-to-api:local
     container_name: aistudio-to-api
     ports:

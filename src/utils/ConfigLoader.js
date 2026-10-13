@@ -9,7 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const { getProxySummaryFromEnv } = require("./ProxyUtils");
 
-const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/d31dbffc-6199-4f09-9da5-45de7684ab8a";
+const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/56128c84-c8e6-4d52-bf94-934c836720d9";
 
 function parseAiStudioAppUrl(value) {
     const rawValue = String(value || "").trim();
@@ -220,17 +220,17 @@ class ConfigLoader {
                     );
                 } else {
                     this.logger.warn(`[System] models.json is not in the expected format, using default model list.`);
-                    config.modelList = [{ name: "models/gemini-2.5-flash-lite" }];
+                    config.modelList = [{ name: "models/gemini-flash-lite-latest" }];
                 }
             } else {
                 this.logger.warn(`[System] models.json file not found, using default model list.`);
-                config.modelList = [{ name: "models/gemini-2.5-flash-lite" }];
+                config.modelList = [{ name: "models/gemini-flash-lite-latest" }];
             }
         } catch (error) {
             this.logger.error(
                 `[System] Failed to read or parse models.json: ${error.message}, using default model list.`
             );
-            config.modelList = [{ name: "models/gemini-2.5-flash-lite" }];
+            config.modelList = [{ name: "models/gemini-flash-lite-latest" }];
         }
 
         this._printConfiguration(config);

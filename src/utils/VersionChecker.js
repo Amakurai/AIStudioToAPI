@@ -117,10 +117,6 @@ class VersionChecker {
     }
 
     /**
-     * Check for updates
-     * @returns {Promise<object>}
-     */
-    /**
      * Fetch all version tags from GitHub
      * @returns {Promise<Array<{name: string, url: string}>>}
      */

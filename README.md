@@ -179,13 +179,6 @@ services:
 
 > 📖 详细的 Nginx 配置说明请参阅：[Nginx 反向代理配置文档](docs/zh/nginx-setup.md)
 
-### 🐾 Claw Cloud Run 部署
-
-> ℹ **Claw Cloud Run 公告：** 自 **2026/05/11 00:00 UTC** 起，Claw Cloud Run 已停止产品及相关服务。详情请参阅官方公告：
-> [公告](https://question.run.claw.cloud/questions/10010000000003261)
-
-> 📖 旧版部署教程请参阅：[部署到 Claw Cloud Run](docs/zh/claw-cloud-run.md)
-
 ### 🦓 Zeabur 部署
 
 > ℹ **Zeabur 公告：** 自 **2026/03/15** 起，Zeabur 已停止在 **共享集群** 上创建新项目；**已经运行在共享集群上的服务不会受到影响**。详情请参阅官方变更说明：
@@ -212,9 +205,9 @@ services:
 - `GET /v1beta/models`: 列出可用的 Gemini 模型。
 - `POST /v1beta/models/{model_name}:generateContent`: 生成内容、图片和语音。
 - `POST /v1beta/models/{model_name}:streamGenerateContent`: 流式生成内容、图片和语音，支持真流式和假流式。
+- `POST /v1beta/models/{model_name}:countTokens`: 计算请求内容的 token 数量。
 - `POST /v1beta/models/{model_name}:embedContent`: 生成单条文本嵌入向量。
 - `POST /v1beta/models/{model_name}:batchEmbedContents`: 批量生成文本嵌入向量。
-- `POST /v1beta/models/{model_name}:predict`: Imagen 系列模型图像生成。
 
 ### 👤 Anthropic 兼容 API
 
@@ -364,14 +357,14 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ## Star History
 
-<a href="https://star-history.dera.page/#iBUHub/AIStudioToAPI">
+<a href="https://www.star-history.com/?repos=ibuhub%2Faistudiotoapi&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&legend=top-left" />
  </picture>
 </a>
 
 ### 抗截断模型
 
-直接选择 `gemini-3.7-flash-抗截断` 或 `gemini-3.8-flash-抗截断`，即自动启用工具输出抗截断：原始对话直接发送，模型通过工具按序交付正文，未完成时有限续写；单段完整回答可在一次上游调用内完成。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。
+直接选择 `gemini-3.7-flash-抗截断`、`gemini-3.8-flash-抗截断` 或 `gemini-4-argon-抗截断`，即自动启用工具输出抗截断：原始对话直接发送，模型通过工具按序交付正文，未完成时有限续写；单段完整回答可在一次上游调用内完成。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。

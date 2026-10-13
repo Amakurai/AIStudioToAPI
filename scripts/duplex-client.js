@@ -142,7 +142,8 @@
             } catch {
                 return nativeFetch(request);
             }
-            if (!/^gemini-3\.[78]-flash-抗截断$/.test(payload.model || "")) return nativeFetch(request);
+            if (!/^(?:gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/.test(payload.model || ""))
+                return nativeFetch(request);
             const headers = new Headers(request.headers);
             headers.set("X-Anti-Truncation-Output", "tools");
             const response = await nativeFetch(new Request(request, { headers }));

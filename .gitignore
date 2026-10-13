@@ -3,6 +3,7 @@
 .cursor/
 .DS_Store
 .claude/
+.codex_tmp/
 
 # Environment variables (keep .env.example)
 .env

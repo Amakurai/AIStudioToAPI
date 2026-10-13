@@ -9,7 +9,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-flash-lite-latest",
     "messages": [
       {
         "role": "user",
@@ -27,7 +27,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-flash-lite-latest",
     "messages": [
       {
         "role": "user",
@@ -38,14 +38,14 @@ curl -X POST http://localhost:7860/v1/chat/completions \
   }'
 ```
 
-### 🖼️ Generate Image [Official Docs](https://ai.google.dev/gemini-api/docs/image-generation)
+### 🖼️ Generate Image [Official Docs](https://ai.google.dev/gemini-api/docs/generate-content/image-generation)
 
 ```bash
 curl -X POST http://localhost:7860/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
-    "model": "gemini-2.5-flash-image",
+    "model": "gemini-3.1-flash-lite-image",
     "messages": [
       {
         "role": "user",
@@ -63,7 +63,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
-    "model": "gemini-2.5-flash-image",
+    "model": "gemini-3.1-flash-lite-image",
     "messages": [
       {
         "role": "user",
@@ -93,7 +93,7 @@ curl -X POST http://localhost:7860/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-flash-lite-latest",
     "input": "Summarize the main idea of functional programming in 3 sentences.",
     "stream": false
   }'
@@ -106,7 +106,7 @@ curl -X POST http://localhost:7860/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-flash-lite-latest",
     "input": [
       {
         "role": "user",
@@ -125,7 +125,7 @@ curl -X POST http://localhost:7860/v1/responses \
 ## ♊ Gemini Native API Format
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-lite:generateContent \
+curl -X POST http://localhost:7860/v1beta/models/gemini-flash-lite-latest:generateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
@@ -145,7 +145,7 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-lite:generateC
 ### 🌊 Streaming Content Generation
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-lite:streamGenerateContent?alt=sse \
+curl -X POST http://localhost:7860/v1beta/models/gemini-flash-lite-latest:streamGenerateContent?alt=sse \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
@@ -162,10 +162,10 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-lite:streamGen
   }'
 ```
 
-### 🖼️ Generate Image [Official Docs](https://ai.google.dev/gemini-api/docs/image-generation)
+### 🖼️ Generate Image [Official Docs](https://ai.google.dev/gemini-api/docs/generate-content/image-generation)
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-image:generateContent \
+curl -X POST http://localhost:7860/v1beta/models/gemini-3.1-flash-lite-image:generateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
@@ -185,7 +185,7 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-image:generate
 #### 🫗 Stream Generation
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-image:streamGenerateContent?alt=sse \
+curl -X POST http://localhost:7860/v1beta/models/gemini-3.1-flash-lite-image:streamGenerateContent?alt=sse \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
@@ -202,81 +202,74 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-image:streamGe
   }'
 ```
 
-### 🎨 Imagen (Image Generation) [Official Docs](https://ai.google.dev/gemini-api/docs/imagen)
+### 🎵 Lyria Music Generation [Official Docs](https://ai.google.dev/gemini-api/docs/generate-content/music-generation)
 
-Use the `imagen` series models to generate images through the `:predict` endpoint.
-
-#### Basic Image Generation
+#### Generate a 30-Second Music Clip
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/imagen-4.0-generate-001:predict \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-api-key-1" \
-  -d '{
-    "instances": [
-      {
-        "prompt": "Robot holding a red skateboard"
-      }
-    ],
-    "parameters": {
-      "sampleCount": 1
-    }
-  }'
-```
-
-#### Generate Multiple Images
-
-Adjust `sampleCount` to generate multiple images at once (maximum 4).
-
-```bash
-curl -X POST http://localhost:7860/v1beta/models/imagen-4.0-generate-001:predict \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-api-key-1" \
-  -d '{
-    "instances": [
-      {
-        "prompt": "A futuristic city at sunset with flying cars"
-      }
-    ],
-    "parameters": {
-      "sampleCount": 4
-    }
-  }'
-```
-
-> 💡 **Tip**: Imagen responses return base64-encoded image data. Each generated image will be included in the `predictions` array.
-
-### 🎤 TTS (Text-to-Speech) [Official Docs](https://ai.google.dev/gemini-api/docs/speech-generation)
-
-#### Basic TTS (Default Voice)
-
-```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:generateContent \
+curl -X POST http://localhost:7860/v1beta/models/lyria-3-clip-preview:generateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
     "contents": [
       {
-        "role": "user",
         "parts": [
           {
-            "text": "Hello, this is a text-to-speech test."
+            "text": "Create a 30-second cheerful acoustic folk song with guitar and harmonica."
           }
         ]
       }
-    ],
-    "generationConfig": {
-      "responseModalities": ["AUDIO"]
-    }
+    ]
   }'
 ```
 
-#### Specify Voice
-
-Available voices: `Kore`, `Puck`, `Charon`, `Fenrir`, `Aoede`
+#### Generate a Full-Length Song
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:generateContent \
+curl -X POST http://localhost:7860/v1beta/models/lyria-3.5:generateContent \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key-1" \
+  -d '{
+    "contents": [
+      {
+        "parts": [
+          {
+            "text": "Create an epic cinematic orchestral piece about a journey home. Start with a solo piano, build through sweeping strings, and end with a powerful climax."
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+### 🎧 Audio Transcription [Official Docs](https://ai.google.dev/gemini-api/docs/generate-content/transcribe)
+
+```bash
+curl -X POST http://localhost:7860/v1beta/models/gemini-3.5-transcribe:generateContent \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key-1" \
+  -d '{
+    "contents": [
+      {
+        "parts": [
+          {
+            "fileData": {
+              "fileUri": "YOUR_FILE_URI",
+              "mimeType": "audio/mp3"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+### 🎤 TTS (Text-to-Speech) [Official Docs](https://ai.google.dev/gemini-api/docs/generate-content/speech-generation)
+
+#### Single-Speaker Speech
+
+```bash
+curl -X POST http://localhost:7860/v1beta/models/gemini-3.8-flash-tts:generateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
@@ -285,7 +278,10 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:ge
         "role": "user",
         "parts": [
           {
-            "text": "Hello, this is a text-to-speech test."
+            "text": "Have a wonderful day!",
+            "speech_metadata": {
+              "style": "cheerful and friendly"
+            }
           }
         ]
       }
@@ -294,9 +290,7 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:ge
       "responseModalities": ["AUDIO"],
       "speechConfig": {
         "voiceConfig": {
-          "prebuiltVoiceConfig": {
-            "voiceName": "Kore"
-          }
+          "voice": "Kore"
         }
       }
     }
@@ -305,10 +299,10 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:ge
 
 #### Multi-Speaker Dialogue
 
-Write the dialogue in the prompt and configure multiple speaker voices using `multiSpeakerVoiceConfig` (up to 2 speakers).
+For multi-speaker dialogue, place each speaker's text in a separate `part` and match `speech_metadata.speaker` to the voice configuration.
 
 ```bash
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:generateContent \
+curl -X POST http://localhost:7860/v1beta/models/gemini-3.8-flash-tts:generateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key-1" \
   -d '{
@@ -317,7 +311,18 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:ge
         "role": "user",
         "parts": [
           {
-            "text": "TTS the following conversation between Joe and Jane:\nJoe: How are you today Jane?\nJane: I am doing great, thanks for asking!"
+            "text": "How is it going today, Jane?",
+            "speech_metadata": {
+              "speaker": "Joe",
+              "style": "cheerful and friendly"
+            }
+          },
+          {
+            "text": "Not too bad. How about you? Ready to test these new voices?",
+            "speech_metadata": {
+              "speaker": "Jane",
+              "style": "calm and relaxed"
+            }
           }
         ]
       }
@@ -331,7 +336,7 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:ge
               "speaker": "Joe",
               "voiceConfig": {
                 "prebuiltVoiceConfig": {
-                  "voiceName": "Charon"
+                  "voiceName": "Puck"
                 }
               }
             },
@@ -349,8 +354,6 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-flash-preview-tts:ge
     }
   }'
 ```
-
-> 💡 **Tip**: TTS responses return base64-encoded audio data in `audio/L16;codec=pcm;rate=24000` format. You need to decode and convert it to WAV format for playback.
 
 ### 📐 Text Embeddings [Official Docs](https://ai.google.dev/gemini-api/docs/embeddings)
 
@@ -436,7 +439,7 @@ curl -X POST http://localhost:7860/v1/messages \
   -H "x-api-key: your-api-key-1" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-flash-lite-latest",
     "max_tokens": 1024,
     "messages": [
       {
@@ -456,7 +459,7 @@ curl -X POST http://localhost:7860/v1/messages \
   -H "x-api-key: your-api-key-1" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-flash-lite-latest",
     "max_tokens": 1024,
     "messages": [
       {

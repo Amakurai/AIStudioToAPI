@@ -1,4 +1,4 @@
-/** Internal tool transport for the two opt-in Flash aliases. */
+/** Internal tool transport for the opt-in model aliases. */
 class AntiTruncation {
     static TOOL = "deliver_response";
     static MAX_FOLLOWUPS = 2;
@@ -59,7 +59,7 @@ class AntiTruncation {
         } catch {
             return null;
         }
-        const match = decoded.match(/^(gemini-3\.[78]-flash)-抗截断$/);
+        const match = decoded.match(/^(gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/);
         return match ? match[1] : null;
     }
 

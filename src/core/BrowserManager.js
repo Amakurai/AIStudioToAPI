@@ -185,7 +185,7 @@ class BrowserManager {
 
     /**
      * Helper: Check for page errors that require refresh
-     * @returns {Object} Object with error flags
+     * @returns {Promise<Object>} Object with error flags
      */
     async _checkPageErrors(page) {
         try {
@@ -2504,17 +2504,8 @@ class BrowserManager {
     }
 
     /**
-     * Lightweight Reconnect: Refreshes the page and clicks "Continue to the app" button
-     * without restarting the entire browser instance.
-     *
-     * This method is called when WebSocket connection is lost but the browser
-     * process is still running. It's much faster than a full browser restart.
-     *
-     * @returns {Promise<boolean>} true if reconnect was successful, false otherwise
-     */
-    /**
-     * Attempt lightweight reconnect for a specific account
-     * Refreshes the page and re-injects the proxy script without restarting the browser
+     * Attempt a lightweight reconnect for a specific account by refreshing the page
+     * and re-injecting the proxy script without restarting the browser.
      * @param {number} authIndex - The auth index to reconnect (defaults to current if not specified)
      * @returns {Promise<boolean>} true if reconnect was successful, false otherwise
      */

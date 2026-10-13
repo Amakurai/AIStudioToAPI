@@ -21,6 +21,7 @@ class ConnectionRegistry extends EventEmitter {
      * @param {Object} logger - Logger instance
      * @param {Function} [onConnectionLostCallback] - Optional callback to invoke when connection is lost after grace period
      * @param {Function} [getCurrentAuthIndex] - Function to get current auth index
+     * @param {Object|null} [browserManager=null] - Browser manager used for lightweight reconnects
      */
     constructor(logger, onConnectionLostCallback = null, getCurrentAuthIndex = null, browserManager = null) {
         super();

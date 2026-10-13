@@ -22,9 +22,8 @@ const reply = (text, done, finishReason = "STOP") => ({
     usageMetadata: { candidatesTokenCount: 5, promptTokenCount: 10, totalTokenCount: 15 },
 });
 
-test("only the two exact opt-in aliases activate, including encoded native paths", () => {
-    for (const version of ["3.7", "3.8"]) {
-        const base = `gemini-${version}-flash`;
+test("only the supported exact opt-in aliases activate, including encoded native paths", () => {
+    for (const base of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
         assert.equal(AntiTruncation.baseModel(base + "-抗截断"), base);
         assert.equal(AntiTruncation.baseModel(base + encodeURIComponent("-抗截断")), base);
         assert.equal(AntiTruncation.baseModel(base), null);
@@ -236,7 +235,7 @@ const logger = { debug() {}, error() {}, info() {}, warn() {} };
 
 test("request routing strips aliases only on the two allowed models and buffers generation", () => {
     const handler = Object.create(RequestHandler.prototype);
-    for (const model of ["gemini-3.7-flash", "gemini-3.8-flash"]) {
+    for (const model of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
         for (const suffix of ["-抗截断", encodeURIComponent("-抗截断")]) {
             const spec = {
                 is_generative: true,
@@ -467,7 +466,7 @@ test("valid text cut off before the done flag can continue on MAX_TOKENS", async
 test("Responses marks exhausted continuation as incomplete in JSON and SSE, only for aliases", async () => {
     const response = await AntiTruncation.generate(body(), async () => reply("part", false));
     const converter = new FormatConverter(logger, { config: {} });
-    for (const model of ["gemini-3.7-flash-抗截断", "gemini-3.8-flash-抗截断"]) {
+    for (const model of ["gemini-3.7-flash-抗截断", "gemini-3.8-flash-抗截断", "gemini-4-argon-抗截断"]) {
         const result = converter.convertGoogleToResponseAPINonStream(response, model);
         assert.equal(result.status, "incomplete");
         assert.equal(result.incomplete_details.reason, "max_output_tokens");
@@ -526,9 +525,9 @@ test("transport preserves non-retryable protocol errors and clears child queues"
     assert.equal(h.entries.size, 1);
 });
 
-test("both aliases are present exactly once with metadata from their original model", () => {
+test("all aliases are present exactly once with metadata from their original model", () => {
     const { models } = require("../configs/models.json");
-    for (const name of ["gemini-3.7-flash", "gemini-3.8-flash"]) {
+    for (const name of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
         const original = models.find(model => model.name === `models/${name}`);
         const aliases = models.filter(model => model.name === `models/${name}-抗截断`);
         assert.equal(aliases.length, 1);
@@ -672,8 +671,8 @@ const processors = {
     responses: "processOpenAIResponseRequest",
 };
 
-test("both aliases traverse all four public handlers in streaming and non-streaming modes", async t => {
-    for (const base of ["gemini-3.7-flash", "gemini-3.8-flash"]) {
+test("all aliases traverse all four public handlers in streaming and non-streaming modes", async t => {
+    for (const base of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
         for (const [api, method] of Object.entries(processors)) {
             for (const stream of [false, true]) {
                 await t.test(`${base} ${api} stream=${stream}`, async () => {
@@ -983,7 +982,7 @@ test("local validation errors avoid upstream calls and account switching through
 });
 
 test("original Flash models still send ordinary requests without the internal tool", async () => {
-    for (const model of ["gemini-3.7-flash", "gemini-3.8-flash"]) {
+    for (const model of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
         const h = requestHarness([
             {
                 candidates: [
@@ -1181,7 +1180,7 @@ test("large Unicode text survives three continuations and all public response fo
     const first = Math.floor(expected.length / 3);
     const second = Math.floor((expected.length * 2) / 3);
     const chunks = [expected.slice(0, first), expected.slice(first, second), expected.slice(second)];
-    for (const model of ["gemini-3.7-flash-抗截断", "gemini-3.8-flash-抗截断"]) {
+    for (const model of ["gemini-3.7-flash-抗截断", "gemini-3.8-flash-抗截断", "gemini-4-argon-抗截断"]) {
         for (const [api, method] of Object.entries(processors)) {
             for (const stream of [false, true]) {
                 await t.test(`${model} ${api} stream=${stream}`, async () => {
@@ -1533,17 +1532,17 @@ test("duplex rejects unsupported multimodal and client tool input before network
     }
 });
 
-test("duplex HTTP route works with both aliases, text/tools output and normal/SSE clients", async t => {
-    for (const version of ["3.7", "3.8"])
+test("duplex HTTP route works with all aliases, text/tools output and normal/SSE clients", async t => {
+    for (const base of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"])
         for (const stream of [false, true])
             for (const output of ["text", "tools"]) {
-                await t.test(`${version} ${stream} ${output}`, async () => {
+                await t.test(`${base} ${stream} ${output}`, async () => {
                     const expected = '中文🙂\n"引号"\\路径\r\nXML=<item>完整</item>';
                     const h = requestHarness([
                         duplexReply("append_output", { seq: 1, text: expected }),
                         duplexReply("finish_output", { last_seq: 1 }),
                     ]);
-                    const req = apiRequest("openai", `gemini-${version}-flash-抗截断`, stream);
+                    const req = apiRequest("openai", `${base}-抗截断`, stream);
                     req.headers = output === "tools" ? { "x-anti-truncation-output": "tools" } : {};
                     const res = new FakeResponse();
                     await h.handler.processOpenAIRequest(req, res);
@@ -1704,7 +1703,7 @@ test("duplex adapter preserves Request overrides and only opts in exact aliases"
         received.push(request);
         return new Response("upstream error", { status: 400 });
     });
-    for (const model of ["gemini-3.8-flash-抗截断", "gemini-3.8-flash"]) {
+    for (const model of ["gemini-3.8-flash-抗截断", "gemini-3.8-flash", "gemini-4-argon-抗截断", "gemini-4-argon"]) {
         const controller = new AbortController();
         const original = new Request("https://example.invalid/v1/chat/completions", { body: "{}", method: "POST" });
         await fetch(original, {
@@ -1992,7 +1991,7 @@ test("fake mode sends data heartbeats while waiting for upstream", async () => {
 
 test("original models remain ordinary across every public API despite old mode headers", async t => {
     for (const [api, method] of Object.entries(processors)) {
-        for (const model of ["gemini-3.7-flash", "gemini-3.8-flash"]) {
+        for (const model of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
             await t.test(`${api} ${model}`, async () => {
                 const h = requestHarness([
                     {
@@ -2029,4 +2028,79 @@ test("native alias requests without an explicit role automatically use duplex", 
     const input = JSON.parse(h.sent[0].body).contents;
     assert.equal(input[0].role, "user");
     assert.equal(req.body.contents[0].role, undefined);
+});
+
+test("Argon converters preserve assistant history and add exactly one trailing user turn", async () => {
+    const converter = new FormatConverter(logger, { config: {} });
+    for (const model of ["gemini-4-argon", "gemini-4-argon-抗截断", "gemini-4-argon-high-fake-search-code"]) {
+        const messages = [
+            { content: "Hi", role: "user" },
+            { content: "Existing answer", role: "assistant" },
+        ];
+        const results = await Promise.all([
+            converter.translateOpenAIToGoogle({ messages, model }),
+            converter.translateOpenAIResponseToGoogle({ input: messages, model }),
+            converter.translateClaudeToGoogle({ max_tokens: 100, messages, model }),
+        ]);
+        for (const { googleRequest, cleanModelName, modelStreamingMode } of results) {
+            assert.deepEqual(googleRequest.contents.slice(-2), [
+                { parts: [{ text: "Existing answer" }], role: "model" },
+                { parts: [{ text: "\n" }], role: "user" },
+            ]);
+            converter._applyTrailingUserTurnGuard(googleRequest, cleanModelName);
+            assert.equal(googleRequest.contents.length, 3);
+            if (model.endsWith("-code")) {
+                assert.equal(cleanModelName, "gemini-4-argon");
+                assert.equal(modelStreamingMode, "fake");
+                assert.equal(googleRequest.generationConfig.thinkingConfig.thinkingLevel, "HIGH");
+                assert.ok(googleRequest.tools.some(tool => tool.googleSearch));
+                assert.ok(googleRequest.tools.some(tool => tool.codeExecution));
+            }
+        }
+    }
+});
+
+test("Argon trailing turn guard preserves user text and tool results", () => {
+    const converter = new FormatConverter(logger, { config: {} });
+    const toolResult = { parts: [{ functionResponse: { name: "lookup", response: { result: "ok" } } }], role: "user" };
+    const request = { contents: [toolResult] };
+    converter._applyTrailingUserTurnGuard(request, "gemini-4-argon");
+    assert.equal(request.contents[0], toolResult);
+    assert.deepEqual(request.contents[1], { parts: [{ text: "\n" }], role: "user" });
+    const ordinary = body();
+    const snapshot = JSON.stringify(ordinary);
+    converter._applyTrailingUserTurnGuard(ordinary, "gemini-4-argon");
+    assert.equal(JSON.stringify(ordinary), snapshot);
+    const older = { contents: [{ parts: [{ text: "done" }], role: "model" }] };
+    converter._applyTrailingUserTurnGuard(older, "gemini-2.5-pro");
+    assert.equal(older.contents.length, 1);
+});
+
+test("Argon native suffix routing and encoded alias token counting strip only gateway suffixes", () => {
+    const handler = requestHarness([]).handler;
+    const spec = handler._buildProxyRequest(
+        {
+            body: body(),
+            headers: {},
+            method: "POST",
+            path: "/v1beta/models/gemini-4-argon-high-fake-search-code:streamGenerateContent",
+            query: {},
+        },
+        "argon-suffix"
+    );
+    assert.equal(spec.path, "/v1beta/models/gemini-4-argon:streamGenerateContent");
+    assert.equal(spec.streaming_mode, "fake");
+    const payload = JSON.parse(spec.body);
+    assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, "HIGH");
+    assert.ok(payload.tools.some(tool => tool.googleSearch));
+    assert.ok(payload.tools.some(tool => tool.codeExecution));
+    const counter = {
+        body: JSON.stringify({ generateContentRequest: { model: "models/gemini-4-argon-抗截断", ...body() } }),
+        path: `/v1beta/models/${encodeURIComponent("gemini-4-argon-抗截断")}:countTokens`,
+        request_id: "argon-count",
+    };
+    handler._initializeProxyRequestAttempt(counter);
+    assert.equal(counter.path, "/v1beta/models/gemini-4-argon:countTokens");
+    assert.equal(JSON.parse(counter.body).generateContentRequest.model, "models/gemini-4-argon");
+    assert.equal(counter.anti_truncation, undefined);
 });

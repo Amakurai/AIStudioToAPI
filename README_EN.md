@@ -177,13 +177,6 @@ If you need to access via a domain name or want unified management at the revers
 
 > 📖 For detailed Nginx configuration instructions, see: [Nginx Reverse Proxy Configuration](docs/en/nginx-setup.md)
 
-### 🐾 Claw Cloud Run Deployment
-
-> ℹ **Claw Cloud Run announcement:** Since **May 11, 2026, 00:00 UTC**, Claw Cloud Run has discontinued its product and related services. See the official announcement for details:
-> [Announcement](https://question.run.claw.cloud/questions/10010000000003261)
-
-> 📖 For the legacy deployment guide, see: [Deploy on Claw Cloud Run](docs/en/claw-cloud-run.md)
-
 ### 🦓 Zeabur Deployment
 
 > ℹ **Zeabur announcement:** Since **March 15, 2026**, Zeabur has stopped allowing new projects to be created on the **Shared Cluster**. **Services already running on the Shared Cluster are not affected.** See the official changelog for details:
@@ -210,9 +203,9 @@ This endpoint is forwarded to the Gemini API format endpoint.
 - `GET /v1beta/models`: List available Gemini models.
 - `POST /v1beta/models/{model_name}:generateContent`: Generate content, images, and speech.
 - `POST /v1beta/models/{model_name}:streamGenerateContent`: Stream content, image, and speech generation, supports real and fake streaming.
+- `POST /v1beta/models/{model_name}:countTokens`: Count tokens in the request content.
 - `POST /v1beta/models/{model_name}:embedContent`: Generate a single text embedding vector.
 - `POST /v1beta/models/{model_name}:batchEmbedContents`: Batch generate text embedding vectors.
-- `POST /v1beta/models/{model_name}:predict`: Imagen series models image generation.
 
 ### 👤 Anthropic Compatible API
 
@@ -362,10 +355,10 @@ If you find AIStudioToAPI useful, consider giving it a ⭐️!
 
 ## Star History
 
-<a href="https://star-history.dera.page/#iBUHub/AIStudioToAPI">
+<a href="https://www.star-history.com/?repos=ibuhub%2Faistudiotoapi&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&legend=top-left" />
  </picture>
 </a>

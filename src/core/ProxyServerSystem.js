@@ -99,13 +99,27 @@ class ProxyServerSystem extends EventEmitter {
         // Set ConnectionRegistry reference in BrowserManager to avoid circular dependency
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
 
-        this.requestHandler = new RequestHandler(
-            this,
-            this.connectionRegistry,
-            this.logger,
-            this.browserManager,
-            this.config,
-            this.authSource
+        // index.js mounts the request/response modules onto this instance's prototype at runtime.
+        this.requestHandler = /** @type {RequestHandler &
+         * import("./RequestHandler/ConnectionHandler") &
+         * import("./RequestHandler/RetryHandler") &
+         * import("./RequestHandler/GeminiHandler") &
+         * import("./RequestHandler/EmbeddingsHandler") &
+         * import("./RequestHandler/UploadHandler") &
+         * import("./RequestHandler/ChatCompletionsHandler") &
+         * import("./RequestHandler/ResponsesHandler") &
+         * import("./RequestHandler/ClaudeHandler") &
+         * import("./RequestHandler/ErrorHandler") &
+         * import("./RequestHandler/TransportHandler")}
+         */ (
+            new RequestHandler(
+                this,
+                this.connectionRegistry,
+                this.logger,
+                this.browserManager,
+                this.config,
+                this.authSource
+            )
         );
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
 

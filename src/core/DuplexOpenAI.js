@@ -28,7 +28,7 @@ class DuplexOpenAI {
                 throw AntiTruncation.invalidRequest("output must be text or tools when explicitly requested.");
             }
             if (!AntiTruncation.baseModel(model))
-                throw AntiTruncation.invalidRequest("duplex mode only supports the two Flash anti-truncation aliases.");
+                throw AntiTruncation.invalidRequest("duplex mode only supports the supported anti-truncation aliases.");
             if (req.body.stream !== undefined && typeof req.body.stream !== "boolean")
                 throw AntiTruncation.invalidRequest("stream must be boolean.");
             const { googleRequest, cleanModelName } = await handler.formatConverter.translateOpenAIToGoogle(req.body);

@@ -4,8 +4,9 @@
 
 - `gemini-3.7-flash-抗截断`
 - `gemini-3.8-flash-抗截断`
+- `gemini-4-argon-抗截断`
 
-仅这两个精确别名启用；原模型及其他模型保持原有行为。请求头不能给其他模型开启此功能。模型列表会显示这两个别名，网关请求上游时自动去掉后缀。中文原生接口路径可以使用 URL 编码；不与搜索、代码执行、思考等级等其他模型后缀组合。
+仅这三个精确别名启用；原模型及其他模型保持原有行为。请求头不能给其他模型开启此功能。模型列表会显示这三个别名，网关请求上游时自动去掉后缀。中文原生接口路径可以使用 URL 编码；不与搜索、代码执行、思考等级等其他模型后缀组合。
 
 ```json
 {
@@ -17,6 +18,10 @@
 ```
 
 OpenAI Chat Completions、Responses、Claude Messages 和 Gemini 原生生成接口均自动使用同一套分段工具输出协议，返回各接口的普通助手正文，客户端无需执行内部工具。Gemini 原生接口使用路径中的模型别名；其他接口使用请求里的 `model`。
+
+普通 Argon 使用 `gemini-4-argon`，同样支持思考等级、流式模式和内置工具后缀（例如 `gemini-4-argon-high-fake-search`）。OpenAI、Responses、Claude 转换后的对话若以模型回复或工具结果结尾，会沿用 3.7/3.8 的规则补一个最小 user 轮次。抗截断别名也保留该处理。
+
+Argon 的模型 ID 来自 AI Studio 界面；模型列表暂不填未经确认的 token 上限及采样默认值。实际可用性和工具协议支持仍需通过有权限的上游账号验证。
 
 ## 工作方式
 
@@ -47,11 +52,11 @@ OpenAI Chat Completions、Responses、Claude Messages 和 Gemini 原生生成接
 
 **这不是开启抗截断的必要步骤。** 普通客户端直接选择模型即可，默认收到正常正文。
 
-仅在开发自定义客户端、需要将工具结构保留到最终客户端时，OpenAI Chat Completions 可额外使用 `X-Anti-Truncation-Output: tools` 选择响应格式。`X-Anti-Truncation-Mode` 不再参与启用判断。两个别名之外的模型不受这些请求头影响。
+仅在开发自定义客户端、需要将工具结构保留到最终客户端时，OpenAI Chat Completions 可额外使用 `X-Anti-Truncation-Output: tools` 选择响应格式。`X-Anti-Truncation-Mode` 不再参与启用判断。三个别名之外的模型不受这些请求头影响。
 
 工具输出模式返回 `append_output` 和 `finish_output` 的 OpenAI `tool_calls`。每个 SSE 工具参数是完整 JSON，包含唯一 ID 和连续 index；未完成或被拦截时不发送完成工具，结束原因分别是 `length` 或 `content_filter`。
 
-[`scripts/duplex-client.js`](../scripts/duplex-client.js) 提供可选的 `createFetch()` / `decodeResponse()` 适配器，将此格式还原为普通 OpenAI 正文。Node.js 可通过 `require` 引用；浏览器加载后使用 `AIStudioDuplex.createFetch()`。适配器只处理直连 `/v1/chat/completions` 的两个精确别名，不会给其他模型加工具。通过酒馆等客户端后端转发时，仍需确认其能透传工具响应和可选格式头，不能假定替换网页 fetch 就能修改其上游请求。
+[`scripts/duplex-client.js`](../scripts/duplex-client.js) 提供可选的 `createFetch()` / `decodeResponse()` 适配器，将此格式还原为普通 OpenAI 正文。Node.js 可通过 `require` 引用；浏览器加载后使用 `AIStudioDuplex.createFetch()`。适配器只处理直连 `/v1/chat/completions` 的三个精确别名，不会给其他模型加工具。通过酒馆等客户端后端转发时，仍需确认其能透传工具响应和可选格式头，不能假定替换网页 fetch 就能修改其上游请求。
 
 ## 验证和部署
 
@@ -63,6 +68,7 @@ OpenAI Chat Completions、Responses、Claude Messages 和 Gemini 原生生成接
 # 默认测试无需额外请求头，仅凭模型别名自动启用
 node tests/duplex-live.js --run --model=gemini-3.7-flash
 node tests/duplex-live.js --run --model=gemini-3.8-flash
+node tests/duplex-live.js --run --model=gemini-4-argon
 
 # 可选工具格式及客户端还原
 node tests/duplex-live.js --run --tools --model=gemini-3.8-flash
