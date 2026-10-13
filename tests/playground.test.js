@@ -121,8 +121,8 @@ test("model channels include aliases and are restored after restart", t => {
     const h = harness(t);
     assert.equal(h.router.channel("gemini-4-argon-抗截断"), "playground");
     assert.equal(h.router.channel("models/gemini-3.8-flash"), "build");
-    h.router.remember("gemini-3.8-flash");
-    assert.equal(new ModelRouter(h.handler).channel("gemini-3.8-flash-抗截断"), "playground");
+    h.router.remember("gemini-3.8-flash", 1);
+    assert.equal(new ModelRouter(h.handler).channel("gemini-3.8-flash-抗截断", 1), "playground");
 });
 
 test("only explicit Build permission or zero-quota failures trigger fallback", () => {
@@ -171,7 +171,7 @@ test("Build fallback runs once on the same account and ignores late Build frames
     assert.match((await h.queue.dequeue()).data, /hello/);
     assert.equal((await h.queue.dequeue()).type, "STREAM_END");
     assert.equal(h.calls(), 1);
-    assert.equal(h.router.channel("gemini-3.8-flash"), "playground");
+    assert.equal(h.router.channel("gemini-3.8-flash", 1), "playground");
 });
 
 test("a committed Build stream never switches transport", async t => {
@@ -306,4 +306,83 @@ test("channel groups contain each configured name exactly once", t => {
     assert.deepEqual(h.router.groups(), { build: ["gemini-3.8-flash"], playground: ["gemini-4-argon"] });
     h.handler.config.playgroundEnabled = false;
     assert.deepEqual(h.router.groups(), { build: ["gemini-3.8-flash", "gemini-4-argon"], playground: [] });
+});
+
+test("learned routes and cooldowns are scoped to account and expire", t => {
+    const h = harness(t);
+    h.router.remember("gemini-3.8-flash", 1);
+    assert.equal(h.router.channel("gemini-3.8-flash", 1), "playground");
+    assert.equal(h.router.channel("gemini-3.8-flash", 2), "build");
+    h.router.fail("gemini-3.8-flash", 1, 403);
+    assert.ok(h.router.record("gemini-3.8-flash", 1).failedUntil > Date.now());
+    assert.equal(h.router.record("gemini-3.8-flash", 2), undefined);
+    h.router.record("gemini-3.8-flash", 1).successAt = Date.now() - 86400001;
+    assert.equal(h.router.channel("gemini-3.8-flash", 1), "build");
+    h.router.remember("gemini-3.8-flash", 1);
+    assert.equal(h.router.record("gemini-3.8-flash", 1).failedUntil, 0);
+});
+
+test("catalog names and limits survive restart without globalizing account preferences", t => {
+    const h = harness(t);
+    h.router.discover([[["models/gemini-new", null, "", "New", "Description", 2000, 200, ["generateContent"]]]]);
+    h.router.remember("gemini-3.8-flash", 1);
+    h.handler.config.modelList = [{ name: "models/gemini-3.8-flash" }, { name: "models/gemini-4-argon" }];
+    const restored = new ModelRouter(h.handler);
+    assert.equal(h.handler.config.modelList.find(m => m.name === "models/gemini-new").outputTokenLimit, 200);
+    assert.equal(restored.channel("gemini-new"), "playground");
+    assert.equal(restored.channel("gemini-3.8-flash", 1), "playground");
+    assert.equal(restored.channel("gemini-3.8-flash", 2), "build");
+});
+
+test("true streaming does not accumulate a second complete response", async t => {
+    const h = harness(t, "real");
+    const original = WireCodec.merge;
+    let merges = 0;
+    WireCodec.merge = (...args) => {
+        merges++;
+        return original(...args);
+    };
+    try {
+        h.router.forward(h.spec, 1);
+        await h.queue.dequeue();
+        assert.match((await h.queue.dequeue()).data, /hello/);
+        assert.equal((await h.queue.dequeue()).type, "STREAM_END");
+        assert.equal(merges, 0);
+    } finally {
+        WireCodec.merge = original;
+    }
+});
+
+test("cooling Playground accounts fail quickly without dispatch or extending cooldown", async t => {
+    const h = harness(t);
+    h.router.fail("gemini-4-argon", 1, 429);
+    const until = h.router.record("gemini-4-argon", 1).failedUntil;
+    h.router.forward(h.spec, 1);
+    assert.equal((await h.queue.dequeue()).status, 503);
+    assert.equal(h.calls(), 0);
+    assert.equal(h.router.record("gemini-4-argon", 1).failedUntil, until);
+});
+
+test("first Playground permission failure can switch accounts, but committed streams cannot retry", async t => {
+    for (const committed of [false, true]) {
+        const h = harness(t, "real");
+        h.router.sessions.set(h.context, {
+            async request(_m, _b, { onData }) {
+                if (committed) onData(response("prefix"));
+                throw Object.assign(new Error("Playground HTTP 403: The caller does not have permission"), {
+                    status: 403,
+                });
+            },
+        });
+        h.router.forward(h.spec, 1);
+        if (committed) {
+            await h.queue.dequeue();
+            await h.queue.dequeue();
+        }
+        const error = await h.queue.dequeue();
+        assert.equal(error.status, committed ? 403 : 503);
+        if (committed) assert.equal(error.retryable, false);
+        assert.ok(h.router.record("gemini-4-argon", 1).failedUntil > Date.now());
+        assert.equal(h.router.record("gemini-4-argon", 2), undefined);
+    }
 });

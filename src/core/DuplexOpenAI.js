@@ -8,7 +8,7 @@ class DuplexOpenAI {
     static async handle(handler, req, res) {
         const requestId = handler._generateRequestId();
         const stream = req.body?.stream === true;
-        const streamMode = stream ? (handler.config.streamingMode === "fake" ? "fake" : "real") : null;
+        const streamMode = stream ? (handler.config.antiTruncationStreamingMode === "fake" ? "fake" : "real") : null;
         const fakeStream = streamMode === "fake";
         const output = req.headers?.["x-anti-truncation-output"] || "text";
         const model = req.body?.model;

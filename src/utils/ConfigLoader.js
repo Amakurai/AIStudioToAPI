@@ -48,6 +48,7 @@ class ConfigLoader {
     loadConfiguration() {
         const config = {
             aiStudioAppUrl: DEFAULT_AI_STUDIO_APP_URL,
+            antiTruncationStreamingMode: "real",
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
@@ -133,6 +134,8 @@ class ConfigLoader {
             );
             // Do not modify config.wsPort - keep it at default 9998
         }
+        if (["real", "fake"].includes(process.env.ANTI_TRUNCATION_STREAMING_MODE))
+            config.antiTruncationStreamingMode = process.env.ANTI_TRUNCATION_STREAMING_MODE;
         if (process.env.PLAYGROUND_ENABLED)
             config.playgroundEnabled = process.env.PLAYGROUND_ENABLED.toLowerCase() !== "false";
         if (process.env.MAX_CONTEXTS) {

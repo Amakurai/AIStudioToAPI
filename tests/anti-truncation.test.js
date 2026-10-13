@@ -1775,6 +1775,7 @@ test("duplex appends are bounded and empty or malformed arguments cannot produce
 
 test("duplex streams a first segment while the model is still generating later segments", async () => {
     const h = requestHarness([duplexReply("append_output", { seq: 1, text: "visible-before-completion" }), null]);
+    h.handler.config.streamingMode = "fake"; // Ordinary streams must not buffer duplex segments.
     const req = apiRequest("openai", "gemini-3.8-flash-抗截断", true);
     const res = new FakeResponse();
     const pending = h.handler.processOpenAIRequest(req, res);
@@ -1790,7 +1791,7 @@ test("duplex streams a first segment while the model is still generating later s
 test("fake mode buffers anti-truncation segments, then visibly streams the complete text", async () => {
     const tail = "中🙂".repeat(150);
     const h = requestHarness([duplexReply("append_output", { seq: 1, text: "前半" }), null]);
-    h.handler.config.streamingMode = "fake";
+    h.handler.config.antiTruncationStreamingMode = "fake";
     const res = new FakeResponse();
     const pending = h.handler.processOpenAIRequest(apiRequest("openai", "gemini-3.8-flash-抗截断", true), res);
     await new Promise(resolve => setImmediate(resolve));
@@ -1815,7 +1816,7 @@ test("fake mode buffers anti-truncation segments, then visibly streams the compl
 test("streams open immediately before browser readiness or model output", async () => {
     for (const mode of ["fake", "real"]) {
         const h = requestHarness([duplexReply("append_output", { done: true, seq: 1, text: "ready" })]);
-        h.handler.config.streamingMode = mode;
+        h.handler.config.antiTruncationStreamingMode = mode;
         let release;
         const ready = new Promise(resolve => {
             release = resolve;
@@ -1846,7 +1847,7 @@ test("streams open immediately before browser readiness or model output", async 
 
 test("opening frames cross a relay that buffers one event while fake-stream text stays buffered", async () => {
     const h = requestHarness([duplexReply("append_output", { seq: 1, text: "buffered prefix" }), null]);
-    h.handler.config.streamingMode = "fake";
+    h.handler.config.antiTruncationStreamingMode = "fake";
     const res = new FakeResponse();
     let held = "";
     let downstream = "";
@@ -1944,7 +1945,7 @@ test("invalid streaming requests still return HTTP errors before opening SSE", a
 
 test("fake mode preserves optional tool output for the client decoder", async () => {
     const h = requestHarness([duplexReply("append_output", { done: true, seq: 1, text: "正文🙂" })]);
-    h.handler.config.streamingMode = "fake";
+    h.handler.config.antiTruncationStreamingMode = "fake";
     const req = apiRequest("openai", "gemini-3.8-flash-抗截断", true);
     req.headers = { "x-anti-truncation-output": "tools" };
     const res = new FakeResponse();
@@ -1966,7 +1967,7 @@ test("fake mode sends data heartbeats while waiting for upstream", async () => {
     const original = DuplexOpenAI.HEARTBEAT_INTERVAL_MS;
     DuplexOpenAI.HEARTBEAT_INTERVAL_MS = 10;
     const h = requestHarness([null]);
-    h.handler.config.streamingMode = "fake";
+    h.handler.config.antiTruncationStreamingMode = "fake";
     const res = new FakeResponse();
     const pending = h.handler.processOpenAIRequest(apiRequest("openai", "gemini-3.8-flash-抗截断", true), res);
     try {

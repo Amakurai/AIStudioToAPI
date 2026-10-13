@@ -20,7 +20,12 @@ class PlaygroundSession {
         if (signal.aborted) throw cancelled();
         const run = this.pending.then(() => {
             if (signal.aborted) throw cancelled();
-            return this._request(model, body, { onData, signal, timeoutMs });
+            return this._request(model, body, { onData, signal, timeoutMs }).catch(error => {
+                // Only retry preparation; never repeat an inference which may have produced output.
+                if (error.resetFailed && !signal.aborted)
+                    return this._request(model, body, { onData, signal, timeoutMs });
+                throw error;
+            });
         });
         // Keep the account lock until the active operation has actually stopped, even if
         // its caller has cancelled. A cancelled waiter must never open a page later.
@@ -41,6 +46,7 @@ class PlaygroundSession {
         const wire = WireCodec.encode(model, body);
         if (!this.page || this.page.isClosed()) {
             this.page = await this.context.newPage();
+            this.pageModel = null;
             this.page.on("response", async response => {
                 if (response.url() === `${RPC_ORIGIN}${RPC_PATH.replace("GenerateContent", "ListModels")}`) {
                     try {
@@ -85,13 +91,29 @@ class PlaygroundSession {
         signal.addEventListener("abort", abort, { once: true });
         try {
             if (signal.aborted) throw cancelled();
-            await page.goto(
-                `https://aistudio.google.com/prompts/new_chat?model=${encodeURIComponent(model)}&temporary=true&hl=en`,
-                {
-                    timeout: Math.min(timeoutMs, 60000),
-                    waitUntil: "domcontentloaded",
+            let reused = false;
+            if (this.pageModel === model && Date.now() - this.loadedAt < 600000) {
+                try {
+                    await page.getByRole("button", { exact: true, name: "New chat" }).click({ timeout: 5000 });
+                    const discard = page.getByRole("button", { exact: true, name: "Discard and continue" });
+                    if (await discard.isVisible()) await discard.click({ timeout: 5000 });
+                    await page.getByRole("textbox", { exact: true, name: "Enter a prompt" }).waitFor({ timeout: 5000 });
+                    reused = true;
+                } catch {
+                    /* Fall back to a clean navigation before signing. */
                 }
-            );
+            }
+            if (!reused) {
+                await page.goto(
+                    `https://aistudio.google.com/prompts/new_chat?model=${encodeURIComponent(model)}&temporary=true&hl=en`,
+                    {
+                        timeout: Math.min(timeoutMs, 60000),
+                        waitUntil: "domcontentloaded",
+                    }
+                );
+                this.pageModel = model;
+                this.loadedAt = Date.now();
+            }
             if (new URL(page.url()).hostname !== "aistudio.google.com") {
                 throw Object.assign(
                     new Error(
@@ -117,8 +139,9 @@ class PlaygroundSession {
             await page.getByRole("button", { name: /^Run(?:\s|$)/ }).click({ timeout: Math.min(timeoutMs, 30000) });
             const template = await envelope;
             if (signal.aborted) throw cancelled();
-            if (WireCodec.hash(template.body) !== WireCodec.hash(wire)) {
+            if (template.body[0] !== wire[0] || WireCodec.hash(template.body) !== WireCodec.hash(wire)) {
                 throw Object.assign(new Error("Playground could not sign this prompt without changing its content"), {
+                    resetFailed: reused,
                     retryable: false,
                     status: 400,
                 });
@@ -147,58 +170,36 @@ class PlaygroundSession {
                 Object.entries(template.headers).filter(([name]) => !forbidden.has(name) && !name.startsWith("sec-"))
             );
             // In particular preserve x-aistudio-g1-tier and the native entitlement headers.
-            await page.evaluate(
-                ({ headers, payload, url }) => {
-                    const state = { chunks: [], done: false, error: null, status: 0 };
-                    window.__gatewayStream = state;
-                    void (async () => {
-                        try {
-                            const response = await fetch(url, {
-                                body: JSON.stringify(payload),
-                                credentials: "include",
-                                headers,
-                                method: "POST",
-                            });
-                            state.status = response.status;
-                            if (!response.ok) {
-                                state.error = await response.text();
-                                return;
-                            }
-                            const reader = response.body.getReader();
-                            const decoder = new TextDecoder();
-                            for (;;) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                state.chunks.push(decoder.decode(value, { stream: true }));
-                            }
-                            const tail = decoder.decode();
-                            if (tail) state.chunks.push(tail);
-                        } catch (error) {
-                            state.error = error.message;
-                        } finally {
-                            state.done = true;
-                        }
-                    })();
+            let result = await page.evaluate(
+                async ({ headers, payload, url }) => {
+                    const response = await fetch(url, {
+                        body: JSON.stringify(payload),
+                        credentials: "include",
+                        headers,
+                        method: "POST",
+                    });
+                    if (!response.ok) return { done: true, error: await response.text(), status: response.status };
+                    window.__gatewayStream = { decoder: new TextDecoder(), reader: response.body.getReader() };
+                    return { done: false, status: response.status };
                 },
                 { headers, payload, url: `${RPC_ORIGIN}${RPC_PATH}` }
             );
-            // Camoufox's isolated evaluation world cannot call main-world exposeBinding functions.
-            // Drain its own queue; this preserves incremental output without page-global hooks.
-            let result;
-            do {
+            // Await the next network chunk in Camoufox's isolated world. There is no polling
+            // timer or producer queue, and the next read starts only after onData completes.
+            while (!result.done) {
                 if (signal.aborted) throw cancelled();
-                result = await page.evaluate(() => {
+                result = await page.evaluate(async () => {
                     const state = window.__gatewayStream;
-                    return {
-                        chunks: state.chunks.splice(0),
-                        done: state.done,
-                        error: state.error,
-                        status: state.status,
-                    };
+                    const { done, value } = await state.reader.read();
+                    const chunk = done ? state.decoder.decode() : state.decoder.decode(value, { stream: true });
+                    if (done) {
+                        state.reader.releaseLock();
+                        delete window.__gatewayStream;
+                    }
+                    return { chunk, done, status: 200 };
                 });
-                for (const chunk of result.chunks) onData(chunk);
-                if (!result.done) await new Promise(resolve => setTimeout(resolve, 40));
-            } while (!result.done);
+                if (result.chunk) await onData(result.chunk);
+            }
             if (result.error && result.status < 400) throw new Error(`Playground network failure: ${result.error}`);
             if (result.status >= 400) {
                 // Include server error, never headers, cookies, snapshots or the request body.

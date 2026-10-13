@@ -174,7 +174,7 @@
     "maxContextsHint": "0 表示不限制；运行时生效，重启后恢复为环境变量值",
     "maxRetries": "错误重试次数",
     "modelChannels": "模型通道",
-    "modelChannelsHelp": "按默认通道自动发送请求；成功切换后会记住选择。分组不代表所有账号都拥有该模型权限。",
+    "modelChannelsHelp": "分组显示默认通道；实际请求按账号自动选择，成功记录保留 24 小时。",
     "modelUsage": "模型使用",
     "modelUsageBreakdown": "模型使用分布",
     "networkError": "网络连接失败，请检查您的网络设置。",

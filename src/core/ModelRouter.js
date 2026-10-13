@@ -10,11 +10,15 @@ class ModelRouter {
         this.sessions = new WeakMap();
         this.routes = new Map([["gemini-4-argon", "playground"]]);
         this.routeFile = handler.config.modelRoutesPath || path.join(process.cwd(), "data", "model-routes.json");
+        this.accounts = {};
+        this.catalog = [];
         if (handler.config.playgroundEnabled) {
             try {
                 const saved = JSON.parse(fs.readFileSync(this.routeFile, "utf8"));
-                for (const [model, channel] of Object.entries(saved)) {
-                    if (/^[a-z0-9._-]+$/.test(model) && channel === "playground") this.routes.set(model, channel);
+                // Legacy global learned routes cannot establish another account's entitlement.
+                if (saved.version === 2) {
+                    this.accounts = saved.accounts || {};
+                    this.restoreCatalog(saved.models || []);
                 }
             } catch (error) {
                 if (error.code !== "ENOENT")
@@ -22,13 +26,48 @@ class ModelRouter {
             }
         }
     }
-    channel(model) {
+    accountKey(authIndex) {
+        const name = this.handler.authSource?.accountNameMap?.get(authIndex);
+        const identity =
+            typeof name === "string" && name.includes("@") ? name.trim().toLowerCase() : `index:${authIndex}`;
+        return require("crypto").createHash("sha256").update(identity).digest("hex");
+    }
+    record(model, authIndex) {
+        return this.accounts[this.accountKey(authIndex)]?.[model];
+    }
+    channel(model, authIndex) {
+        if (!this.handler.config.playgroundEnabled) return "build";
         const normalized = String(model || "").replace(/^models\//, "");
-        return (
-            (this.handler.config.playgroundEnabled &&
-                this.routes.get(AntiTruncation.baseModel(normalized) || normalized)) ||
-            "build"
-        );
+        const base = AntiTruncation.baseModel(normalized) || normalized;
+        const learned = authIndex === undefined ? null : this.record(base, authIndex);
+        if (learned?.channel === "playground" && Date.now() - learned.successAt < 86400000) return "playground";
+        return this.routes.get(base) || "build";
+    }
+    save() {
+        try {
+            fs.mkdirSync(path.dirname(this.routeFile), { recursive: true });
+            fs.writeFileSync(
+                `${this.routeFile}.tmp`,
+                JSON.stringify({ accounts: this.accounts, models: this.catalog, version: 2 }, null, 2) + "\n"
+            );
+            fs.renameSync(`${this.routeFile}.tmp`, this.routeFile);
+        } catch (error) {
+            this.handler.logger.warn(`[Routing] Could not save model routes: ${error.message}`);
+        }
+    }
+    restoreCatalog(models) {
+        for (const model of models) {
+            if (!model || !/^models\/[a-z0-9._-]+$/.test(model.name)) continue;
+            const existing = this.handler.config.modelList?.find(m => m.name === model.name);
+            if (!existing) {
+                this.handler.config.modelList?.push(model);
+                this.routes.set(model.name.slice(7), "playground");
+            } else if (this.routes.has(model.name.slice(7))) {
+                for (const key of ["inputTokenLimit", "outputTokenLimit"])
+                    if (Number.isFinite(model[key])) existing[key] = model[key];
+            }
+            this.catalog.push(model);
+        }
     }
     groups() {
         const groups = { build: [], playground: [] };
@@ -37,41 +76,55 @@ class ModelRouter {
         }
         return groups;
     }
-    remember(model) {
-        if (this.routes.get(model) === "playground") return;
-        this.routes.set(model, "playground");
-        try {
-            fs.mkdirSync(path.dirname(this.routeFile), { recursive: true });
-            fs.writeFileSync(`${this.routeFile}.tmp`, JSON.stringify(Object.fromEntries(this.routes), null, 2) + "\n");
-            fs.renameSync(`${this.routeFile}.tmp`, this.routeFile);
-        } catch (error) {
-            this.handler.logger.warn(`[Routing] Could not save model routes: ${error.message}`);
-        }
+    remember(model, authIndex) {
+        const key = this.accountKey(authIndex);
+        this.accounts[key] ||= {};
+        this.accounts[key][model] = { channel: "playground", failedUntil: 0, successAt: Date.now() };
+        this.save();
+    }
+    fail(model, authIndex, status) {
+        if (![401, 403, 429, 502, 503, 504].includes(status)) return;
+        const key = this.accountKey(authIndex);
+        this.accounts[key] ||= {};
+        this.accounts[key][model] = {
+            ...this.accounts[key][model],
+            failedUntil: Date.now() + (status === 401 || status === 403 ? 300000 : 60000),
+            lastFailureAt: Date.now(),
+        };
+        this.save();
     }
     discover(raw) {
         const models = this.handler.config.modelList;
         if (!Array.isArray(models)) return;
+        const catalog = new Map(this.catalog.map(m => [m.name, m]));
         for (const m of raw?.[0] || []) {
-            if (!Array.isArray(m) || typeof m[0] !== "string" || !m[0].startsWith("models/")) continue;
-            if (!m[7]?.includes("generateContent")) continue;
-            const existing = models.find(x => x.name === m[0]);
-            if (existing) {
-                if (this.channel(m[0]) === "playground") {
-                    if (Number.isFinite(m[5])) existing.inputTokenLimit = m[5];
-                    if (Number.isFinite(m[6])) existing.outputTokenLimit = m[6];
-                }
+            if (
+                !Array.isArray(m) ||
+                !/^models\/[a-z0-9._-]+$/.test(m[0]) ||
+                !Array.isArray(m[7]) ||
+                !m[7].includes("generateContent")
+            )
                 continue;
-            }
-            models.push({
+            const metadata = {
                 description: m[4] || "",
                 displayName: m[3] || m[0],
                 inputTokenLimit: m[5],
                 name: m[0],
                 outputTokenLimit: m[6],
                 supportedGenerationMethods: ["generateContent"],
-            });
-            this.remember(m[0].slice(7));
+            };
+            catalog.set(m[0], metadata);
+            const existing = models.find(x => x.name === m[0]);
+            if (!existing) {
+                models.push(metadata);
+                this.routes.set(m[0].slice(7), "playground");
+            } else if (this.channel(m[0]) === "playground") {
+                for (const key of ["inputTokenLimit", "outputTokenLimit"])
+                    if (Number.isFinite(metadata[key])) existing[key] = metadata[key];
+            }
         }
+        this.catalog = [...catalog.values()];
+        this.save();
     }
     static canFallback(message) {
         if (message.event_type !== "error") return false;
@@ -90,7 +143,7 @@ class ModelRouter {
         const model = decodeURIComponent(match[1]);
         const entry = this.handler.connectionRegistry.messageQueues.get(spec.request_id);
         if (!entry || entry.queue.closed) return false;
-        if (this.channel(model) === "playground") {
+        if (this.channel(model, authIndex) === "playground") {
             this._start(spec, authIndex, entry, model);
             return true;
         }
@@ -143,6 +196,7 @@ class ModelRouter {
         let started = false;
         const realStream = spec.streaming_mode === "real" && spec.path.endsWith(":streamGenerateContent");
         const merged = {};
+        let completed = false;
         const headers = () => {
             if (started || !active()) return;
             started = true;
@@ -156,6 +210,11 @@ class ModelRouter {
             });
         };
         try {
+            if (this.record(model, authIndex)?.failedUntil > Date.now())
+                throw Object.assign(new Error("Playground channel is cooling down for this account and model"), {
+                    coolingDown: true,
+                    status: 503,
+                });
             const context = this.handler.browserManager.contexts.get(authIndex)?.context;
             if (!context) throw Object.assign(new Error("Playground account context is unavailable"), { status: 503 });
             let session = this.sessions.get(context);
@@ -165,7 +224,8 @@ class ModelRouter {
             }
             const parser = new WireStream(raw => {
                 const chunk = WireCodec.decode(raw, model);
-                WireCodec.merge(merged, chunk);
+                completed ||= !!chunk.candidates?.some(c => c.finishReason) || !!chunk.promptFeedback?.blockReason;
+                if (!realStream) WireCodec.merge(merged, chunk);
                 if (realStream && active()) {
                     headers();
                     queue.enqueue({ data: `data: ${JSON.stringify(chunk)}\n\n`, event_type: "chunk" });
@@ -181,19 +241,26 @@ class ModelRouter {
             });
             if (!active()) return;
             parser.finish();
-            if (!merged.candidates?.some(c => c.finishReason) && !merged.promptFeedback?.blockReason) {
+            if (!completed) {
                 throw Object.assign(new Error("Playground response ended without a finish reason"), {
                     retryable: false,
                     status: 502,
                 });
             }
-            this.remember(model);
+            this.remember(model, authIndex);
             if (!realStream) {
                 headers();
                 queue.enqueue({ data: JSON.stringify(merged), event_type: "chunk" });
             }
             queue.enqueue({ type: "STREAM_END" });
         } catch (error) {
+            const upstreamStatus = Number(error.status) || 502;
+            const unavailableAccount =
+                !started &&
+                (upstreamStatus === 401 ||
+                    (upstreamStatus === 403 && /permission|PERMISSION_DENIED/i.test(error.message)));
+            if (!error.coolingDown && (!controller.signal.aborted || timedOut))
+                this.fail(model, authIndex, timedOut ? 504 : upstreamStatus);
             if (
                 !queue.closed &&
                 registry.messageQueues.get(spec.request_id) === entry &&
@@ -203,7 +270,9 @@ class ModelRouter {
                     event_type: "error",
                     message: timedOut ? "Playground request timed out" : error.message,
                     retryable: started ? false : error.retryable,
-                    status: timedOut ? 504 : Number(error.status) || 502,
+                    // Let the existing bounded account-switch mechanism handle an unavailable
+                    // Playground account on its first failure, not only during its cooldown.
+                    status: timedOut ? 504 : unavailableAccount ? 503 : upstreamStatus,
                 });
             }
         } finally {
