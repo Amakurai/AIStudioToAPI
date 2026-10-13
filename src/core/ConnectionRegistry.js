@@ -271,6 +271,7 @@ class ConnectionRegistry extends EventEmitter {
                     );
                     return;
                 }
+                if (entry.onUpstreamMessage?.(parsedMessage)) return;
                 this._routeMessage(parsedMessage, entry.queue);
             } else {
                 this.logger.warn(`[Server] Received message for unknown or outdated request ID: ${requestId}`);

@@ -7,6 +7,7 @@
 
 const AuthSwitcher = require("../../auth/AuthSwitcher");
 const FormatConverter = require("../FormatConverter");
+const ModelRouter = require("../ModelRouter");
 const { DEFAULT_TIMEOUTS } = require("./constants");
 
 class RequestHandler {
@@ -32,6 +33,7 @@ class RequestHandler {
              * import("../FormatConverter/ResponsesNonStreamResponseConverter")}
              */ (new FormatConverter(logger, serverSystem));
 
+        this.modelRouter = new ModelRouter(this);
         this.needsSwitchingAfterRequest = false;
 
         // Round-robin cursor for multi-account dispatch: rotates among equally

@@ -13,6 +13,10 @@
 - 📝 **模型支持**：通过 AI Studio 访问各种 Gemini 模型，包括生图模型和 TTS 语音合成模型
 - 🎨 **主页展示控制**：提供可视化的 Web 控制台，支持账号管理、VNC 登录等操作
 
+## Build / Playground 自动分流
+
+已登录账号可直接使用 Playground 通道。Argon 及其抗截断版本默认走 Playground；其他模型保留 Build 优先，遇到明确的通道权限问题时自动尝试 Playground 并记住成功选择。控制台展示模型分组，无需额外抓取 Cookie。详见 [Playground 兼容说明](docs/playground.md)。
+
 ## 🚀 快速开始
 
 ### 💻 直接运行（Windows / macOS / Linux）
@@ -265,7 +269,7 @@ services:
 | `SWITCH_ON_USES`                | 自动切换帐户前允许的请求次数（设为 `0` 禁用）。                                                                                                                     | `40`      |
 | `FAILURE_THRESHOLD`             | 切换帐户前允许的连续失败次数（设为 `0` 禁用）。                                                                                                                     | `3`       |
 | `IMMEDIATE_SWITCH_STATUS_CODES` | 触发立即切换帐户的 HTTP 状态码（逗号分隔，设为空值以禁用）。                                                                                                        | `429,503` |
-| `RATE_LIMIT_COOLDOWN_MS` | 429 后已换下账号重新参与分发前的间隔（毫秒，必须为正数）。有可用账号时立即换号重试，不等待此间隔。 | `60000` |
+| `RATE_LIMIT_COOLDOWN_MS`        | 429 后已换下账号重新参与分发前的间隔（毫秒，必须为正数）。有可用账号时立即换号重试，不等待此间隔。                                                                  | `60000`   |
 | `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
 | `AI_STUDIO_APP_URL`             | 要打开的 AI Studio 应用地址（可选），格式为 `https://ai.studio/apps/<应用 ID>`；留空时使用内置应用。[教程](docs/zh/create-ai-studio-app.md)                         | 内置应用  |
 | `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |

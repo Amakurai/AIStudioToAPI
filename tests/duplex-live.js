@@ -10,7 +10,8 @@ async function main() {
     const upstream = args.includes("--upstream");
     const toolOutput = args.includes("--tools");
     const model = args.find(arg => arg.startsWith("--model="))?.slice(8) || "gemini-3.8-flash";
-    if (!["gemini-3.7-flash", "gemini-3.8-flash"].includes(model)) throw new Error("Unexpected test model");
+    if (!["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"].includes(model))
+        throw new Error("Unexpected test model");
     const root = path.join(__dirname, "..");
     const env = require("dotenv").parse(fs.readFileSync(path.join(root, ".env")));
     const key = (env.API_KEYS || "123456")

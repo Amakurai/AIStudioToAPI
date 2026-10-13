@@ -65,6 +65,7 @@ class ConfigLoader {
             immediateSwitchStatusCodes: [429, 503],
             maxContexts: 1,
             maxRetries: 3,
+            playgroundEnabled: true,
             rateLimitCooldownMs: 60000,
             retryDelay: 2000,
             safetySettingsThreshold: "OFF",
@@ -132,6 +133,8 @@ class ConfigLoader {
             );
             // Do not modify config.wsPort - keep it at default 9998
         }
+        if (process.env.PLAYGROUND_ENABLED)
+            config.playgroundEnabled = process.env.PLAYGROUND_ENABLED.toLowerCase() !== "false";
         if (process.env.MAX_CONTEXTS) {
             const parsed = parseInt(process.env.MAX_CONTEXTS, 10);
             config.maxContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.maxContexts;

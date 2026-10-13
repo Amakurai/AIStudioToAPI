@@ -1081,6 +1081,7 @@ class StatusRoutes {
                 logMaxCount: limit,
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
+                modelChannels: requestHandler.modelRouter?.groups() || { build: [], playground: [] },
                 rotationIndicesRaw: rotationIndices,
                 safetySettingsThreshold: config.safetySettingsThreshold,
                 streamingMode: config.streamingMode,

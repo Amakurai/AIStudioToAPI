@@ -100,27 +100,28 @@ class ProxyServerSystem extends EventEmitter {
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
 
         // index.js mounts the request/response modules onto this instance's prototype at runtime.
-        this.requestHandler = /** @type {RequestHandler &
-         * import("./RequestHandler/ConnectionHandler") &
-         * import("./RequestHandler/RetryHandler") &
-         * import("./RequestHandler/GeminiHandler") &
-         * import("./RequestHandler/EmbeddingsHandler") &
-         * import("./RequestHandler/UploadHandler") &
-         * import("./RequestHandler/ChatCompletionsHandler") &
-         * import("./RequestHandler/ResponsesHandler") &
-         * import("./RequestHandler/ClaudeHandler") &
-         * import("./RequestHandler/ErrorHandler") &
-         * import("./RequestHandler/TransportHandler")}
-         */ (
-            new RequestHandler(
-                this,
-                this.connectionRegistry,
-                this.logger,
-                this.browserManager,
-                this.config,
-                this.authSource
-            )
-        );
+        this.requestHandler =
+            /** @type {RequestHandler &
+             * import("./RequestHandler/ConnectionHandler") &
+             * import("./RequestHandler/RetryHandler") &
+             * import("./RequestHandler/GeminiHandler") &
+             * import("./RequestHandler/EmbeddingsHandler") &
+             * import("./RequestHandler/UploadHandler") &
+             * import("./RequestHandler/ChatCompletionsHandler") &
+             * import("./RequestHandler/ResponsesHandler") &
+             * import("./RequestHandler/ClaudeHandler") &
+             * import("./RequestHandler/ErrorHandler") &
+             * import("./RequestHandler/TransportHandler")}
+             */ (
+                new RequestHandler(
+                    this,
+                    this.connectionRegistry,
+                    this.logger,
+                    this.browserManager,
+                    this.config,
+                    this.authSource
+                )
+            );
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
 
         this.httpServer = null;
@@ -485,6 +486,7 @@ class ProxyServerSystem extends EventEmitter {
                 max_tokens: model.outputTokenLimit,
                 object: "model",
                 owned_by: "google",
+                upstream_channel: this.requestHandler.modelRouter.channel(model.name),
             }));
 
             res.status(200).json({
@@ -494,7 +496,12 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.get(["/v1beta/models"], (req, res) => {
-            res.status(200).json({ models: this.config.modelList });
+            res.status(200).json({
+                models: this.config.modelList.map(model => ({
+                    ...model,
+                    upstreamChannel: this.requestHandler.modelRouter.channel(model.name),
+                })),
+            });
         });
 
         app.post("/v1/chat/completions", (req, res) => {

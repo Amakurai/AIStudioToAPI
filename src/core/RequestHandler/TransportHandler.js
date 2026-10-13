@@ -76,6 +76,7 @@ class TransportHandler extends RequestHandler {
     }
 
     _cancelBrowserRequest(requestId, authIndex, requestAttemptId = null) {
+        if (this.modelRouter?.cancel(requestId, requestAttemptId)) return;
         const targetAuthIndex = authIndex !== undefined ? authIndex : this.currentAuthIndex;
         const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
@@ -150,6 +151,7 @@ class TransportHandler extends RequestHandler {
             void AntiTruncation.forward(this, proxyRequest, authIndex);
             return;
         }
+        if (this.modelRouter?.forward(proxyRequest, authIndex)) return;
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
             this.logger.debug(

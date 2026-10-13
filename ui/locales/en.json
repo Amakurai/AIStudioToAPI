@@ -173,6 +173,8 @@
     "maxContexts": "Max Concurrent Accounts",
     "maxContextsHint": "0 means unlimited; applies at runtime, resets to the env value after restart",
     "maxRetries": "Error Retries",
+    "modelChannels": "Model Channels",
+    "modelChannelsHelp": "Requests use the preferred channel automatically. Successful fallback choices are remembered. Groups do not guarantee access for every account.",
     "modelUsage": "Model Usage",
     "modelUsageBreakdown": "Model Usage Breakdown",
     "networkError": "Network connection failed. Please check your network settings.",
