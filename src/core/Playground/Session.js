@@ -14,16 +14,17 @@ class PlaygroundSession {
         this.pending = Promise.resolve();
     }
 
-    async request(model, body, { signal, onData, timeoutMs }) {
+    async request(model, body, { signal, onData, timeoutMs, onStage = () => {} }) {
         // Each account has one temporary UI used to obtain fresh native request credentials.
         // Separate account contexts remain independent and can run concurrently.
         if (signal.aborted) throw cancelled();
+        onStage("queued");
         const run = this.pending.then(() => {
             if (signal.aborted) throw cancelled();
-            return this._request(model, body, { onData, signal, timeoutMs }).catch(error => {
+            return this._request(model, body, { onData, onStage, signal, timeoutMs }).catch(error => {
                 // Only retry preparation; never repeat an inference which may have produced output.
                 if (error.resetFailed && !signal.aborted)
-                    return this._request(model, body, { onData, signal, timeoutMs });
+                    return this._request(model, body, { onData, onStage, signal, timeoutMs });
                 throw error;
             });
         });
@@ -42,7 +43,8 @@ class PlaygroundSession {
         }
     }
 
-    async _request(model, body, { signal, onData, timeoutMs }) {
+    async _request(model, body, { signal, onData, timeoutMs, onStage }) {
+        onStage("prepare_page");
         const wire = WireCodec.encode(model, body);
         if (!this.page || this.page.isClosed()) {
             this.page = await this.context.newPage();
@@ -82,6 +84,7 @@ class PlaygroundSession {
             });
         }
         const page = this.page;
+        let preparationTimer;
         const abort = () => {
             // Closing this dedicated page interrupts navigation, signing, and an active fetch.
             this.capture?.reject(cancelled());
@@ -128,6 +131,19 @@ class PlaygroundSession {
             if (await cookieNotice.isVisible()) await cookieNotice.click();
             const envelope = new Promise((resolve, reject) => {
                 this.capture = { reject, resolve };
+                // UI submission has its own short deadline; model generation keeps
+                // the separately configured long deadline after dispatch succeeds.
+                // Nothing reached inference yet, so another account may safely retry it.
+                preparationTimer = setTimeout(
+                    () =>
+                        reject(
+                            Object.assign(
+                                new Error("Playground prompt submission timed out before inference started"),
+                                { status: 504 }
+                            )
+                        ),
+                    Math.min(timeoutMs, 60000)
+                );
             });
             // Attach immediately so aborting during a UI operation cannot reject an unobserved promise.
             envelope.catch(() => {});
@@ -135,9 +151,12 @@ class PlaygroundSession {
                 .flatMap(c => c[0].map(p => p[1] ?? p[2]?.[1] ?? p[5]?.[0] ?? p[8] ?? p[9] ?? ""))
                 .join(" ");
             // The native signer hashes this same space-joined content, including tool-only parts.
+            onStage("submit_prompt");
             await input.fill(hashText || " ");
             await page.getByRole("button", { name: /^Run(?:\s|$)/ }).click({ timeout: Math.min(timeoutMs, 30000) });
             const template = await envelope;
+            clearTimeout(preparationTimer);
+            onStage("request_dispatched");
             if (signal.aborted) throw cancelled();
             if (template.body[0] !== wire[0] || WireCodec.hash(template.body) !== WireCodec.hash(wire)) {
                 throw Object.assign(new Error("Playground could not sign this prompt without changing its content"), {
@@ -152,6 +171,11 @@ class PlaygroundSession {
             // Discard UI tools/format while preserving protocol-only defaults from the native envelope.
             generation[7] = null;
             generation[8] = null;
+            // The UI template shows thoughts by default; the API omits them unless requested.
+            if (Array.isArray(generation[16]) && wire[3][16] == null) {
+                generation[16] = [...generation[16]];
+                generation[16][0] = 0;
+            }
             wire[3].forEach((value, index) => {
                 if (value !== undefined && value !== null) generation[index] = value;
             });
@@ -172,18 +196,25 @@ class PlaygroundSession {
             // In particular preserve x-aistudio-g1-tier and the native entitlement headers.
             let result = await page.evaluate(
                 async ({ headers, payload, url }) => {
-                    const response = await fetch(url, {
-                        body: JSON.stringify(payload),
-                        credentials: "include",
-                        headers,
-                        method: "POST",
-                    });
+                    let response;
+                    try {
+                        response = await fetch(url, {
+                            body: JSON.stringify(payload),
+                            credentials: "include",
+                            headers,
+                            method: "POST",
+                        });
+                    } catch (error) {
+                        return { done: true, error: String(error?.message || error), status: 0 };
+                    }
                     if (!response.ok) return { done: true, error: await response.text(), status: response.status };
                     window.__gatewayStream = { decoder: new TextDecoder(), reader: response.body.getReader() };
                     return { done: false, status: response.status };
                 },
                 { headers, payload, url: `${RPC_ORIGIN}${RPC_PATH}` }
             );
+            onStage("upstream_headers");
+            let receivedData = false;
             // Await the next network chunk in Camoufox's isolated world. There is no polling
             // timer or producer queue, and the next read starts only after onData completes.
             while (!result.done) {
@@ -198,9 +229,19 @@ class PlaygroundSession {
                     }
                     return { chunk, done, status: 200 };
                 });
-                if (result.chunk) await onData(result.chunk);
+                if (result.chunk) {
+                    if (!receivedData) {
+                        receivedData = true;
+                        onStage("first_chunk");
+                    }
+                    await onData(result.chunk);
+                }
             }
-            if (result.error && result.status < 400) throw new Error(`Playground network failure: ${result.error}`);
+            if (result.error && result.status < 400) {
+                throw Object.assign(new Error(`Playground network failure: ${String(result.error).slice(0, 500)}`), {
+                    status: 502,
+                });
+            }
             if (result.status >= 400) {
                 // Include server error, never headers, cookies, snapshots or the request body.
                 throw Object.assign(
@@ -208,12 +249,14 @@ class PlaygroundSession {
                     { status: result.status }
                 );
             }
+            onStage("complete");
             return result;
         } catch (error) {
             // Also stop the browser fetch when decoding or the downstream consumer fails.
             await page.close().catch(() => {});
             throw error;
         } finally {
+            clearTimeout(preparationTimer);
             this.capture = null;
             signal.removeEventListener("abort", abort);
         }

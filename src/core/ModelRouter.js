@@ -3,6 +3,7 @@ const path = require("path");
 const AntiTruncation = require("./AntiTruncation");
 const PlaygroundSession = require("./Playground/Session");
 const { WireCodec, WireStream } = require("./Playground/WireCodec");
+const { DEFAULT_TIMEOUTS } = require("./RequestHandler/constants");
 
 class ModelRouter {
     constructor(handler) {
@@ -179,6 +180,14 @@ class ModelRouter {
     }
     async _run(spec, authIndex, entry, model, controller) {
         const { queue } = entry;
+        const requestStartedAt = Date.now();
+        let stage = "start";
+        const reportStage = value => {
+            stage = value;
+            this.handler.logger.info(
+                `[Playground] ${spec.request_id} account=#${authIndex} stage=${stage} elapsedMs=${Date.now() - requestStartedAt}`
+            );
+        };
         const registry = this.handler.connectionRegistry;
         const active = () =>
             !queue.closed &&
@@ -188,11 +197,18 @@ class ModelRouter {
         const abort = () => controller.abort();
         queue.once("close", abort);
         const timeoutMs = this.handler.timeouts.FAKE_STREAM;
+        // Like Build real streaming, a visible stream is bounded by inactivity, not total duration.
+        const idleTimeoutMs = this.handler.timeouts.STREAM_CHUNK || DEFAULT_TIMEOUTS.STREAM_CHUNK;
         let timedOut = false;
-        const timer = setTimeout(() => {
-            timedOut = true;
-            controller.abort();
-        }, timeoutMs);
+        let timer;
+        const arm = ms => {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+            }, ms);
+        };
+        arm(timeoutMs);
         let started = false;
         const realStream = spec.streaming_mode === "real" && spec.path.endsWith(":streamGenerateContent");
         const merged = {};
@@ -234,8 +250,11 @@ class ModelRouter {
             this.handler.logger.info(`[Routing] ${model} -> Playground (account #${authIndex}).`);
             await session.request(model, JSON.parse(spec.body), {
                 onData: value => {
-                    if (active() && typeof value === "string") parser.feed(value);
+                    if (!active() || typeof value !== "string") return;
+                    parser.feed(value);
+                    if (started) arm(idleTimeoutMs);
                 },
+                onStage: reportStage,
                 signal: controller.signal,
                 timeoutMs,
             });
@@ -255,11 +274,17 @@ class ModelRouter {
             queue.enqueue({ type: "STREAM_END" });
         } catch (error) {
             const upstreamStatus = Number(error.status) || 502;
+            // Waiting behind this account's active Playground request says nothing about the
+            // account's health and nothing was dispatched: retry elsewhere without a cooldown.
+            const queuedTimeout = timedOut && stage === "queued";
+            this.handler.logger.warn(
+                `[Playground] ${spec.request_id} account=#${authIndex} failedStage=${stage} status=${timedOut ? 504 : upstreamStatus} elapsedMs=${Date.now() - requestStartedAt}`
+            );
             const unavailableAccount =
                 !started &&
                 (upstreamStatus === 401 ||
                     (upstreamStatus === 403 && /permission|PERMISSION_DENIED/i.test(error.message)));
-            if (!error.coolingDown && (!controller.signal.aborted || timedOut))
+            if (!error.coolingDown && !queuedTimeout && (!controller.signal.aborted || timedOut))
                 this.fail(model, authIndex, timedOut ? 504 : upstreamStatus);
             if (
                 !queue.closed &&
@@ -268,11 +293,15 @@ class ModelRouter {
             ) {
                 queue.enqueue({
                     event_type: "error",
-                    message: timedOut ? "Playground request timed out" : error.message,
-                    retryable: started ? false : error.retryable,
+                    message: queuedTimeout
+                        ? "Playground account is busy; request timed out while queued"
+                        : timedOut
+                          ? "Playground request timed out"
+                          : error.message,
+                    retryable: started ? false : queuedTimeout ? undefined : error.retryable,
                     // Let the existing bounded account-switch mechanism handle an unavailable
-                    // Playground account on its first failure, not only during its cooldown.
-                    status: timedOut ? 504 : unavailableAccount ? 503 : upstreamStatus,
+                    // (or busy) Playground account on its first failure, not only during its cooldown.
+                    status: queuedTimeout ? 503 : timedOut ? 504 : unavailableAccount ? 503 : upstreamStatus,
                 });
             }
         } finally {

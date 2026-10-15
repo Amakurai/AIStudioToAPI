@@ -26,6 +26,17 @@ const compact = value => {
 };
 const invalid = message => Object.assign(new Error(`Playground: ${message}`), { retryable: false, status: 400 });
 const pick = (obj, camel) => obj?.[camel] ?? obj?.[camel.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`)];
+const SCHEMA_TYPES = { ARRAY: 5, BOOLEAN: 4, INTEGER: 3, NUMBER: 2, OBJECT: 6, STRING: 1 };
+// The native signer hashes text after the browser textarea normalizes line breaks.
+const normalizeText = value => (typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value);
+const enumType = value => {
+    if (value === null) return "NULL";
+    if (typeof value === "string") return "STRING";
+    if (typeof value === "boolean") return "BOOLEAN";
+    if (Number.isInteger(value)) return "INTEGER";
+    if (typeof value === "number") return "NUMBER";
+    return null;
+};
 
 class WireCodec {
     static value(value) {
@@ -57,8 +68,52 @@ class WireCodec {
             v.filter(p => Array.isArray(p) && typeof p[0] === "string").map(([k, x]) => [k, this.decodeValue(x)])
         );
     }
-    static schema(s) {
-        if (!s || typeof s !== "object") throw invalid("invalid schema");
+    static schema(s, path = "$", depth = 0) {
+        const fail = (message, field = "") => invalid(`${message} at ${path}${field}`);
+        if (depth > 64) throw fail("schema nesting exceeds 64 levels");
+        if (!s || typeof s !== "object" || Array.isArray(s)) throw fail("invalid schema: expected an object");
+        const child = (value, suffix) => this.schema(value, `${path}${suffix}`, depth + 1);
+        if (pick(s, "const") !== undefined && pick(s, "enum") === undefined) s = { ...s, enum: [pick(s, "const")] };
+        if (s.type === undefined && !["oneOf", "anyOf", "allOf", "not"].some(k => pick(s, k) !== undefined)) {
+            // JSON Schema allows typeless schemas. Infer their type instead of narrowing them to strings.
+            const types = this.inferTypes(s);
+            s = { ...s, type: types.length === 1 ? types[0] : types };
+        }
+        let union;
+        if (s.type !== undefined) {
+            const types = Array.isArray(s.type) ? s.type : [s.type];
+            if (!types.length) throw fail("schema type array must not be empty", ".type");
+            for (const [i, type] of types.entries()) {
+                if (typeof type !== "string" || !(type.toUpperCase() in SCHEMA_TYPES || type.toUpperCase() === "NULL"))
+                    throw fail(
+                        `unsupported schema type ${String(JSON.stringify(type)).slice(0, 80)}`,
+                        `.type${Array.isArray(s.type) ? `[${i}]` : ""}`
+                    );
+            }
+            const unique = [...new Set(types.map(type => type.toUpperCase()))];
+            if (s.nullable === true && !unique.includes("NULL")) unique.push("NULL");
+            const nonNull = unique.filter(type => type !== "NULL");
+            if (nonNull.length === 1) {
+                s = { ...s, type: nonNull[0] };
+                if (unique.includes("NULL")) s.nullable = true;
+            } else if (!nonNull.length) {
+                // MakerSuite has no NULL type enum. A nullable string excluding all
+                // strings expresses null without widening the accepted values.
+                s = { ...s, nullable: true, type: "STRING" };
+                const excludeString = { type: "STRING" };
+                if (pick(s, "not") !== undefined) {
+                    const allOf = pick(s, "allOf") ?? [];
+                    if (!Array.isArray(allOf)) throw fail("expected an array of schemas", ".allOf");
+                    s.allOf = [...allOf, { not: excludeString }];
+                } else s.not = excludeString;
+            } else {
+                // Encode shared constraints once so nested unions do not expand
+                // exponentially. Intersect with an existing anyOf below.
+                union = unique.map(type => child({ type }, ".type"));
+                s = { ...s };
+                delete s.type;
+            }
+        }
         const fields = [
             "type",
             "format",
@@ -89,21 +144,59 @@ class WireCodec {
             let v = pick(s, k);
             if (v === undefined) continue;
             if (k === "type") {
-                v = { ARRAY: 5, BOOLEAN: 4, INTEGER: 3, NUMBER: 2, OBJECT: 6, STRING: 1 }[String(v).toUpperCase()];
-                if (!v) throw invalid("unsupported schema type");
+                v = SCHEMA_TYPES[v];
             }
-            if (["items", "not"].includes(k)) v = this.schema(v);
-            if (["oneOf", "anyOf", "allOf"].includes(k)) v = v.map(x => this.schema(x));
-            if (k === "properties") v = Object.entries(v).map(([name, x]) => [name, this.schema(x)]);
+            if (["items", "not"].includes(k)) v = child(v, `.${k}`);
+            if (["oneOf", "anyOf", "allOf"].includes(k)) {
+                if (!Array.isArray(v) || !v.length) throw fail("expected a non-empty array of schemas", `.${k}`);
+                v = v.map((x, index) => child(x, `.${k}[${index}]`));
+            }
+            if (k === "properties") {
+                if (!v || typeof v !== "object" || Array.isArray(v))
+                    throw fail("expected an object of property schemas", ".properties");
+                v = Object.entries(v).map(([name, x]) => [name, child(x, `.properties[${JSON.stringify(name)}]`)]);
+            }
             if (k === "example") v = this.value(v);
+            if (k === "enum") {
+                if (!Array.isArray(v)) throw fail("expected an array of values", ".enum");
+                // Native enum values are strings; null membership is expressed by nullable.
+                if (v.includes(null)) out[3] = true;
+                v = v.filter(x => x !== null).map(x => (typeof x === "string" ? x : JSON.stringify(x)));
+                if (!v.length) continue;
+            }
             out[i] = v;
         }
-        if (!out[0] && !out[17]) out[0] = s.properties ? 6 : s.items ? 5 : 1;
+        if (union) {
+            if (out[17]) {
+                const typeConstraint = [];
+                typeConstraint[17] = union;
+                out[18] = [...(out[18] || []), typeConstraint];
+            } else out[17] = union;
+        }
+        if (!out[0] && ![16, 17, 18, 19].some(index => out[index])) out[0] = s.properties ? 6 : s.items ? 5 : 1;
         return compact(out);
     }
-    static part(p) {
+    static inferTypes(s) {
+        const has = (...keys) => keys.some(k => pick(s, k) !== undefined);
+        if (has("properties", "required", "minProperties", "maxProperties", "propertyOrdering")) return ["OBJECT"];
+        if (has("items", "minItems", "maxItems")) return ["ARRAY"];
+        const values = pick(s, "enum");
+        if (Array.isArray(values) && values.length) {
+            const types = [...new Set(values.map(enumType))];
+            if (types.includes(null)) throw invalid("unsupported enum value");
+            // An integer is also a number; keep the wider type once.
+            return types.includes("NUMBER") ? types.filter(type => type !== "INTEGER") : types;
+        }
+        if (has("minLength", "maxLength", "pattern")) return ["STRING"];
+        if (has("minimum", "maximum")) return ["NUMBER"];
+        // An unconstrained value. MakerSuite rejects incomplete OBJECT/ARRAY schemas, so this
+        // accepts every scalar and null rather than restricting the value to a string.
+        return ["STRING", "NUMBER", "BOOLEAN", "NULL"];
+    }
+    static part(p, where = "part") {
+        if (!p || typeof p !== "object" || Array.isArray(p)) throw invalid(`unsupported content part at ${where}`);
         const out = [];
-        if (typeof p.text === "string") out[1] = p.text;
+        if (typeof p.text === "string") out[1] = normalizeText(p.text);
         const inline = pick(p, "inlineData");
         if (inline) out[2] = [pick(inline, "mimeType"), inline.data];
         const file = pick(p, "fileData");
@@ -117,15 +210,26 @@ class WireCodec {
         }
         if (p.thought) out[0] = true;
         if (pick(p, "thoughtSignature")) out[14] = pick(p, "thoughtSignature");
-        if (pick(p, "executableCode")) out[8] = pick(p, "executableCode").code;
-        if (pick(p, "codeExecutionResult")) out[9] = pick(p, "codeExecutionResult").output;
-        if (!out.length) throw invalid("unsupported content part");
+        if (pick(p, "executableCode")) out[8] = normalizeText(pick(p, "executableCode").code);
+        if (pick(p, "codeExecutionResult")) out[9] = normalizeText(pick(p, "codeExecutionResult").output);
+        if (!out.length) throw invalid(`unsupported content part at ${where}`);
         return compact(out);
     }
-    static content(c) {
-        return [c.parts.map(p => this.part(p)), c.role || "user"];
+    static content(c, where = "contents") {
+        if (!c || typeof c !== "object" || !Array.isArray(c.parts)) throw invalid(`${where}.parts must be an array`);
+        return [c.parts.map((p, i) => this.part(p, `${where}.parts[${i}]`)), c.role || "user"];
     }
     static encode(model, body) {
+        try {
+            return this._encode(model, body);
+        } catch (error) {
+            // A malformed client request is a 400, never an upstream failure that cools down the account.
+            if (error.status) throw error;
+            throw invalid(`malformed request: ${error.message}`);
+        }
+    }
+    static _encode(model, body) {
+        if (!body || typeof body !== "object") throw invalid("request body must be an object");
         if (!Array.isArray(body.contents) || !body.contents.length) throw invalid("contents must not be empty");
         const gc = pick(body, "generationConfig") || {};
         if (pick(gc, "candidateCount") && pick(gc, "candidateCount") !== 1)
@@ -146,46 +250,67 @@ class WireCodec {
             const value = pick(gc, k);
             if (value !== undefined) generation[i] = value;
         }
-        const schema = pick(gc, "responseSchema") || pick(gc, "responseJsonSchema") || gc.responseFormat?.text?.schema;
-        if (schema) generation[8] = this.schema(schema);
-        if (gc.responseFormat?.text?.mimeType)
-            generation[7] = gc.responseFormat.text.mimeType
-                .toLowerCase()
-                .replace("application_json", "application/json");
+        const responseSchemas = [
+            ["responseSchema", pick(gc, "responseSchema")],
+            ["responseJsonSchema", pick(gc, "responseJsonSchema")],
+            ["responseFormat.text.schema", pick(gc, "responseFormat")?.text?.schema],
+        ];
+        const responseSchema = responseSchemas.find(([, schema]) => schema !== undefined);
+        if (responseSchema) generation[8] = this.schema(responseSchema[1], `generationConfig.${responseSchema[0]}`);
+        const formatMimeType = pick(pick(gc, "responseFormat")?.text, "mimeType");
+        if (formatMimeType)
+            generation[7] = String(formatMimeType).toLowerCase().replace("application_json", "application/json");
         const thinking = pick(gc, "thinkingConfig");
         if (thinking) {
             const level = pick(thinking, "thinkingLevel");
             generation[16] = compact([
-                pick(thinking, "includeThoughts") === false ? 0 : 1,
+                // Gemini API default: thoughts are omitted unless explicitly requested.
+                pick(thinking, "includeThoughts") === true ? 1 : 0,
                 pick(thinking, "thinkingBudget"),
                 null,
                 level ? { HIGH: 3, LOW: 1, MEDIUM: 2, MINIMAL: 4 }[String(level).toUpperCase()] : null,
             ]);
         }
-        if (gc.responseModalities)
-            generation[14] = gc.responseModalities.map(m => ({ AUDIO: 3, IMAGE: 2, TEXT: 1 })[m]);
-        if (gc.imageConfig) generation[26] = [gc.imageConfig.aspectRatio || null, gc.imageConfig.imageSize || null];
-        if (gc.mediaResolution)
+        const modalities = pick(gc, "responseModalities");
+        if (modalities) {
+            if (!Array.isArray(modalities)) throw invalid("responseModalities must be an array");
+            generation[14] = modalities.map(m => {
+                const value = { AUDIO: 3, IMAGE: 2, TEXT: 1 }[String(m).toUpperCase()];
+                if (!value) throw invalid(`unsupported response modality ${String(m).slice(0, 40)}`);
+                return value;
+            });
+        }
+        const imageConfig = pick(gc, "imageConfig");
+        if (imageConfig)
+            generation[26] = [pick(imageConfig, "aspectRatio") || null, pick(imageConfig, "imageSize") || null];
+        const mediaResolution = pick(gc, "mediaResolution");
+        if (mediaResolution)
             generation[17] = { MEDIA_RESOLUTION_HIGH: 3, MEDIA_RESOLUTION_LOW: 1, MEDIA_RESOLUTION_MEDIUM: 2 }[
-                gc.mediaResolution
+                mediaResolution
             ];
         const tools = [];
         const fc = pick(pick(body, "toolConfig"), "functionCallingConfig") || {};
-        for (const tool of body.tools || []) {
+        for (const [toolIndex, tool] of (body.tools || []).entries()) {
             const functions = pick(tool, "functionDeclarations");
             if (functions && fc.mode !== "NONE") {
                 const allowed = pick(fc, "allowedFunctionNames");
-                const declarations = functions
-                    .filter(f => !allowed?.length || allowed.includes(f.name))
-                    .map(f =>
+                const declarations = functions.flatMap((f, index) => {
+                    if (allowed?.length && !allowed.includes(f.name)) return [];
+                    const parameters = pick(f, "parameters") ?? pick(f, "parametersJsonSchema");
+                    const field = pick(f, "parameters") !== undefined ? "parameters" : "parametersJsonSchema";
+                    return [
                         compact([
                             f.name,
                             f.description || null,
-                            f.parameters || f.parametersJsonSchema
-                                ? this.schema(f.parameters || f.parametersJsonSchema)
-                                : null,
-                        ])
-                    );
+                            parameters === undefined
+                                ? null
+                                : this.schema(
+                                      parameters,
+                                      `tools[${toolIndex}].functionDeclarations[${index}].${field}`
+                                  ),
+                        ]),
+                    ];
+                });
                 if (declarations.length) tools.push([null, declarations]);
             }
             if (pick(tool, "codeExecution")) tools.push([[]]);
@@ -209,17 +334,22 @@ class WireCodec {
             HARM_BLOCK_THRESHOLD_UNSPECIFIED: 0,
             OFF: 5,
         };
-        const safety = (pick(body, "safetySettings") || []).map(s => {
-            if (!(s.category in categories) || !(s.threshold in thresholds))
-                throw invalid("unsupported safety setting");
-            return [null, null, categories[s.category], thresholds[s.threshold]];
+        const safety = (pick(body, "safetySettings") || []).flatMap(s => {
+            if (!(s?.threshold in thresholds)) throw invalid("unsupported safety setting");
+            if (s.category in categories) return [[null, null, categories[s.category], thresholds[s.threshold]]];
+            // Build accepts newer public categories (e.g. CIVIC_INTEGRITY) that MakerSuite does
+            // not expose. Leave them at their native default instead of rejecting the request.
+            if (/^HARM_CATEGORY_[A-Z_]+$/.test(s.category)) return [];
+            throw invalid("unsupported safety setting");
         });
         const out = [];
         out[0] = `models/${model.replace(/^models\//, "")}`;
-        out[1] = body.contents.map(c => this.content(c));
+        out[1] = body.contents.map((c, i) => this.content(c, `contents[${i}]`));
         out[2] = safety.length ? safety : null;
         out[3] = compact(generation);
-        out[5] = pick(body, "systemInstruction") ? this.content(pick(body, "systemInstruction")) : null;
+        out[5] = pick(body, "systemInstruction")
+            ? this.content(pick(body, "systemInstruction"), "systemInstruction")
+            : null;
         if (fc.mode === "ANY" && tools.some(t => t[1]?.length)) {
             out[5] ||= [[], "user"];
             out[5][0].push([null, "Respond using one of the provided functions."]);
