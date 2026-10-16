@@ -1,16 +1,21 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const AntiTruncation = require("../src/core/AntiTruncation");
+const Duplex = require("../src/core/DuplexToolTransport");
 const MessageQueue = require("../src/utils/MessageQueue");
 
 const body = () => ({ contents: [{ parts: [{ text: "写一篇文章" }], role: "user" }] });
-const reply = (text, done, finishReason = "STOP") => ({
+// One signed append_output turn, as the upstream model returns it.
+const reply = (seq, text, done, finishReason = "STOP") => ({
     candidates: [
         {
             content: {
                 parts: [
                     {
-                        functionCall: { args: { done, text }, name: AntiTruncation.TOOL },
+                        functionCall: {
+                            args: { ...(done === undefined ? {} : { done }), seq, text },
+                            name: "append_output",
+                        },
                         thoughtSignature: "signature",
                     },
                 ],
@@ -21,6 +26,7 @@ const reply = (text, done, finishReason = "STOP") => ({
     ],
     usageMetadata: { candidatesTokenCount: 5, promptTokenCount: 10, totalTokenCount: 15 },
 });
+const textOf = response => response.candidates[0].content.parts[0].text;
 
 test("only the supported exact opt-in aliases activate, including encoded native paths", () => {
     for (const base of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
@@ -38,14 +44,14 @@ test("complete output preserves text byte-for-byte and hides internal calls", as
     const snapshot = JSON.stringify(original);
     const text = '<hello>你好</hello>\n```js\nconst x = "\\n";\n```\n';
     let count = 0;
-    const result = await AntiTruncation.generate(original, async request => {
+    const result = await Duplex.generate(original, async request => {
         count++;
         assert.equal(request.toolConfig.functionCallingConfig.mode, "ANY");
-        assert.equal(request.tools[0].functionDeclarations[0].name, AntiTruncation.TOOL);
-        return reply(text, true);
+        assert.equal(request.tools[0].functionDeclarations[0].name, "append_output");
+        return reply(1, text, true);
     });
     assert.equal(count, 1);
-    assert.equal(result.candidates[0].content.parts[0].text, text);
+    assert.equal(textOf(result), text);
     assert.equal(result.candidates[0].finishReason, "STOP");
     assert.ok(!JSON.stringify(result).includes("functionCall"));
     assert.equal(JSON.stringify(original), snapshot);
@@ -53,62 +59,65 @@ test("complete output preserves text byte-for-byte and hides internal calls", as
 
 test("continuation preserves signature, acknowledges call, appends text and sums usage", async () => {
     let count = 0;
-    let continuations = 0;
-    const result = await AntiTruncation.generate(
+    const reasons = [];
+    const result = await Duplex.generate(
         body(),
         async request => {
             if (count++) {
                 assert.equal(request.contents.at(-3).parts[0].thoughtSignature, "signature");
-                assert.equal(request.contents.at(-2).parts[0].functionResponse.name, AntiTruncation.TOOL);
+                assert.equal(request.contents.at(-2).parts[0].functionResponse.name, "append_output");
                 assert.ok(request.contents.at(-1).parts[0].text);
-                return reply("后半段", true);
+                return reply(2, "后半段", true);
             }
-            return reply("前半段\n", false);
+            return reply(1, "前半段\n", false);
         },
-        () => continuations++
+        reason => reasons.push(reason)
     );
-    assert.equal(continuations, 1);
-    assert.equal(result.candidates[0].content.parts[0].text, "前半段\n后半段");
+    assert.deepEqual(reasons, ["continue"]);
+    assert.equal(textOf(result), "前半段\n后半段");
     assert.deepEqual(result.usageMetadata, { candidatesTokenCount: 10, promptTokenCount: 20, totalTokenCount: 30 });
 });
 
-test("incomplete answers stop after two followups and retain MAX_TOKENS", async () => {
+test("incomplete answers stop at the segment cap and retain MAX_TOKENS", async () => {
     let count = 0;
-    const result = await AntiTruncation.generate(body(), async () => reply(String(++count), false));
-    assert.equal(count, 3);
-    assert.equal(result.candidates[0].content.parts[0].text, "123");
+    const result = await Duplex.generate(body(), async () => {
+        count++;
+        return reply(count, String(count), false);
+    });
+    assert.equal(count, AntiTruncation.MAX_SEGMENTS + 1);
+    assert.equal(textOf(result), Array.from({ length: AntiTruncation.MAX_SEGMENTS }, (_, i) => String(i + 1)).join(""));
     assert.equal(result.candidates[0].finishReason, "MAX_TOKENS");
 });
 
 test("MAX_TOKENS overrides a premature model completion claim", async () => {
     let count = 0;
-    const result = await AntiTruncation.generate(body(), async () =>
-        ++count === 1 ? reply("A", true, "MAX_TOKENS") : reply("B", true)
+    const result = await Duplex.generate(body(), async () =>
+        ++count === 1 ? reply(1, "A", true, "MAX_TOKENS") : reply(2, "B", true)
     );
     assert.equal(count, 2);
-    assert.equal(result.candidates[0].content.parts[0].text, "AB");
+    assert.equal(textOf(result), "AB");
 });
 
 test("stop sequences work across continuation boundaries", async () => {
     const input = body();
     input.generationConfig = { stopSequences: ["<END>"] };
     let count = 0;
-    const result = await AntiTruncation.generate(input, async request => {
+    const result = await Duplex.generate(input, async request => {
         assert.equal(request.generationConfig.stopSequences, undefined);
-        return ++count === 1 ? reply("answer<EN", false) : reply("D>hidden", true);
+        return ++count === 1 ? reply(1, "answer<EN", false) : reply(2, "D>hidden", true);
     });
-    assert.equal(result.candidates[0].content.parts[0].text, "answer");
+    assert.equal(textOf(result), "answer");
 });
 
 test("malformed calls fail explicitly and blocked output never leaks tools or triggers continuation", async () => {
     await assert.rejects(
-        AntiTruncation.generate(body(), async () => reply("partial", undefined)),
-        /invalid tool arguments/
+        Duplex.generate(body(), async () => reply(0, "partial", false)),
+        /repair exhausted/
     );
     let count = 0;
-    const result = await AntiTruncation.generate(body(), async () => {
+    const result = await Duplex.generate(body(), async () => {
         count++;
-        return reply("", false, "SAFETY");
+        return reply(1, "", false, "SAFETY");
     });
     assert.equal(count, 1);
     assert.equal(result.candidates[0].finishReason, "SAFETY");
@@ -123,7 +132,7 @@ test("client tools and structured outputs are rejected without overwriting them"
         { generationConfig: { candidateCount: 2 } },
     ]) {
         assert.throws(
-            () => AntiTruncation.prepare({ ...body(), ...extra }),
+            () => Duplex.prepare({ ...body(), ...extra }),
             error => error.status === 400
         );
     }
@@ -173,7 +182,7 @@ function harness(respond) {
 
 test("forwarding buffers real queue chunks, rewrites transport and cleans child queues", async () => {
     const h = harness(queue => {
-        const json = JSON.stringify(reply("正文", true));
+        const json = JSON.stringify(reply(1, "正文", true));
         queue.enqueue({ event_type: "response_headers", status: 200 });
         queue.enqueue({ data: json.slice(0, 30), event_type: "chunk" });
         queue.enqueue({ data: json.slice(30), event_type: "chunk" });
@@ -214,7 +223,8 @@ test("deadline aborts hanging upstream work", async () => {
 test("each continuation gets its own upstream timeout", async () => {
     let round = 0;
     const h = harness(queue => {
-        const response = reply(String(++round), round === 3);
+        round++;
+        const response = reply(round, String(round), round === 3);
         setTimeout(() => {
             queue.enqueue({ data: JSON.stringify(response), event_type: "chunk" });
             queue.enqueue({ type: "STREAM_END" });
@@ -312,13 +322,13 @@ test("OpenAI, Responses and Claude converters preserve the alias and trailing-us
     for (const result of results) {
         assert.equal(result.cleanModelName, model);
         assert.equal(result.googleRequest.contents.at(-1).role, "user");
-        assert.doesNotThrow(() => AntiTruncation.prepare(result.googleRequest));
+        assert.doesNotThrow(() => Duplex.prepare(result.googleRequest));
     }
 });
 
 test("restored output converts to ordinary text in all non-streaming and SSE formats", async () => {
     const converter = new FormatConverter(logger, { config: {} });
-    const response = await AntiTruncation.generate(body(), async () => reply("你好正文", true));
+    const response = await Duplex.generate(body(), async () => reply(1, "你好正文", true));
     const model = "gemini-3.7-flash-抗截断";
     const outputs = [
         converter.convertGoogleToOpenAINonStream(response, model),
@@ -331,23 +341,24 @@ test("restored output converts to ordinary text in all non-streaming and SSE for
     for (const output of outputs) {
         const value = typeof output === "string" ? output : JSON.stringify(output);
         assert.ok(value.includes("你好正文"));
-        assert.ok(!value.includes("deliver_response"));
+        assert.ok(!value.includes("append_output"));
         assert.ok(!value.includes('"tool_calls"'));
     }
 });
 
-test("native histories ending in a model or function turn gain an ordinary user turn", () => {
-    for (const last of [
-        { parts: [{ text: "previous reply" }], role: "model" },
-        { parts: [{ functionResponse: { name: "previous", response: {} } }], role: "user" },
-    ]) {
-        const input = body();
-        input.contents.push(last);
-        const request = AntiTruncation.prepare(input);
-        assert.equal(request.contents.at(-1).role, "user");
-        assert.equal(request.contents.at(-1).parts[0].text, "\n");
-        assert.equal(input.contents.length, 2);
-    }
+test("native histories ending in a model turn gain an ordinary user turn; function turns are rejected", () => {
+    const input = body();
+    input.contents.push({ parts: [{ text: "previous reply" }], role: "model" });
+    const { request } = Duplex.prepare(input);
+    assert.equal(request.contents.at(-1).role, "user");
+    assert.equal(request.contents.at(-1).parts[0].text, "\n");
+    assert.equal(input.contents.length, 2);
+    const withFunction = body();
+    withFunction.contents.push({ parts: [{ functionResponse: { name: "previous", response: {} } }], role: "user" });
+    assert.throws(
+        () => Duplex.prepare(withFunction),
+        error => error.status === 400
+    );
 });
 
 test("a single OpenAI stop string is honored after conversion", async () => {
@@ -357,9 +368,9 @@ test("a single OpenAI stop string is honored after conversion", async () => {
         model: "gemini-3.8-flash-抗截断",
         stop: "END",
     });
-    const result = await AntiTruncation.generate(googleRequest, async request => {
+    const result = await Duplex.generate(googleRequest, async request => {
         assert.equal(request.generationConfig.stopSequences, undefined);
-        return reply("answerENDhidden", true);
+        return reply(1, "answerENDhidden", true);
     });
     assert.equal(result.candidates[0].content.parts[0].text, "answer");
 });
@@ -378,7 +389,7 @@ test("invalid input is rejected before any paid request", async () => {
     ]) {
         let sent = false;
         await assert.rejects(
-            AntiTruncation.generate(input, async () => {
+            Duplex.generate(input, async () => {
                 sent = true;
             }),
             error => error.status === 400
@@ -394,21 +405,21 @@ test("native protobuf spellings preserve system instructions and stop sequences"
         system_instruction: { parts: [{ text: "My instruction" }] },
     };
     const snapshot = JSON.stringify(input);
-    const result = await AntiTruncation.generate(input, async request => {
+    const result = await Duplex.generate(input, async request => {
         assert.equal(request.generation_config, undefined);
         assert.equal(request.system_instruction, undefined);
         assert.equal(request.systemInstruction.parts[0].text, "My instruction");
         assert.equal(request.generationConfig.stopSequences, undefined);
-        return reply("answerENDignored", true);
+        return reply(1, "answerENDignored", true);
     });
     assert.equal(result.candidates[0].content.parts[0].text, "answer");
     assert.equal(JSON.stringify(input), snapshot);
     assert.throws(
-        () => AntiTruncation.prepare({ ...body(), generation_config: { response_mime_type: "application/json" } }),
+        () => Duplex.prepare({ ...body(), generation_config: { response_mime_type: "application/json" } }),
         error => error.status === 400
     );
     assert.throws(
-        () => AntiTruncation.prepare({ ...body(), tool_config: { functionCallingConfig: { mode: "NONE" } } }),
+        () => Duplex.prepare({ ...body(), tool_config: { functionCallingConfig: { mode: "NONE" } } }),
         error => error.status === 400
     );
 });
@@ -419,12 +430,12 @@ test("malformed upstream envelopes and function statuses fail rather than return
         [],
         {},
         { candidates: [] },
-        reply("partial", true, "MALFORMED_FUNCTION_CALL"),
-        reply("partial", true, "OTHER"),
-        reply("partial", true, ""),
+        reply(1, "partial", true, "MALFORMED_FUNCTION_CALL"),
+        reply(1, "partial", true, "OTHER"),
+        reply(1, "partial", true, ""),
     ]) {
         await assert.rejects(
-            AntiTruncation.generate(body(), async () => response),
+            Duplex.generate(body(), async () => response),
             error => error.status === 502 && error.retryable === false
         );
     }
@@ -432,7 +443,7 @@ test("malformed upstream envelopes and function statuses fail rather than return
 
 test("prompt blocking remains a content-filter result in compatibility responses", async () => {
     let sent = 0;
-    const response = await AntiTruncation.generate(body(), async () => {
+    const response = await Duplex.generate(body(), async () => {
         sent++;
         return { promptFeedback: { blockReason: "SAFETY" }, usageMetadata: { promptTokenCount: 12 } };
     });
@@ -444,12 +455,12 @@ test("prompt blocking remains a content-filter result in compatibility responses
 
 test("continuation acknowledgement echoes the upstream function call ID", async () => {
     let sent = 0;
-    await AntiTruncation.generate(body(), async request => {
+    await Duplex.generate(body(), async request => {
         if (sent++) {
             assert.equal(request.contents.at(-2).parts[0].functionResponse.id, "upstream-call-id");
-            return reply("B", true);
+            return reply(2, "B", true);
         }
-        const response = reply("A", false);
+        const response = reply(1, "A", false);
         response.candidates[0].content.parts[0].functionCall.id = "upstream-call-id";
         return response;
     });
@@ -457,14 +468,14 @@ test("continuation acknowledgement echoes the upstream function call ID", async 
 
 test("valid text cut off before the done flag can continue on MAX_TOKENS", async () => {
     let sent = 0;
-    const result = await AntiTruncation.generate(body(), async () =>
-        sent++ ? reply("B", true) : reply("A", undefined, "MAX_TOKENS")
+    const result = await Duplex.generate(body(), async () =>
+        sent++ ? reply(2, "B", true) : reply(1, "A", undefined, "MAX_TOKENS")
     );
     assert.equal(result.candidates[0].content.parts[0].text, "AB");
 });
 
 test("Responses marks exhausted continuation as incomplete in JSON and SSE, only for aliases", async () => {
-    const response = await AntiTruncation.generate(body(), async () => reply("part", false));
+    const response = await Duplex.generate(body(), async () => reply(1, "part", false));
     const converter = new FormatConverter(logger, { config: {} });
     for (const model of ["gemini-3.7-flash-抗截断", "gemini-3.8-flash-抗截断", "gemini-4-argon-抗截断"]) {
         const result = converter.convertGoogleToResponseAPINonStream(response, model);
@@ -767,7 +778,14 @@ test("OpenAI duplex retries both the first round and a repair round on the selec
     }
 });
 
-test("all rate-limited accounts finish with the original 429 and never restart buffered generation", async t => {
+const incompleteMarkers = {
+    claude: /"stop_reason":"max_tokens"/,
+    gemini: /"finishReason":"MAX_TOKENS"/,
+    openai: /"finish_reason":"length"/,
+    responses: /"status":"incomplete"/,
+};
+
+test("all rate-limited accounts keep accepted text as incomplete and never restart buffered generation", async t => {
     for (const [api, method] of Object.entries(processors)) {
         await t.test(api, async () => {
             const h = requestHarness([
@@ -776,9 +794,24 @@ test("all rate-limited accounts finish with the original 429 and never restart b
             ]);
             const res = new FakeResponse();
             await h.handler[method](apiRequest(api, "gemini-3.7-flash-抗截断", false), res);
-            assert.equal(res.statusCode, 429, res.output);
+            assert.equal(res.statusCode, 200, res.output);
             assert.deepEqual(h.sentAccounts, [0, 0, 1, 2]);
             for (const spec of h.sent.slice(2)) assert.equal(spec.body, h.sent[1].body);
+            assert.equal(visibleText(res, api, false), "accepted");
+            assert.match(res.output, incompleteMarkers[api]);
+            assert.equal(h.registry.messageQueues.size, 0);
+        });
+    }
+});
+
+test("a first-round failure with nothing accepted still returns the original upstream error", async t => {
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const h = requestHarness([{ event_type: "error", message: "upstream rate limit", status: 429 }]);
+            const res = new FakeResponse();
+            await h.handler[method](apiRequest(api, "gemini-3.7-flash-抗截断", false), res);
+            assert.equal(res.statusCode, 429, res.output);
+            assert.deepEqual(h.sentAccounts, [0, 1, 2]);
             assert.ok(res.output.includes("upstream rate limit"));
             assert.equal(h.registry.messageQueues.size, 0);
         });
@@ -788,8 +821,8 @@ test("all rate-limited accounts finish with the original 429 and never restart b
 test("native transport also retries JSON error envelopes and keeps subsequent usage on the new account", async () => {
     const h = requestHarness([
         { error: { code: 429, message: "rate limited" } },
-        reply("first", false),
-        reply("second", true),
+        reply(1, "first", false),
+        reply(2, "second", true),
     ]);
     const attempts = [];
     h.handler._getUsageStatsService = () => ({ recordAttempt: (id, account) => attempts.push(account) });
@@ -814,9 +847,9 @@ test("native transport also retries JSON error envelopes and keeps subsequent us
 test("the shared retry helper keeps rate-limited accounts excluded across continuation rounds", async () => {
     const h = requestHarness([
         { event_type: "error", message: "first account limited", status: 429 },
-        reply("accepted", false),
+        reply(1, "accepted", false),
         { event_type: "error", message: "second account limited", status: 429 },
-        reply(" continued", true),
+        reply(2, " continued", true),
     ]);
     const coolingDown = new Set();
     h.handler.authSource.markAccountCoolingDown = authIndex => coolingDown.add(authIndex);
@@ -970,7 +1003,7 @@ test("actual disconnect handler releases parent and child even with a broken soc
 });
 
 test("local validation errors avoid upstream calls and account switching through the public handler", async () => {
-    const h = requestHarness([reply("should not be called", true)]);
+    const h = requestHarness([reply(1, "should not be called", true)]);
     const req = apiRequest("openai", "gemini-3.8-flash-抗截断", false);
     req.body.stop = [null];
     const res = new FakeResponse();
@@ -1002,7 +1035,7 @@ test("original Flash models still send ordinary requests without the internal to
 test("blocked finish reasons stay visible in native output and map to filtering for aliases", async () => {
     const converter = new FormatConverter(logger, { config: {} });
     const model = "gemini-3.7-flash-抗截断";
-    const response = await AntiTruncation.generate(body(), async () => reply("hidden", true, "PROHIBITED_CONTENT"));
+    const response = await Duplex.generate(body(), async () => reply(1, "hidden", true, "PROHIBITED_CONTENT"));
     assert.equal(response.candidates[0].finishReason, "PROHIBITED_CONTENT");
     assert.equal(converter.convertGoogleToOpenAINonStream(response, model).choices[0].finish_reason, "content_filter");
     assert.equal(
@@ -1037,7 +1070,7 @@ test("native snake-case config works alongside forced thinking without losing li
 });
 
 test("invalid native histories return 400 without an unhandled rejected request", async () => {
-    const h = requestHarness([reply("unused", true)]);
+    const h = requestHarness([reply(1, "unused", true)]);
     const req = apiRequest("gemini", "gemini-3.7-flash-抗截断", false);
     req.body.contents = [null];
     const res = new FakeResponse();
@@ -1072,7 +1105,7 @@ test("anti-truncation parent and child count as one request when dispatching acc
 });
 
 test("invalid native anti-truncation parameters use INVALID_ARGUMENT and do not count as usage", async () => {
-    const h = requestHarness([reply("unused", true)]);
+    const h = requestHarness([reply(1, "unused", true)]);
     const req = apiRequest("gemini", "gemini-3.8-flash-抗截断", false);
     req.body.generationConfig = { stopSequences: [null] };
     const res = new FakeResponse();
@@ -1200,29 +1233,48 @@ test("large Unicode text survives three continuations and all public response fo
     }
 });
 
-test("small output budgets add explicit chunk limits and allow bounded extra continuations", async () => {
-    let sent = 0;
-    const result = await AntiTruncation.generate(
-        { ...body(), generationConfig: { maxOutputTokens: 4096 } },
-        async request => {
+test("chunk limits leave headroom for JSON and explicit thinking budgets", async () => {
+    for (const [generationConfig, limit] of [
+        [{}, 12000],
+        [{ maxOutputTokens: 4096 }, 3072],
+        [{ maxOutputTokens: 4096, thinkingConfig: { thinkingBudget: 1024 } }, 2304],
+        [{ maxOutputTokens: 4096, thinkingConfig: { thinkingBudget: -1 } }, 3072],
+        [{ maxOutputTokens: 50 }, 64],
+        [{ maxOutputTokens: 65536 }, 12000],
+    ]) {
+        let sent = 0;
+        const result = await Duplex.generate({ ...body(), generationConfig }, async request => {
             sent++;
-            assert.match(request.systemInstruction.parts.at(-1).text, /at most 4096 characters/);
-            return reply(`part${sent}`, sent === 4);
-        }
-    );
-    assert.equal(sent, 4);
-    assert.equal(result.candidates[0].content.parts[0].text, "part1part2part3part4");
-    assert.equal(result.candidates[0].finishReason, "STOP");
+            assert.match(request.systemInstruction.parts.at(-1).text, new RegExp(`within ${limit} characters`));
+            return reply(sent, `part${sent}`, sent === 4);
+        });
+        assert.equal(sent, 4);
+        assert.equal(textOf(result), "part1part2part3part4");
+        assert.equal(result.candidates[0].finishReason, "STOP");
+    }
+});
+
+test("segment capacity never shrinks when the output budget grows", () => {
+    let previous = 0;
+    for (let budget = 1; budget <= 65536; budget += 97) {
+        const capacity = AntiTruncation.textChunkLimit(budget) * AntiTruncation.MAX_SEGMENTS;
+        assert.ok(capacity >= previous, `budget ${budget}: ${capacity} < ${previous}`);
+        previous = capacity;
+    }
+    assert.ok(AntiTruncation.textChunkLimit(undefined) * AntiTruncation.MAX_SEGMENTS >= previous);
+    // The outer wait covers every possible segment, finish_output and repair call.
+    assert.equal(AntiTruncation.maxWaitMs(1000), 1000 * (AntiTruncation.MAX_SEGMENTS + 1 + 2) + 1000);
 });
 
 test("malformed tool repair reduces chunk size without replaying diagnostics or accepted text", async () => {
     let sent = 0;
-    let followups = 0;
-    const result = await AntiTruncation.generate(
+    const reasons = [];
+    const diagnostics = [];
+    const result = await Duplex.generate(
         body(),
         async request => {
             sent++;
-            if (sent === 1) return reply("accepted prefix\n", false);
+            if (sent === 1) return reply(1, "accepted prefix\n", false);
             if (sent === 2)
                 return {
                     candidates: [
@@ -1235,42 +1287,41 @@ test("malformed tool repair reduces chunk size without replaying diagnostics or 
                     usageMetadata: { totalTokenCount: 10 },
                 };
             assert.ok(request.contents.at(-3).parts[0].functionCall.args.text.includes("accepted prefix"));
-            assert.match(request.systemInstruction.parts.at(-1).text, /at most 6000 characters/);
+            assert.match(request.systemInstruction.parts.at(-1).text, /at most 6000 text characters/);
             assert.doesNotMatch(JSON.stringify(request), /PRIVATE_DIAGNOSTIC|NOT_AN_ANSWER/);
-            return reply("recovered tail", true);
+            return reply(2, "recovered tail", true);
         },
-        () => followups++
+        reason => reasons.push(reason),
+        () => {},
+        diagnostic => diagnostics.push(diagnostic)
     );
     assert.equal(sent, 3);
-    assert.equal(followups, 2);
-    assert.equal(result.candidates[0].content.parts[0].text, "accepted prefix\nrecovered tail");
+    assert.deepEqual(reasons, ["continue", "repair"]);
+    assert.deepEqual(diagnostics, [{ issue: "malformed tool arguments", segments: 1, type: "repair" }]);
+    assert.equal(textOf(result), "accepted prefix\nrecovered tail");
     assert.equal(result.usageMetadata.totalTokenCount, 40);
 });
 
 test("exhausted repair returns an acknowledged prefix as incomplete without leaked diagnostics", async () => {
     let sent = 0;
-    const result = await AntiTruncation.generate(body(), async () => {
-        if (++sent === 1) return reply("valid prefix", false);
-        return { candidates: [{ finishMessage: "PRIVATE_DIAGNOSTIC", finishReason: "MALFORMED_FUNCTION_CALL" }] };
-    });
+    const diagnostics = [];
+    const result = await Duplex.generate(
+        body(),
+        async () => {
+            if (++sent === 1) return reply(1, "valid prefix", false);
+            return { candidates: [{ finishMessage: "PRIVATE_DIAGNOSTIC", finishReason: "MALFORMED_FUNCTION_CALL" }] };
+        },
+        () => {},
+        () => {},
+        diagnostic => diagnostics.push(diagnostic.type)
+    );
     assert.equal(sent, 4);
-    assert.equal(result.candidates[0].content.parts[0].text, "valid prefix");
+    assert.equal(textOf(result), "valid prefix");
     assert.equal(result.candidates[0].finishReason, "MAX_TOKENS");
     assert.doesNotMatch(JSON.stringify(result), /PRIVATE_DIAGNOSTIC/);
+    assert.deepEqual(diagnostics, ["repair", "repair", "repair_exhausted"]);
 });
 
-test("small-budget continuation still terminates instead of requesting indefinitely", async () => {
-    let sent = 0;
-    const response = await AntiTruncation.generate(
-        { ...body(), generationConfig: { maxOutputTokens: 4096 } },
-        async () => reply(String(++sent), false)
-    );
-    assert.equal(sent, 6);
-    assert.equal(response.candidates[0].content.parts[0].text, "123456");
-    assert.equal(response.candidates[0].finishReason, "MAX_TOKENS");
-});
-
-const Duplex = require("../src/core/DuplexToolTransport");
 const duplexClient = require("../scripts/duplex-client");
 const parseSse = raw =>
     raw
@@ -1429,7 +1480,8 @@ test("duplex completion flags cannot hide token limits or conflicting duplicate 
     assert.equal(limited.result.candidates[0].content.parts[0].text, "AB");
     for (const invalid of [
         duplexReply("append_output", { done: "true", seq: 2, text: "invalid" }),
-        duplexReply("append_output", { done: true, seq: 1, text: "A" }),
+        duplexReply("append_output", { done: true, seq: 1, text: "changed" }),
+        duplexReply("append_output", { done: true, seq: 2, text: "" }, "MAX_TOKENS"),
         { candidates: [{ content: { parts: [null] }, finishReason: "STOP" }] },
     ]) {
         const { result, published, requests } = await runDuplex([
@@ -1503,7 +1555,7 @@ test("duplex stop handling never streams a stop prefix and preserves surrogate p
     assert.equal(emoji.published.map(s => Buffer.from(s.text).toString()).join(""), "🙂");
 });
 
-test("both engines preserve accepted prefixes when a later round is blocked, without retrying the block", async () => {
+test("accepted prefixes survive when a later round is blocked, without retrying the block", async () => {
     for (const blocked of [
         duplexReply("append_output", { seq: 2, text: "unaccepted" }, "SAFETY"),
         { promptFeedback: { blockReason: "PROHIBITED_CONTENT" } },
@@ -1511,12 +1563,7 @@ test("both engines preserve accepted prefixes when a later round is blocked, wit
         const duplex = await runDuplex([duplexReply("append_output", { seq: 1, text: "accepted" }), blocked]);
         assert.equal(duplex.result.candidates[0].content.parts[0].text, "accepted");
         assert.equal(duplex.result.candidates[0].finishReason, "SAFETY");
-        let count = 0;
-        const legacy = await AntiTruncation.generate(body(), async () =>
-            ++count === 1 ? reply("accepted", false) : blocked
-        );
-        assert.equal(count, 2);
-        assert.equal(legacy.candidates[0].content.parts[0].text, "accepted");
+        assert.equal(duplex.requests.length, 2);
     }
 });
 
@@ -1721,7 +1768,7 @@ test("duplex adapter preserves Request overrides and only opts in exact aliases"
     }
 });
 
-test("duplex upstream failure retains its code in SSE and never restarts partially delivered output", async () => {
+test("duplex upstream failure keeps its SSE code, or returns delivered output as incomplete without restarting", async () => {
     for (const partial of [false, true]) {
         const responses = partial
             ? [
@@ -1734,8 +1781,11 @@ test("duplex upstream failure retains its code in SSE and never restarts partial
         const res = new FakeResponse();
         await h.handler.processOpenAIRequest(req, res);
         assert.equal(res.statusCode, 200);
-        assert.ok(res.output.includes('"code":429'));
-        if (partial) assert.ok(res.output.includes("accepted"));
+        if (partial) {
+            assert.equal(visibleText(res, "openai", true), "accepted");
+            assert.ok(res.output.includes('"finish_reason":"length"'));
+            assert.ok(!res.output.includes('"code":429'));
+        } else assert.ok(res.output.includes('"code":429'));
         assert.equal(h.sent.length, responses.length + 2);
         assert.deepEqual(h.sentAccounts, partial ? [0, 0, 1, 2] : [0, 1, 2]);
         assert.equal(h.registry.messageQueues.size, 0);
@@ -1759,8 +1809,8 @@ test("duplex appends are bounded and empty or malformed arguments cannot produce
         calls++;
         return duplexReply("append_output", { seq: calls, text: String(calls) });
     });
-    assert.equal(calls, 4);
-    assert.equal(result.candidates[0].content.parts[0].text, "123");
+    assert.equal(calls, AntiTruncation.MAX_SEGMENTS + 1);
+    assert.equal(textOf(result), "12345678");
     assert.equal(result.candidates[0].finishReason, "MAX_TOKENS");
     let count = 0;
     await assert.rejects(
@@ -2104,4 +2154,220 @@ test("Argon native suffix routing and encoded alias token counting strip only ga
     assert.equal(counter.path, "/v1beta/models/gemini-4-argon:countTokens");
     assert.equal(JSON.parse(counter.body).generateContentRequest.model, "models/gemini-4-argon");
     assert.equal(counter.anti_truncation, undefined);
+});
+
+test("a mid-answer upstream failure returns accepted text as incomplete; before any text it still throws", async () => {
+    for (const failure of [
+        Object.assign(new Error("Internal error"), { status: 500 }),
+        Object.assign(new Error("Anti-truncation upstream round timed out."), { status: 504 }),
+        AntiTruncation.protocolError("upstream returned incomplete or invalid JSON."),
+        { error: { code: 500, message: "envelope error" } },
+    ]) {
+        let sent = 0;
+        const published = [];
+        const diagnostics = [];
+        const result = await Duplex.generate(
+            body(),
+            async () => {
+                if (++sent === 1) return reply(1, "第一段正文", false);
+                if (failure instanceof Error) throw failure;
+                return failure;
+            },
+            () => {},
+            segment => published.push(segment),
+            diagnostic => diagnostics.push(diagnostic)
+        );
+        assert.equal(sent, 2);
+        assert.equal(textOf(result), "第一段正文");
+        assert.equal(result.candidates[0].finishReason, "MAX_TOKENS");
+        assert.deepEqual(published, [{ seq: 1, text: "第一段正文" }]);
+        assert.equal(diagnostics.length, 1);
+        assert.equal(diagnostics[0].type, "interrupted");
+        assert.equal(diagnostics[0].segments, 1);
+        assert.equal(diagnostics[0].status, failure.status ?? failure.error?.code);
+    }
+    await assert.rejects(
+        Duplex.generate(body(), async () => {
+            throw Object.assign(new Error("Internal error"), { status: 500 });
+        }),
+        error => error.status === 500
+    );
+    let sent = 0;
+    await assert.rejects(
+        Duplex.generate(body(), async () => {
+            if (++sent === 1) return reply(1, "accepted", false);
+            throw Object.assign(new Error("Anti-truncation request cancelled."), { cancelled: true });
+        }),
+        error => error.cancelled === true
+    );
+});
+
+test("buffered public APIs keep accepted text after a non-switching continuation error and never replay", async t => {
+    for (const [api, method] of Object.entries(processors)) {
+        for (const stream of [false, true]) {
+            await t.test(`${api} stream=${stream}`, async () => {
+                const h = requestHarness([
+                    duplexReply("append_output", { seq: 1, text: "accepted" }),
+                    { event_type: "error", message: "Internal error", status: 500 },
+                ]);
+                const res = new FakeResponse();
+                await h.handler[method](apiRequest(api, "gemini-3.8-flash-抗截断", stream), res);
+                assert.equal(res.statusCode, 200, res.output);
+                assert.equal(visibleText(res, api, stream), "accepted");
+                assert.equal(h.sent.length, 2);
+                assert.deepEqual(h.switched, []);
+                assert.ok(!res.output.includes("Internal error"));
+                assert.equal(h.registry.messageQueues.size, 0);
+            });
+        }
+    }
+});
+
+test("a hanging continuation times out only its own round and keeps the accepted prefix", async () => {
+    let round = 0;
+    const h = harness(queue => {
+        if (++round > 1) return; // Never answers.
+        queue.enqueue({ data: JSON.stringify(reply(1, "accepted", false)), event_type: "chunk" });
+        queue.enqueue({ type: "STREAM_END" });
+    });
+    const warnings = [];
+    h.handler.logger = { info() {}, warn: message => warnings.push(message) };
+    h.handler.timeouts.FAKE_STREAM = 30;
+    await AntiTruncation.forward(h.handler, h.spec, 0);
+    assert.equal((await h.parent.dequeue()).status, 200);
+    const response = JSON.parse((await h.parent.dequeue()).data);
+    assert.equal(textOf(response), "accepted");
+    assert.equal(response.candidates[0].finishReason, "MAX_TOKENS");
+    assert.equal((await h.parent.dequeue()).type, "STREAM_END");
+    assert.deepEqual(h.cancelled, ["child-2"]);
+    assert.equal(h.parent.closed, false);
+    assert.equal(h.parent.listenerCount("close"), 0);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /parent: upstream round failed after 1 accepted segment\(s\) \(status 504/);
+});
+
+test("forwarding logs every rejected transport call with its reason", async () => {
+    let round = 0;
+    const h = harness(queue => {
+        round++;
+        const response = round === 1 ? duplexReply("append_output", { seq: 3, text: "gap" }) : reply(1, "fixed", true);
+        queue.enqueue({ data: JSON.stringify(response), event_type: "chunk" });
+        queue.enqueue({ type: "STREAM_END" });
+    });
+    const infos = [];
+    const warnings = [];
+    h.handler.logger = { info: message => infos.push(message), warn: message => warnings.push(message) };
+    await AntiTruncation.forward(h.handler, h.spec, 0);
+    assert.equal((await h.parent.dequeue()).status, 200);
+    assert.equal(textOf(JSON.parse((await h.parent.dequeue()).data)), "fixed");
+    assert.deepEqual(warnings, [
+        "[AntiTruncation] parent: rejected transport call: out-of-order or conflicting output sequence",
+    ]);
+    assert.deepEqual(infos, ["[AntiTruncation] Retrying rejected transport call for parent"]);
+});
+
+test("done=true on an empty next segment or a repeated last segment confirms completion", async () => {
+    for (const completion of [
+        duplexReply("append_output", { done: true, seq: 2, text: "" }),
+        duplexReply("append_output", { done: true, seq: 1, text: "全文" }),
+    ]) {
+        const { result, requests, published } = await runDuplex([
+            duplexReply("append_output", { done: false, seq: 1, text: "全文" }),
+            completion,
+        ]);
+        assert.equal(requests.length, 2);
+        assert.equal(result.candidates[0].finishReason, "STOP");
+        assert.equal(textOf(result), "全文");
+        assert.deepEqual(published, [{ seq: 1, text: "全文" }]);
+    }
+    const empty = await runDuplex([duplexReply("append_output", { done: true, seq: 1, text: "" })]);
+    assert.equal(empty.result.candidates[0].finishReason, "STOP");
+    assert.equal(textOf(empty.result), "");
+    // Only the last accepted segment can carry a late completion flag.
+    const early = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: "A" }),
+        duplexReply("append_output", { seq: 2, text: "B" }),
+        duplexReply("append_output", { done: true, seq: 1, text: "A" }),
+        duplexReply("finish_output", { last_seq: 2 }),
+    ]);
+    assert.equal(early.result.candidates[0].finishReason, "STOP");
+    assert.match(early.requests[3].systemInstruction.parts.at(-1).text, /completion may only follow/);
+});
+
+test("model reasoning in history is dropped and text signatures are kept instead of rejecting the request", async () => {
+    const converter = new FormatConverter(logger, { config: {} });
+    const { googleRequest } = await converter.translateClaudeToGoogle({
+        max_tokens: 100,
+        messages: [
+            { content: "first", role: "user" },
+            {
+                content: [
+                    { signature: "sig", thinking: "private reasoning", type: "thinking" },
+                    { text: "previous answer", type: "text" },
+                ],
+                role: "assistant",
+            },
+            { content: "second", role: "user" },
+        ],
+        model: "gemini-3.8-flash-抗截断",
+    });
+    const { request } = Duplex.prepare(googleRequest);
+    assert.deepEqual(
+        request.contents.map(turn => turn.parts.map(part => part.text)),
+        [["first"], ["previous answer"], ["second"]]
+    );
+    const native = {
+        contents: [
+            { parts: [{ text: "q" }], role: "user" },
+            { parts: [{ text: "only thoughts", thought: true }], role: "model" },
+            { parts: [{ text: "a", thoughtSignature: "opaque" }], role: "model" },
+            { parts: [{ text: "q2" }], role: "user" },
+        ],
+    };
+    const snapshot = JSON.stringify(native);
+    const prepared = Duplex.prepare(native).request;
+    assert.equal(prepared.contents.length, 3);
+    assert.deepEqual(prepared.contents[1].parts, [{ text: "a", thoughtSignature: "opaque" }]);
+    assert.equal(JSON.stringify(native), snapshot);
+    assert.throws(
+        () => Duplex.prepare({ contents: [{ parts: [{ text: "x", thought: true }], role: "model" }] }),
+        error => error.status === 400
+    );
+});
+
+test("Claude multi-turn requests with thinking blocks complete through the public handler", async () => {
+    const h = requestHarness(duplexTextReplies(["second answer"]));
+    const res = new FakeResponse();
+    await h.handler.processClaudeRequest(
+        {
+            body: {
+                max_tokens: 100,
+                messages: [
+                    { content: "first", role: "user" },
+                    {
+                        content: [
+                            { signature: "sig", thinking: "private reasoning", type: "thinking" },
+                            { text: "first answer", type: "text" },
+                        ],
+                        role: "assistant",
+                    },
+                    { content: "second", role: "user" },
+                ],
+                model: "gemini-3.8-flash-抗截断",
+                thinking: { budget_tokens: 1024, type: "enabled" },
+            },
+            headers: {},
+            method: "POST",
+            path: "/v1/messages",
+            query: {},
+        },
+        res
+    );
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(visibleText(res, "claude", false), "second answer");
+    assert.deepEqual(
+        JSON.parse(h.sent[0].body).contents.map(turn => turn.parts.map(part => part.text)),
+        [["first"], ["first answer"], ["second"]]
+    );
+    assert.equal(h.registry.messageQueues.size, 0);
 });

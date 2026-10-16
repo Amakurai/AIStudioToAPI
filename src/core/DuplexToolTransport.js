@@ -8,19 +8,29 @@ class DuplexToolTransport {
         // Native text requests may omit role; preserve their default user semantics.
         for (const turn of request.contents) {
             if (turn.role === undefined) turn.role = "user";
+            // Earlier reasoning (for example Claude thinking blocks) is not answer history. Drop it
+            // instead of rejecting multi-turn conversations from clients that echo it back.
+            if (turn.role === "model") turn.parts = turn.parts.filter(part => part.thought !== true);
         }
+        request.contents = request.contents.filter(turn => turn.parts.length);
         if (
+            !request.contents.length ||
             request.contents.some(
                 turn =>
                     !["user", "model"].includes(turn.role) ||
                     turn.parts.some(
-                        part => typeof part.text !== "string" || Object.keys(part).some(key => key !== "text")
+                        part =>
+                            typeof part.text !== "string" ||
+                            Object.keys(part).some(key => key !== "text" && key !== "thoughtSignature")
                     )
             )
         ) {
             throw AntiTruncation.invalidRequest("duplex mode requires text-only conversation history.");
         }
-        const limit = AntiTruncation.textChunkLimit(request.generationConfig.maxOutputTokens);
+        const limit = AntiTruncation.textChunkLimit(
+            request.generationConfig.maxOutputTokens,
+            request.generationConfig.thinkingConfig?.thinkingBudget
+        );
         // Preserve native conversation roles; these Flash models require a final user turn.
         if (request.contents.at(-1).role !== "user") {
             request.contents.push({ parts: [{ text: "\n" }], role: "user" });
@@ -81,26 +91,31 @@ class DuplexToolTransport {
         return { request };
     }
 
-    static async generate(body, send, onFollowup = () => {}, onSegment = () => {}) {
+    /**
+     * Runs the bounded segment protocol. `onFollowup(reason)` fires before every additional upstream
+     * call ("continue" or "repair"), `onSegment` receives text that is safe to publish, and
+     * `onDiagnostic` receives rejected calls and interruptions for logging.
+     */
+    static async generate(body, send, onFollowup = () => {}, onSegment = () => {}, onDiagnostic = () => {}) {
         const { request } = this.prepare(body);
         const stops = request.generationConfig.stopSequences;
         const stopOverlap = stops.reduce((longest, stop) => Math.max(longest, stop.length - 1), 0);
         delete request.generationConfig.stopSequences;
-        const maxSegments =
-            1 +
-            (request.generationConfig.maxOutputTokens <= 8192
-                ? AntiTruncation.MAX_SMALL_BUDGET_FOLLOWUPS
-                : AntiTruncation.MAX_FOLLOWUPS);
+        const maxSegments = AntiTruncation.MAX_SEGMENTS;
         const maxCalls = maxSegments + 1 + AntiTruncation.MAX_TOOL_REPAIRS;
         const usage = {};
         const segments = [];
         let text = "",
             published = 0,
             outputSeq = 0,
-            repairs = 0;
+            repairs = 0,
+            nextReason = "continue";
         let lastResponse = {},
             finishReason = "MAX_TOKENS";
-        let limit = AntiTruncation.textChunkLimit(request.generationConfig.maxOutputTokens);
+        let limit = AntiTruncation.textChunkLimit(
+            request.generationConfig.maxOutputTokens,
+            request.generationConfig.thinkingConfig?.thinkingBudget
+        );
         const publish = final => {
             let end = text.length;
             if (!final) {
@@ -120,25 +135,43 @@ class DuplexToolTransport {
                 published = end;
             }
         };
-        const repair = message => {
-            if (repairs >= AntiTruncation.MAX_TOOL_REPAIRS) return false;
+        const repair = issue => {
+            if (repairs >= AntiTruncation.MAX_TOOL_REPAIRS) {
+                onDiagnostic({ issue, segments: segments.length, type: "repair_exhausted" });
+                return false;
+            }
             repairs++;
             limit = Math.max(32, Math.floor(limit / 2));
+            onDiagnostic({ issue, segments: segments.length, type: "repair" });
             request.systemInstruction.parts.push({
-                text: `Transport validation failed: ${message}. No part of that call was accepted. Retry the current step only, using at most ${limit} text characters. Next output sequence: ${segments.length + 1}.`,
+                text: `Transport validation failed: ${issue}. No part of that call was accepted. Retry the current step only, using at most ${limit} text characters. Next output sequence: ${segments.length + 1}.`,
             });
             return true;
         };
         for (let round = 0; round < maxCalls; round++) {
-            if (round) onFollowup();
-            const response = await send(request);
-            if (!response || typeof response !== "object" || Array.isArray(response))
-                throw AntiTruncation.protocolError("invalid duplex response.");
-            if (response.error)
-                throw Object.assign(new Error(response.error.message || "Upstream generation failed"), {
-                    status: response.error.code,
+            if (round) onFollowup(nextReason);
+            nextReason = "continue";
+            let response;
+            try {
+                response = await send(request);
+                if (!response || typeof response !== "object" || Array.isArray(response))
+                    throw AntiTruncation.protocolError("invalid duplex response.");
+                if (response.error)
+                    throw Object.assign(new Error(response.error.message || "Upstream generation failed"), {
+                        status: response.error.code,
+                    });
+            } catch (error) {
+                // Before any accepted text, the caller may still retry the whole request. Afterwards,
+                // keep the accepted prefix and report it as incomplete instead of discarding it.
+                if (error?.cancelled || !segments.length) throw error;
+                onDiagnostic({
+                    message: error?.message,
+                    segments: segments.length,
+                    status: error?.status,
+                    type: "interrupted",
                 });
-            lastResponse = response;
+                break;
+            }
             for (const key of [
                 "promptTokenCount",
                 "candidatesTokenCount",
@@ -155,6 +188,7 @@ class DuplexToolTransport {
                 response.promptFeedback?.blockReason &&
                 response.promptFeedback.blockReason !== "BLOCK_REASON_UNSPECIFIED";
             if (promptBlocked || AntiTruncation.BLOCKED_FINISH_REASONS.includes(candidate?.finishReason)) {
+                lastResponse = response;
                 finishReason = promptBlocked ? "SAFETY" : candidate.finishReason;
                 break; // Preserve accepted text and report the block; never retry it as a transport failure.
             }
@@ -164,7 +198,11 @@ class DuplexToolTransport {
             const calls = validParts ? parts.filter(part => part.functionCall) : [];
             const call = calls[0]?.functionCall;
             const args = call?.args;
+            const stopped = candidate?.finishReason === "STOP";
             let issue;
+            // A completion signal without new text: an empty next segment, or the last accepted
+            // segment repeated, marked done=true. Both mean the same as finish_output(last_seq).
+            let completesWithoutText = false;
             if (candidate?.finishReason === "MALFORMED_FUNCTION_CALL") issue = "malformed tool arguments";
             else if (
                 !Array.isArray(response.candidates) ||
@@ -175,12 +213,21 @@ class DuplexToolTransport {
             else if (calls.length !== 1 || !args || typeof args !== "object" || Array.isArray(args))
                 issue = "expected one valid transport tool call";
             else if (call.name === "append_output") {
-                if (
+                const doneValid = args.done === undefined || typeof args.done === "boolean";
+                completesWithoutText =
+                    doneValid &&
+                    args.done === true &&
+                    stopped &&
+                    typeof args.text === "string" &&
+                    ((args.seq === segments.length + 1 && !args.text.length) ||
+                        (args.seq === segments.length && segments.length > 0 && segments.at(-1) === args.text));
+                if (completesWithoutText) issue = undefined;
+                else if (
                     !Number.isSafeInteger(args.seq) ||
                     args.seq < 1 ||
                     typeof args.text !== "string" ||
                     !args.text.length ||
-                    (args.done !== undefined && typeof args.done !== "boolean")
+                    !doneValid
                 )
                     issue = "invalid output sequence, text or completion flag";
                 else if (
@@ -189,46 +236,45 @@ class DuplexToolTransport {
                 )
                     issue = "out-of-order or conflicting output sequence";
                 else if (args.seq <= segments.length && args.done === true)
-                    issue = "completion must accompany a new segment or use finish_output";
+                    issue = "completion may only follow the last accepted segment";
             } else if (call.name === "finish_output") {
-                if (
-                    args.last_seq !== segments.length ||
-                    !Number.isSafeInteger(args.last_seq) ||
-                    candidate.finishReason !== "STOP"
-                )
+                if (args.last_seq !== segments.length || !Number.isSafeInteger(args.last_seq) || !stopped)
                     issue = "invalid completion acknowledgement";
             } else issue = "unexpected output transport tool";
             if (issue) {
-                if (repair(issue)) continue;
+                if (repair(issue)) {
+                    nextReason = "repair";
+                    continue;
+                }
                 if (!text) throw AntiTruncation.protocolError(`duplex repair exhausted: ${issue}.`);
                 break;
             }
-            let acknowledgement;
-            if (call.name === "finish_output") {
+            // Only accepted calls supply response metadata; rejected calls may carry private diagnostics.
+            lastResponse = response;
+            if (call.name === "finish_output" || completesWithoutText) {
                 finishReason = "STOP";
                 break;
-            } else {
-                if (args.seq === segments.length + 1) {
-                    if (segments.length >= maxSegments) break;
-                    segments.push(args.text);
-                    // Earlier text has already been checked. Only rescan the overlap where a stop can span segments.
-                    const searchFrom = Math.max(0, text.length - stopOverlap);
-                    text += args.text;
-                    const matches = stops.map(stop => text.indexOf(stop, searchFrom)).filter(index => index >= 0);
-                    if (matches.length) {
-                        text = text.slice(0, Math.min(...matches));
-                        finishReason = "STOP";
-                        break;
-                    }
-                    publish(false);
-                    // MAX_TOKENS is not a successful completion, even if the model emitted done=true.
-                    if (args.done === true && candidate.finishReason === "STOP") {
-                        finishReason = "STOP";
-                        break;
-                    }
-                }
-                acknowledgement = { next_seq: segments.length + 1, received: args.seq };
             }
+            if (args.seq === segments.length + 1) {
+                if (segments.length >= maxSegments) break;
+                segments.push(args.text);
+                // Earlier text has already been checked. Only rescan the overlap where a stop can span segments.
+                const searchFrom = Math.max(0, text.length - stopOverlap);
+                text += args.text;
+                const matches = stops.map(stop => text.indexOf(stop, searchFrom)).filter(index => index >= 0);
+                if (matches.length) {
+                    text = text.slice(0, Math.min(...matches));
+                    finishReason = "STOP";
+                    break;
+                }
+                publish(false);
+                // MAX_TOKENS is not a successful completion, even if the model emitted done=true.
+                if (args.done === true && stopped) {
+                    finishReason = "STOP";
+                    break;
+                }
+            }
+            const acknowledgement = { next_seq: segments.length + 1, received: args.seq };
             // Keep the actual model turn intact, including call IDs and thought signatures.
             request.contents.push(
                 candidate.content,

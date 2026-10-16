@@ -27,22 +27,27 @@ Argon 的模型 ID 来自 AI Studio 界面；模型列表暂不填未经确认�
 
 1. 原始文本对话直接作为上游对话发送，保留 user/model 角色和 system 指令优先级。不再调用 `read_input`，也不生成任务 ID。
 2. 模型通过 `append_output(seq, text, done)` 按顺序交付正文。序号从 1 开始；未完成时，网关确认收到后才继续。相同序号和相同内容不会重复拼接；缺号、同号不同内容等进入有限修复。
-3. 最后一个新分段可通过 `done: true` 同时确认全文完成，且该轮上游必须正常 `STOP`。能在一段内完成的回答只需一次上游调用。模型未提供 `done` 时仍支持 `finish_output(last_seq)`；空回答也使用该工具。没有有效完成确认时保留已收到的正文，并标记未完成，不伪装成完整回答。`MAX_TOKENS` 不会因为 `done: true` 被当成正常完成。
+3. 最后一个新分段可通过 `done: true` 同时确认全文完成，且该轮上游必须正常 `STOP`。能在一段内完成的回答只需一次上游调用。以下写法与 `finish_output(last_seq)` 等价，也视为完成：下一序号的空文本加 `done: true`，或原样重发最后一个已确认分段并加 `done: true`。空回答可用 `finish_output(0)` 或 `append_output(1, "", true)`。没有有效完成确认时保留已收到的正文，并标记未完成，不伪装成完整回答。`MAX_TOKENS` 不会因为 `done: true` 被当成正常完成。
+4. 已确认至少一段后，若后续某轮上游出错（HTTP 错误、单轮超时、返回无效 JSON 等），不再丢弃前文，也不整单重放：直接返回已确认的正文并标记未完成（OpenAI `length`、Claude `max_tokens`、Responses `incomplete`、Gemini `MAX_TOKENS`），错误原因写入日志。第一段尚未确认时出错，仍按原有策略返回错误或重试。
+
+历史中的模型思考内容（如 Claude 回传的 thinking 块，转换后为 `thought: true` 的部分）会在发送前移除，不再导致多轮请求被拒；文本部分上的 `thoughtSignature` 原样保留。只含思考内容的模型轮次整轮移除。
 
 工具历史保留真实调用 ID、完整模型回复和 thought signature，参见 [Gemini 官方说明](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)。不建立全局任务读取接口，不支持跨请求或断线后的会话恢复。
 
 ## 流式输出与限制
 
-- **OpenAI Chat Completions**：遵循全局 `STREAMING_MODE`。`real` 模式在收到完整、有效的正文分段时立即返回；粒度是已确认分段，不是半截工具参数的字符流。单段回答可能一次返回，看起来没有逐字输出。`fake` 模式先收齐所有分段，再以短间隔分块发送 SSE 正文，呈现逐步显示效果。两种模式均在参数验证通过后立即发送 SSE 响应头和助手起始帧，再等待后端就绪与生成；内部上游请求均为非流式，等待期间每 10 秒发送 SSE 心跳。
+- **OpenAI Chat Completions**：使用独立的 `ANTI_TRUNCATION_STREAMING_MODE`（默认 `real`），不受普通模型 `STREAMING_MODE` 影响。`real` 模式在收到完整、有效的正文分段时立即返回；粒度是已确认分段，不是半截工具参数的字符流。单段回答可能一次返回，看起来没有逐字输出。`fake` 模式先收齐所有分段，再以短间隔分块发送 SSE 正文，呈现逐步显示效果。两种模式均在参数验证通过后立即发送 SSE 响应头和助手起始帧，再等待后端就绪与生成；内部上游请求均为非流式，等待期间每 10 秒发送 SSE 心跳。
 - **Responses、Claude、Gemini 原生接口**：使用同样的内部工具协议，当前仍先缓冲整次结果，再转换成对应的流式或普通响应格式。
 - OpenAI 起始时连续发送助手角色帧和空内容帧，兼容 `new-api` 等暂存最后一帧的中转，避免起始帧被扣到后续心跳或正文到达。两帧均不包含正文；假流仍在生成完成后才发送正文。
 - 多层 Nginx/OpenResty 代理还需透传 `X-Accel-Buffering` 响应头，否则公网层可能重新缓冲起始帧和心跳。配置与公网验证方法见 [Nginx 多层代理配置](zh/nginx-setup.md#-多层代理配置)。
-- 单次输出预算不超过 8192 token 时最多接受 6 段，否则最多 3 段；使用独立完成确认时额外占一轮，另有最多 2 次协议修复。每次内部上游调用分别受 `FAKE_STREAM_TIMEOUT_MS` 限制，整次回答可能超过该时长；重复确认仍受总轮次限制。客户端或中间代理自身的绝对超时仍可能提前结束请求。
+- 无论输出预算多少，最多接受 8 段；使用独立完成确认时额外占一轮，另有最多 2 次协议修复。每段字符上限为单次输出预算（`max_tokens` / `maxOutputTokens`）的 75%，并先扣除显式的 `thinkingBudget`，范围 64–12000；未设置预算时为 12000。总容量随预算单调增加，调大预算不会减少可输出长度。格式错误或被截断的工具调用会在修复时把上限减半。
+- 每次内部上游调用分别受 `FAKE_STREAM_TIMEOUT_MS` 限制。单轮超时只结束该轮，已确认正文按未完成返回，整次回答可能超过该时长；重复确认仍受总轮次限制。客户端或中间代理自身的绝对超时仍可能提前结束请求。
+- 每次被拒的工具调用都会以 `[AntiTruncation] <请求 ID>: rejected transport call: <原因>` 记录警告；修复轮与正常续写分别记录为 `Retrying rejected transport call` 和 `Requesting next segment`。
 - 所有内部调用计入配额和用量；父请求与内部子请求不重复计算为用户并发。客户端断开会取消内部请求并清理队列。
 - 停止字符串支持字符串或数组，在正文上处理，支持跨段匹配。中文、emoji、换行、Markdown、XML 和转义字符原样保留。
 - 停止词检查只扫描新增正文及可能跨段匹配的前缀重叠区域，避免每轮重复扫描整篇文章。完成时会交付暂存但未构成停止词的尾部文本。
 - 未完成时返回相应的长度限制状态；Responses 使用 `incomplete`。明确审核拦截保留此前已确认的正文，同时返回拦截状态，不重试审核拦截。
-- OpenAI 流式连接建立后，后端就绪失败或上游 HTTP 错误通过 SSE error 返回，并保留错误码；不换账号重放已产生的内容。参数验证失败仍返回普通 HTTP 错误。其他缓冲接口保留原有 HTTP 错误重试策略；协议校验错误不换账号重试。
+- OpenAI 流式连接建立后，后端就绪失败或首段确认前的上游 HTTP 错误通过 SSE error 返回，并保留错误码；首段确认后的错误按上文返回未完成结果。均不换账号重放已产生的内容。参数验证失败仍返回普通 HTTP 错误。其他缓冲接口仅在首段确认前保留原有 HTTP 错误重试策略；协议校验错误不换账号重试。
 
 仅接受文本对话与单候选文本输出。图片、音频、已有工具调用、客户端工具、强制内置工具、缓存上下文或结构化输出等不兼容组合会明确报错，请改用原模型。原生请求兼容常见蛇形和驼峰参数写法；计数接口只映射模型别名，不包含内部工具和多轮调用开销。
 
@@ -77,7 +82,7 @@ node tests/duplex-live.js --run --tools --model=gemini-3.8-flash
 node tests/duplex-live.js --run --upstream --model=gemini-3.8-flash
 ```
 
-结果保存在 `artifacts/anti-truncation/duplex/`。旧结果可能包含此前的输入读取轮次，不能用来证明当前版本的延迟和调用次数；当前改动已通过本地模拟回归，真实模型效果需重新运行上述测试。`tests/anti-truncation-live.js` 仅用于历史单向工具算法的本地对照，不代表当前别名路由。
+结果保存在 `artifacts/anti-truncation/duplex/`。旧结果可能包含此前的输入读取轮次，不能用来证明当前版本的延迟和调用次数；当前改动已通过本地模拟回归，真实模型效果需重新运行上述测试。旧的单向 `deliver_response` 引擎及其对照脚本已移除，所有别名请求均使用上述分段协议。
 
 修改后需重启服务；容器部署需重建镜像。无需新增环境变量或管理界面设置。
-若通过管理页面切换 `STREAMING_MODE`，该设置只在当前进程生效；需要重启后保持假流时，在部署环境中设置 `STREAMING_MODE=fake`。
+抗截断别名的 OpenAI 流式模式只由 `ANTI_TRUNCATION_STREAMING_MODE` 决定；需要先收齐再分块发送时，在部署环境中设置 `ANTI_TRUNCATION_STREAMING_MODE=fake`。管理页面切换的 `STREAMING_MODE` 只影响普通模型。

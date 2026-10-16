@@ -1,9 +1,9 @@
-/** Internal tool transport for the opt-in model aliases. */
+/** Request validation and forwarding for the opt-in anti-truncation model aliases. */
 class AntiTruncation {
-    static TOOL = "deliver_response";
-    static MAX_FOLLOWUPS = 2;
-    static MAX_SMALL_BUDGET_FOLLOWUPS = 5;
+    // Same segment count for every budget, so a larger output budget never lowers total capacity.
+    static MAX_SEGMENTS = 8;
     static MAX_TOOL_REPAIRS = 2;
+    static MAX_CHUNK_CHARACTERS = 12000;
     static BLOCKED_FINISH_REASONS = [
         "SAFETY",
         "RECITATION",
@@ -33,22 +33,18 @@ class AntiTruncation {
         return stops;
     }
 
-    static textChunkLimit(maxOutputTokens) {
-        return Math.min(12000, Math.max(64, maxOutputTokens || 12000));
-    }
-
-    static chunkInstruction(limit) {
-        return (
-            `Each deliver_response call must contain at most ${limit} characters of text. ` +
-            "End at a line or sentence boundary within this limit, leaving room to finish the tool arguments. " +
-            "When more answer text remains, set done=false and wait for acknowledgement before continuing. " +
-            "Keep every character and newline; never omit the remainder to fit a chunk."
-        );
+    static textChunkLimit(maxOutputTokens, thinkingBudget) {
+        if (!maxOutputTokens) return this.MAX_CHUNK_CHARACTERS;
+        // Thinking shares the output budget, and JSON escaping costs tokens. Leave headroom for both;
+        // malformed or cut-off calls still halve the limit through bounded repair.
+        const reserved = Number.isInteger(thinkingBudget) && thinkingBudget > 0 ? thinkingBudget : 0;
+        const available = Math.max(0, maxOutputTokens - reserved);
+        return Math.min(this.MAX_CHUNK_CHARACTERS, Math.max(64, Math.floor(available * 0.75)));
     }
 
     static maxWaitMs(perCallTimeout) {
-        // A duplex answer can need several independent upstream calls, including repairs.
-        return perCallTimeout * (2 + this.MAX_SMALL_BUDGET_FOLLOWUPS + this.MAX_TOOL_REPAIRS) + 1000;
+        // One upstream call per segment, an optional finish_output call and bounded repairs.
+        return perCallTimeout * (this.MAX_SEGMENTS + 1 + this.MAX_TOOL_REPAIRS) + 1000;
     }
 
     static baseModel(model) {
@@ -171,227 +167,6 @@ class AntiTruncation {
         }
     }
 
-    static prepare(body) {
-        const request = this.normalizeRequest(body);
-        this.validateRequest(request);
-        const generation = request.generationConfig;
-        // These Flash models require a final ordinary user turn, including native requests.
-        const last = request.contents[request.contents.length - 1];
-        if (last.role !== "user" || last.parts?.some(part => part.functionCall || part.functionResponse)) {
-            request.contents.push({ parts: [{ text: "\n" }], role: "user" });
-        }
-        request.generationConfig = { ...generation, candidateCount: 1 };
-        // Stop sequences apply to visible text, not the internal tool's JSON serialization.
-        delete request.generationConfig.responseMimeType;
-        request.tools = [
-            {
-                functionDeclarations: [
-                    {
-                        description:
-                            "Deliver the next contiguous portion of the user-facing answer. This is a text transport, not an external action.",
-                        name: this.TOOL,
-                        parameters: {
-                            properties: {
-                                done: {
-                                    description: "True only when the entire requested answer is complete.",
-                                    type: "BOOLEAN",
-                                },
-                                text: {
-                                    description:
-                                        "Exact next answer text, preserving all whitespace, Markdown and XML. Never repeat previously delivered text.",
-                                    type: "STRING",
-                                },
-                            },
-                            required: ["text", "done"],
-                            type: "OBJECT",
-                        },
-                    },
-                ],
-            },
-        ];
-        request.toolConfig = { functionCallingConfig: { allowedFunctionNames: [this.TOOL], mode: "ANY" } };
-        const instruction =
-            "Response transport: deliver your user-facing answer only through deliver_response(text, done). " +
-            "Preserve the requested language and format exactly. Put only the answer in text, not private reasoning. " +
-            "If the full answer fits within the per-call text limit, send it once with done=true. Otherwise send a contiguous portion with done=false. " +
-            "After acknowledgement, continue exactly where the previous text ended without repeating it. " +
-            "Do not summarize or shorten the answer to fit. Set done=true only after completing the user's request. " +
-            this.chunkInstruction(this.textChunkLimit(generation.maxOutputTokens));
-        request.systemInstruction = {
-            ...(request.systemInstruction || {}),
-            parts: [...(request.systemInstruction?.parts || []), { text: instruction }],
-        };
-        return request;
-    }
-
-    static async generate(body, send, onFollowup = () => {}) {
-        const request = this.prepare(body);
-        let text = "";
-        let finalResponse;
-        let completed = false;
-        let repairs = 0;
-        let chunkLimit = this.textChunkLimit(request.generationConfig.maxOutputTokens);
-        const maxFollowups =
-            request.generationConfig.maxOutputTokens <= 8192 ? this.MAX_SMALL_BUDGET_FOLLOWUPS : this.MAX_FOLLOWUPS;
-        const usage = {};
-        const stops = request.generationConfig.stopSequences;
-        delete request.generationConfig.stopSequences;
-        for (let round = 0; round <= maxFollowups; round++) {
-            if (round || repairs) onFollowup();
-            const response = await send(request);
-            if (!response || typeof response !== "object" || Array.isArray(response)) {
-                throw this.protocolError("upstream returned an invalid response object.");
-            }
-            if (response.error)
-                throw Object.assign(new Error(response.error.message || "Upstream generation failed"), {
-                    status: response.error.code,
-                });
-            for (const key of [
-                "promptTokenCount",
-                "candidatesTokenCount",
-                "totalTokenCount",
-                "thoughtsTokenCount",
-                "cachedContentTokenCount",
-                "toolUsePromptTokenCount",
-            ]) {
-                if (Number.isFinite(response.usageMetadata?.[key]))
-                    usage[key] = (usage[key] || 0) + response.usageMetadata[key];
-            }
-            const candidate = response.candidates?.[0];
-            if (candidate?.finishReason === "MALFORMED_FUNCTION_CALL") {
-                if (repairs >= this.MAX_TOOL_REPAIRS) {
-                    if (text.length) break;
-                    throw this.protocolError("tool arguments remained malformed after bounded repair attempts.");
-                }
-                repairs++;
-                chunkLimit = Math.max(32, Math.floor(chunkLimit / 2));
-                request.systemInstruction.parts.push({
-                    text:
-                        "The last tool call was malformed and none of its text was accepted. " +
-                        "Retry only the next not-yet-acknowledged portion, starting at the same position as that failed call. " +
-                        this.chunkInstruction(chunkLimit),
-                });
-                // Keep only acknowledged tool turns in history. Never parse diagnostic text as answer content.
-                round--;
-                continue;
-            }
-            if (!candidate) {
-                if (
-                    response.promptFeedback?.blockReason &&
-                    response.promptFeedback.blockReason !== "BLOCK_REASON_UNSPECIFIED"
-                ) {
-                    // Compatibility converters need a candidate to surface a content-filter result.
-                    return {
-                        ...response,
-                        candidates: [
-                            {
-                                content: { parts: text ? [{ text }] : [], role: "model" },
-                                finishReason: "SAFETY",
-                                index: 0,
-                            },
-                        ],
-                        usageMetadata: usage,
-                    };
-                }
-                throw this.protocolError("upstream returned no candidate.");
-            }
-            if (
-                !Array.isArray(response.candidates) ||
-                response.candidates.length !== 1 ||
-                !["STOP", "MAX_TOKENS", ...this.BLOCKED_FINISH_REASONS].includes(candidate.finishReason)
-            ) {
-                throw this.protocolError("upstream returned an invalid or unfinished tool response.");
-            }
-            // Preserve upstream blocking and refusal outcomes; never turn them into a success.
-            if (!["STOP", "MAX_TOKENS"].includes(candidate.finishReason)) {
-                return {
-                    ...response,
-                    candidates: response.candidates?.map(item => ({
-                        ...item,
-                        content: {
-                            parts: [
-                                ...(text ? [{ text }] : []),
-                                ...(Array.isArray(item.content?.parts)
-                                    ? item.content.parts.filter(
-                                          part =>
-                                              part &&
-                                              typeof part.text === "string" &&
-                                              !part.functionCall &&
-                                              !part.functionResponse
-                                      )
-                                    : []),
-                            ],
-                            role: "model",
-                        },
-                    })),
-                    usageMetadata: usage,
-                };
-            }
-            const parts = candidate.content?.parts;
-            if (!Array.isArray(parts) || parts.some(part => !part || typeof part !== "object")) {
-                throw this.protocolError("upstream returned invalid content parts.");
-            }
-            const calls = parts.filter(part => part.functionCall);
-            if (calls.length !== 1 || calls[0].functionCall.name !== this.TOOL) {
-                throw this.protocolError("upstream did not return the expected internal tool call.");
-            }
-            const args = calls[0].functionCall.args;
-            if (
-                !args ||
-                typeof args.text !== "string" ||
-                (typeof args.done !== "boolean" &&
-                    !(candidate.finishReason === "MAX_TOKENS" && args.done === undefined))
-            ) {
-                throw this.protocolError("incomplete or invalid tool arguments; no malformed text was returned.");
-            }
-            finalResponse = response;
-            text += args.text;
-            const stopPositions = stops
-                .filter(stop => typeof stop === "string" && stop.length)
-                .map(stop => text.indexOf(stop))
-                .filter(index => index >= 0);
-            if (stopPositions.length) {
-                text = text.slice(0, Math.min(...stopPositions));
-                completed = true;
-                break;
-            }
-            completed = args.done && candidate.finishReason !== "MAX_TOKENS";
-            if (completed || !args.text.length || round === maxFollowups) break;
-            request.contents.push(candidate.content);
-            request.contents.push({
-                parts: [
-                    {
-                        functionResponse: {
-                            ...(calls[0].functionCall.id ? { id: calls[0].functionCall.id } : {}),
-                            name: this.TOOL,
-                            response: { continue: true, received: true },
-                        },
-                    },
-                ],
-                role: "user",
-            });
-            request.contents.push({
-                parts: [
-                    {
-                        text: "Continue the answer from the exact next character using deliver_response. Do not repeat any text already delivered.",
-                    },
-                ],
-                role: "user",
-            });
-        }
-        return {
-            ...finalResponse,
-            candidates: [
-                {
-                    ...finalResponse.candidates[0],
-                    content: { parts: [{ text }], role: "model" },
-                    finishReason: completed ? "STOP" : "MAX_TOKENS",
-                },
-            ],
-            usageMetadata: usage,
-        };
-    }
-
     static async forward(handler, spec, authIndex) {
         const registry = handler.connectionRegistry;
         const parent = registry.messageQueues.get(spec.request_id)?.queue;
@@ -399,7 +174,6 @@ class AntiTruncation {
         let activeChild = null;
         let activeAuthIndex = authIndex;
         let cancelled = false;
-        let cancelReason = null;
         let resolveCancellation;
         const cancellation = new Promise(resolve => {
             resolveCancellation = resolve;
@@ -417,7 +191,6 @@ class AntiTruncation {
         const cancel = (reason = "client_disconnect") => {
             if (cancelled) return;
             cancelled = true;
-            cancelReason = reason;
             resolveCancellation(false);
             const child = activeChild;
             activeChild = null;
@@ -433,16 +206,16 @@ class AntiTruncation {
         parent.once("close", cancel);
         try {
             const body = JSON.parse(spec.body);
-            const engine = spec.anti_truncation_mode === "duplex" ? require("./DuplexToolTransport") : this;
-            const response = await engine.generate(
+            const cancelledError = () =>
+                Object.assign(new Error("Anti-truncation request cancelled."), { cancelled: true });
+            const response = await require("./DuplexToolTransport").generate(
                 body,
                 async requestBody => {
                     const tracker = handler._createImmediateSwitchTracker(activeAuthIndex);
                     // Keep the engine's acknowledged history and published segments intact: only this
                     // upstream round is retried, including continuation and malformed-tool repair rounds.
                     for (;;) {
-                        if (cancelled || parent.closed)
-                            throw new Error("Anti-truncation request cancelled or timed out.");
+                        if (cancelled || parent.closed) throw cancelledError();
                         const id = handler._generateRequestId();
                         const attempt = handler._generateRequestAttemptId(id, 1);
                         const queue = registry.createMessageQueue(id, activeAuthIndex, attempt, spec.request_id);
@@ -450,8 +223,9 @@ class AntiTruncation {
                         activeChild = child;
                         let finished = false;
                         let attemptError = null;
+                        // The deadline covers only this upstream round. Expiry stops this child, not the
+                        // whole answer, so the engine can keep already accepted segments.
                         const deadline = Date.now() + handler.timeouts.FAKE_STREAM;
-                        const timer = setTimeout(() => cancel("timeout"), handler.timeouts.FAKE_STREAM);
                         try {
                             handler._forwardRequest(
                                 {
@@ -504,16 +278,19 @@ class AntiTruncation {
                             }
                             return response;
                         } catch (error) {
-                            attemptError = error;
+                            attemptError =
+                                error.code === "QUEUE_TIMEOUT"
+                                    ? Object.assign(new Error("Anti-truncation upstream round timed out."), {
+                                          status: 504,
+                                      })
+                                    : error;
                         } finally {
-                            clearTimeout(timer);
                             if (!finished && !cancelled) stopChild(child, "request_failed");
                             else registry.removeMessageQueue(id);
                             if (activeChild === child) activeChild = null;
                         }
+                        if (cancelled || parent.closed) throw cancelledError();
                         if (
-                            cancelled ||
-                            parent.closed ||
                             attemptError.retryable === false ||
                             !handler.config?.immediateSwitchStatusCodes?.includes(Number(attemptError.status))
                         ) {
@@ -536,7 +313,7 @@ class AntiTruncation {
                         } catch (switchError) {
                             handler.logger.warn?.(`[AntiTruncation] Account retry failed: ${switchError.message}`);
                         }
-                        if (cancelled || parent.closed) throw attemptError;
+                        if (cancelled || parent.closed) throw cancelledError();
                         if (!retryPrepared || !Number.isInteger(tracker.nextAuthIndex) || tracker.nextAuthIndex < 0) {
                             registry.setMessageQueueAuthIndex(spec.request_id, activeAuthIndex, parent);
                             // The outer handler must not restart the whole response after bounded retries.
@@ -549,15 +326,27 @@ class AntiTruncation {
                         recordAdditionalAttempt();
                     }
                 },
-                () => {
+                reason => {
                     recordAdditionalAttempt();
-                    handler.logger.info(`[AntiTruncation] Continuing incomplete response for ${spec.request_id}`);
+                    handler.logger.info(
+                        reason === "repair"
+                            ? `[AntiTruncation] Retrying rejected transport call for ${spec.request_id}`
+                            : `[AntiTruncation] Requesting next segment for ${spec.request_id}`
+                    );
                 },
                 segment => {
                     if (spec.anti_truncation_segments) parent.enqueue({ event_type: "tool_output", ...segment });
+                },
+                diagnostic => {
+                    const detail =
+                        diagnostic.type === "interrupted"
+                            ? `upstream round failed after ${diagnostic.segments} accepted segment(s) ` +
+                              `(status ${diagnostic.status ?? "unknown"}: ${diagnostic.message}); returning them as incomplete`
+                            : `${diagnostic.type === "repair" ? "rejected" : "repair exhausted on"} transport call: ${diagnostic.issue}`;
+                    handler.logger.warn?.(`[AntiTruncation] ${spec.request_id}: ${detail}`);
                 }
             );
-            if (cancelled || parent.closed) throw new Error("Anti-truncation request cancelled or timed out.");
+            if (cancelled || parent.closed) throw cancelledError();
             parent.enqueue({
                 event_type: "response_headers",
                 headers: { "content-type": "application/json" },
@@ -571,8 +360,7 @@ class AntiTruncation {
                 message: error.message,
                 ...(error.retryable === false ? { retryable: false } : {}),
                 ...(error.skipAccountSwitch ? { skipAccountSwitch: true } : {}),
-                status:
-                    cancelReason === "timeout" || error.code === "QUEUE_TIMEOUT" ? 504 : Number(error.status) || 502,
+                status: error.code === "QUEUE_TIMEOUT" ? 504 : Number(error.status) || 502,
             });
         } finally {
             parent.removeListener("close", cancel);
