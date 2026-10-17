@@ -293,6 +293,8 @@ class RetryHandler extends ConnectionHandler {
                 : this.currentAuthIndex;
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+        // Upstream status of each account's failed attempt (by canonical account).
+        const failedStatusByAccount = new Map();
 
         while (retryAttempt <= this.config.maxRetries) {
             // Backoff/recovery may outlive the client or the queue it owned.
@@ -427,6 +429,10 @@ class RetryHandler extends ConnectionHandler {
                 }
 
                 lastError = errorPayload;
+                failedStatusByAccount.set(
+                    this.authSource?.getCanonicalIndex?.(currentQueueAuthIndex) ?? currentQueueAuthIndex,
+                    Number(errorPayload?.status)
+                );
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
@@ -510,7 +516,11 @@ class RetryHandler extends ConnectionHandler {
                 // Dispatches to the least-loaded ready account (falls back to currentAuthIndex).
                 // Note: We keep the same requestId so the browser response routes to the new queue
                 // createMessageQueue will automatically close and remove any existing queue with the same ID from the registry
-                let retryAuthIndex = this._selectDispatchAuthIndex([currentQueueAuthIndex]);
+                // Prefer an account this request has not tried yet, then any account but the last one.
+                let retryAuthIndex = this._selectDispatchAuthIndex([...immediateSwitchTracker.attemptedAuthIndices], {
+                    allowFallback: false,
+                });
+                if (retryAuthIndex < 0) retryAuthIndex = this._selectDispatchAuthIndex([currentQueueAuthIndex]);
                 if (retryAuthIndex < 0 && !this.authSource.isAccountCoolingDown?.(currentQueueAuthIndex)) {
                     retryAuthIndex = currentQueueAuthIndex;
                 }
@@ -547,6 +557,22 @@ class RetryHandler extends ConnectionHandler {
                 }
                 retryAttempt++;
             }
+        }
+
+        // The same failure on several different accounts comes from the model or upstream (e.g. a
+        // model the tier cannot access), not from the current account: do not count or switch it.
+        const failedStatuses = new Set(failedStatusByAccount.values());
+        if (
+            lastError &&
+            !lastError.skipAccountSwitch &&
+            failedStatusByAccount.size >= 2 &&
+            failedStatuses.size === 1 &&
+            failedStatuses.has(Number(lastError.status))
+        ) {
+            this.logger.info(
+                `[Request] Request #${proxyRequest.request_id} failed with ${lastError.status} on ${failedStatusByAccount.size} different accounts; not treating it as an account failure.`
+            );
+            lastError = { ...lastError, skipAccountSwitch: true };
         }
 
         // After all retries, return the final failure result

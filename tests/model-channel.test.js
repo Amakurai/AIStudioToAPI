@@ -568,3 +568,57 @@ test("accounts cooling down for Build quota remain available to Playground", asy
     assert.equal(res.statusCode, 200, res.output);
     assert.equal(served, 1);
 });
+
+function failingPool(t, accounts, respond) {
+    const h = poolHarness(t);
+    h.handler.config.switchOnUses = 0;
+    h.handler.config.maxRetries = accounts.length;
+    h.handler._getReadyAuthIndices = () => accounts;
+    const tried = [];
+    for (const authIndex of accounts)
+        h.handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+            send(data) {
+                const spec = JSON.parse(data);
+                if (spec.event_type === "cancel_request") return;
+                tried.push(authIndex);
+                const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+                const response = respond(authIndex);
+                if (response) queue.enqueue(response);
+                else answer(queue);
+            },
+        });
+    h.handler._selectDispatchAuthIndex = function (exclude = [], options) {
+        return exclude.length ? RequestHandler.prototype._selectDispatchAuthIndex.call(this, exclude, options) : 0;
+    };
+    return { ...h, tried };
+}
+
+test("ordinary retries move to accounts the request has not tried yet", async t => {
+    const h = failingPool(t, [0, 1, 2], authIndex =>
+        authIndex === 2 ? null : { event_type: "error", message: "backend error", status: 500 }
+    );
+    const res = new FakeResponse();
+    await h.handler.processOpenAIRequest(apiRequest("openai", "build-gemini-3.8-flash"), res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.deepEqual(h.tried, [0, 1, 2]);
+});
+
+test("the same failure on several accounts is not counted against the current account", async t => {
+    const denied = {
+        event_type: "error",
+        message: "403 PERMISSION_DENIED The caller does not have permission",
+        status: 403,
+    };
+    const h = failingPool(t, [0, 1], () => denied);
+    const res = new FakeResponse();
+    await h.handler.processOpenAIRequest(apiRequest("openai", "build-gemini-omni-1.1-flash"), res);
+    assert.equal(res.statusCode, 403);
+    assert.deepEqual(h.tried, [0, 1]);
+    assert.equal(h.handler.authSwitcher.failureCount, 0);
+    assert.deepEqual(h.switches, []);
+
+    // A failure seen on only one account still counts against it.
+    const single = failingPool(t, [0], () => denied);
+    await single.handler.processOpenAIRequest(apiRequest("openai", "build-gemini-3.8-flash"), new FakeResponse());
+    assert.equal(single.handler.authSwitcher.failureCount, 1);
+});
