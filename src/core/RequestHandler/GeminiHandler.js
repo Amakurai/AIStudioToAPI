@@ -128,7 +128,7 @@ class GeminiHandler extends RetryHandler {
         );
 
         try {
-            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
 
             if (!result.success) {
                 clearTimeout(connectionMaintainer);
@@ -529,7 +529,7 @@ class GeminiHandler extends RetryHandler {
 
     async _handleNonStreamResponse(proxyRequest, messageQueue, req, res) {
         try {
-            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
 
             if (!result.success) {
                 // If retries failed, handle the failure (e.g., switch account)
@@ -693,7 +693,8 @@ class GeminiHandler extends RetryHandler {
             if (req.method === "POST" && AntiTruncation.baseModel(cleanModelName)) {
                 // Normalize before global settings add camelCase fields to the native body.
                 bodyObj = AntiTruncation.normalizeRequest(bodyObj);
-                AntiTruncation.validateRequest(bodyObj);
+                // Tool and cachedContent requests fall back to the base model in _initializeProxyRequestAttempt.
+                if (!AntiTruncation.requiresOriginalModel(bodyObj)) AntiTruncation.validateRequest(bodyObj);
                 requestBodyObj = bodyObj;
             }
 

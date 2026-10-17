@@ -123,7 +123,11 @@ class TransportHandler extends RequestHandler {
                 if (body.generateContentRequest?.model) body.generateContentRequest.model = `models/${baseModel}`;
                 proxyRequest.body = JSON.stringify(body);
             }
-            if (proxyRequest.is_generative && /:(?:streamGenerateContent|generateContent)$/.test(proxyRequest.path)) {
+            if (
+                proxyRequest.is_generative &&
+                /:(?:streamGenerateContent|generateContent)$/.test(proxyRequest.path) &&
+                (proxyRequest.anti_truncation_mode === "duplex" || !this._antiTruncationFallback(proxyRequest))
+            ) {
                 proxyRequest.anti_truncation = true;
                 proxyRequest.anti_truncation_mode = "duplex";
                 proxyRequest.streaming_mode = "fake";
@@ -136,6 +140,21 @@ class TransportHandler extends RequestHandler {
             proxyRequest.request_id,
             proxyRequest.request_attempt_number
         );
+    }
+
+    _antiTruncationFallback(proxyRequest) {
+        let body;
+        try {
+            body = typeof proxyRequest.body === "string" ? JSON.parse(proxyRequest.body) : proxyRequest.body;
+        } catch {
+            return false;
+        }
+        if (!AntiTruncation.requiresOriginalModel(body)) return false;
+        this.logger.info(
+            `[AntiTruncation] Request #${proxyRequest.request_id} carries tools or cachedContent; ` +
+                "forwarding to the base model without anti-truncation."
+        );
+        return true;
     }
 
     _advanceProxyRequestAttempt(proxyRequest) {

@@ -2371,3 +2371,46 @@ test("Claude multi-turn requests with thinking blocks complete through the publi
     );
     assert.equal(h.registry.messageQueues.size, 0);
 });
+
+test("alias requests with client tools fall back to the base model on every public API", async t => {
+    const tools = {
+        claude: [{ input_schema: { properties: {}, type: "object" }, name: "get_weather" }],
+        gemini: [{ functionDeclarations: [{ name: "get_weather" }] }],
+        openai: [
+            { function: { name: "get_weather", parameters: { properties: {}, type: "object" } }, type: "function" },
+        ],
+        responses: [{ name: "get_weather", parameters: { properties: {}, type: "object" }, type: "function" }],
+    };
+    const plain = { candidates: [{ content: { parts: [{ text: "ok" }], role: "model" }, finishReason: "STOP" }] };
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const h = requestHarness([plain]);
+            const req = apiRequest(api, "gemini-4-argon-抗截断", false);
+            req.body.tools = tools[api];
+            const res = new FakeResponse();
+            await h.handler[method](req, res);
+            assert.equal(res.statusCode, 200, res.output);
+            assert.ok(res.output.includes("ok"), res.output);
+            assert.equal(h.sent.length, 1);
+            assert.equal(h.sent[0].path, "/v1beta/models/gemini-4-argon:generateContent");
+            assert.equal(h.sent[0].anti_truncation, undefined);
+            const sentTools = JSON.parse(h.sent[0].body).tools;
+            assert.equal(sentTools[0].functionDeclarations[0].name, "get_weather");
+        });
+    }
+});
+
+test("fallback detection covers tools, toolConfig, cachedContent and forced built-ins", () => {
+    for (const extra of [
+        { tools: [{ googleSearch: {} }] },
+        { toolConfig: { functionCallingConfig: { mode: "NONE" } } },
+        { cached_content: "cache" },
+    ]) {
+        assert.equal(AntiTruncation.requiresOriginalModel({ ...body(), ...extra }), true);
+    }
+    assert.equal(AntiTruncation.requiresOriginalModel({ ...body(), tools: [] }), false);
+    assert.equal(AntiTruncation.requiresOriginalModel(body()), false);
+    assert.equal(AntiTruncation.openAIRequiresOriginalModel({ tools: [] }), false);
+    assert.equal(AntiTruncation.openAIRequiresOriginalModel({ functions: [{ name: "f" }] }), true);
+    assert.equal(AntiTruncation.openAIRequiresOriginalModel({}, { forceWebSearch: true }), true);
+});

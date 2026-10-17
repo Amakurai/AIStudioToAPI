@@ -59,6 +59,33 @@ class AntiTruncation {
         return match ? match[1] : null;
     }
 
+    /**
+     * The duplex protocol owns tools and toolConfig. Requests that bring their own tools or cached
+     * content fall back to the base model on the ordinary transport instead of failing.
+     */
+    static requiresOriginalModel(request) {
+        if (!request || typeof request !== "object" || Array.isArray(request)) return false;
+        const tools = request.tools;
+        return !!(
+            (tools != null && (!Array.isArray(tools) || tools.length > 0)) ||
+            request.toolConfig ||
+            request.tool_config ||
+            request.cachedContent ||
+            request.cached_content
+        );
+    }
+
+    // Mirrors the OpenAI converter: only named function tools and forced built-ins become Gemini tools.
+    static openAIRequiresOriginalModel(body, config = {}) {
+        const declaresFunctions = list =>
+            Array.isArray(list) && list.some(tool => typeof (tool?.function || tool)?.name === "string");
+        return (
+            declaresFunctions(body?.tools) ||
+            declaresFunctions(body?.functions) ||
+            !!(config.forceWebSearch || config.forceUrlContext || config.forceCodeExecution)
+        );
+    }
+
     static normalizeRequest(body) {
         if (!body || typeof body !== "object" || Array.isArray(body)) {
             throw this.invalidRequest("request body must be an object.");

@@ -13,7 +13,11 @@ const { isUserAbortedError } = require("../../utils/CustomErrors");
 class ChatCompletionsHandler extends RetryHandler {
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
-        if (AntiTruncation.baseModel(req.body?.model)) {
+        // Tool requests keep the alias here; proxy request initialization routes them to the base model.
+        if (
+            AntiTruncation.baseModel(req.body?.model) &&
+            !AntiTruncation.openAIRequiresOriginalModel(req.body, this.config)
+        ) {
             return require("../DuplexOpenAI").handle(this, req, res);
         }
         const requestId = this._generateRequestId();
@@ -161,15 +165,30 @@ class ChatCompletionsHandler extends RetryHandler {
                     // OpenAI Fake Stream / Non-Stream mode
                     // Set up keep-alive timer for fake stream mode to prevent client timeout
                     let connectionMaintainer;
+                    const streamState = {
+                        created: Math.floor(Date.now() / 1000),
+                        id: `chatcmpl-${requestId}`,
+                    };
                     if (isOpenAIStream) {
+                        // OpenAI relays discard SSE comments and may hold the latest data
+                        // frame for usage accounting. Two empty frames release a heartbeat
+                        // downstream without inventing content, usage or a finish reason.
+                        const heartbeat = `data: ${JSON.stringify({
+                            choices: [{ delta: { content: "" }, finish_reason: null, index: 0 }],
+                            created: streamState.created,
+                            id: streamState.id,
+                            model,
+                            object: "chat.completion.chunk",
+                        })}\n\n`;
                         this._startSseKeepAlive(
                             res,
-                            ": keep-alive\n\n",
+                            heartbeat + heartbeat,
                             () => {
                                 res.status(200).set({
                                     "Cache-Control": "no-cache",
                                     Connection: "keep-alive",
                                     "Content-Type": "text/event-stream",
+                                    "X-Accel-Buffering": "no",
                                 });
                             },
                             timer => {
@@ -179,7 +198,7 @@ class ChatCompletionsHandler extends RetryHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "OpenAI fake/non-stream", requestId);
@@ -216,10 +235,11 @@ class ChatCompletionsHandler extends RetryHandler {
                                     "Cache-Control": "no-cache",
                                     Connection: "keep-alive",
                                     "Content-Type": "text/event-stream",
+                                    "X-Accel-Buffering": "no",
                                 });
                             }
-                            // Clear keep-alive timer as we are about to send real data
-                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
+                            // Receiving upstream headers is not the end of generation.
+                            // Keep heartbeats running until the entire buffered body arrives.
 
                             this.logger.info(`[Request] OpenAI streaming response (Fake Mode) started...`);
                             let fullBody = "";
@@ -236,13 +256,14 @@ class ChatCompletionsHandler extends RetryHandler {
                                         this.logger.error(
                                             `❌ [Request] Error received during OpenAI fake stream: ${message.message}`
                                         );
-                                        this._markTrackedResponseError(res, message.message, 500);
+                                        const status = this._getUpstreamErrorStatus(message);
+                                        this._markTrackedResponseError(res, message.message, status);
                                         hadStreamError = true;
                                         // Check if response is still writable before attempting to write
                                         if (this._isResponseWritable(res)) {
                                             try {
                                                 res.write(
-                                                    `data: ${JSON.stringify({ error: { code: 500, message: message.message, type: "api_error" } })}\n\n`
+                                                    `data: ${JSON.stringify({ error: { code: status, message: message.message, type: "api_error" } })}\n\n`
                                                 );
                                             } catch (writeError) {
                                                 this.logger.debug(
@@ -259,7 +280,7 @@ class ChatCompletionsHandler extends RetryHandler {
                                     // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
                                     return;
                                 }
-                                const streamState = {};
+                                if (connectionMaintainer) clearTimeout(connectionMaintainer);
                                 const translatedChunk = this.formatConverter.translateGoogleToOpenAIStream(
                                     fullBody,
                                     model,
@@ -268,9 +289,10 @@ class ChatCompletionsHandler extends RetryHandler {
                                 if (this._isResponseWritable(res)) {
                                     try {
                                         if (translatedChunk) {
-                                            res.write(translatedChunk);
+                                            if (!(await this._writeOpenAIFakeStreamChunks(res, translatedChunk)))
+                                                return;
                                         }
-                                        res.write("data: [DONE]\n\n");
+                                        if (this._isResponseWritable(res)) res.write("data: [DONE]\n\n");
                                     } catch (writeError) {
                                         this.logger.debug(
                                             `[Request] Failed to write final fake OpenAI stream chunks: ${writeError.message}`
@@ -309,6 +331,46 @@ class ChatCompletionsHandler extends RetryHandler {
         }
     }
 
+    async _writeOpenAIFakeStreamChunks(res, translated) {
+        let charactersSincePause = 0;
+        const write = async (frame, characters = 0) => {
+            if (charactersSincePause >= 128) {
+                await new Promise(resolve => setTimeout(resolve, 20));
+                charactersSincePause = 0;
+            }
+            if (!this._isResponseWritable(res)) return false;
+            res.write(`data: ${JSON.stringify(frame)}\n\n`);
+            charactersSincePause += characters;
+            return true;
+        };
+        // These are locally generated OpenAI frames, not arbitrary upstream SSE.
+        // Split text by Unicode code points; keep tool arguments and final usage intact.
+        for (const event of translated.split("\n\n").filter(Boolean)) {
+            const frame = JSON.parse(event.slice(6));
+            const choice = frame.choices?.[0];
+            const delta = choice?.delta;
+            const field =
+                typeof delta?.content === "string"
+                    ? "content"
+                    : typeof delta?.reasoning_content === "string"
+                      ? "reasoning_content"
+                      : null;
+            if (!field || !delta[field] || delta.tool_calls || choice.finish_reason || frame.usage) {
+                if (!(await write(frame))) return false;
+                continue;
+            }
+            const characters = Array.from(delta[field]);
+            for (let i = 0; i < characters.length; i += 128) {
+                const slice = characters.slice(i, i + 128);
+                const nextDelta = { ...delta, [field]: slice.join("") };
+                if (i) delete nextDelta.role;
+                if (!(await write({ ...frame, choices: [{ ...choice, delta: nextDelta }] }, slice.length)))
+                    return false;
+            }
+        }
+        return true;
+    }
+
     async _streamOpenAIResponse(messageQueue, res, model, requestId) {
         const streamState = {};
 
@@ -332,13 +394,14 @@ class ChatCompletionsHandler extends RetryHandler {
 
                 if (message.event_type === "error") {
                     this.logger.error(`❌ [Request] Error received during OpenAI stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
+                    const status = this._getUpstreamErrorStatus(message);
+                    this._markTrackedResponseError(res, message.message, status);
                     // Attempt to send error event to client if headers allowed, then close
                     // Check if response is still writable before attempting to write
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write(
-                                `data: ${JSON.stringify({ error: { code: 500, message: message.message, type: "api_error" } })}\n\n`
+                                `data: ${JSON.stringify({ error: { code: status, message: message.message, type: "api_error" } })}\n\n`
                             );
                         } catch (writeError) {
                             this.logger.debug(
@@ -399,7 +462,7 @@ class ChatCompletionsHandler extends RetryHandler {
 
             if (message.event_type === "error") {
                 this.logger.error(`❌ [Adapter] Error during OpenAI non-stream conversion: ${message.message}`);
-                this._sendErrorResponse(res, 500, message.message);
+                this._sendErrorResponse(res, this._getUpstreamErrorStatus(message), message.message);
                 return;
             }
 

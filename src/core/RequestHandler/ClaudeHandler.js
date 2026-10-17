@@ -167,7 +167,7 @@ class ClaudeHandler extends RetryHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "Claude fake/non-stream", requestId);

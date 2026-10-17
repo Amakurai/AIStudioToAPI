@@ -604,7 +604,10 @@ class ConnectionRegistry extends EventEmitter {
 
         for (const [requestId, entry] of this.messageQueues.entries()) {
             const age = now - entry.createdAt;
-            if (age > maxAgeMs) {
+            // A live consumer owns its timeout. Do not abort long generation or
+            // multi-round parent queues merely because they are over ten minutes old.
+            const liveWaiter = entry.queue.waitingResolvers.some(resolver => resolver.deadlineAt > now);
+            if (age > maxAgeMs && !liveWaiter) {
                 this.logger.warn(
                     `[Registry] Cleaning up stale message queue for request ${requestId} (age: ${Math.round(age / 1000)}s, authIndex: ${entry.authIndex})`
                 );

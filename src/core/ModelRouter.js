@@ -134,8 +134,18 @@ class ModelRouter {
         return (
             (status === 403 && /PERMISSION_DENIED|caller does not have permission/i.test(detail)) ||
             (status === 404 && /model|not found/i.test(detail)) ||
-            (status === 429 && /limit:\s*0\b/.test(detail))
+            (status === 429 && /limit:\s*0\b/.test(detail)) ||
+            (status === 400 && ModelRouter.isBuildProxyRejection(detail))
         );
+    }
+    // The Build proxy (ProxyUnaryCall/ProxyStreamedCall) rejects generation with this bare message,
+    // without field details, regardless of model or body; real API validation errors carry specifics.
+    static isBuildProxyRejection(detail) {
+        return /"message":\s*"Request contains an invalid argument\."/.test(detail) && !/"details"/.test(detail);
+    }
+    playgroundOffers(model) {
+        const base = AntiTruncation.baseModel(model) || model;
+        return this.catalog.length === 0 || this.catalog.some(m => m.name === `models/${base}`);
     }
     forward(spec, authIndex) {
         if (!this.handler.config.playgroundEnabled) return false;
@@ -153,7 +163,11 @@ class ModelRouter {
         let switched = false;
         entry.onUpstreamMessage = message => {
             if (switched) return true;
-            if (!committed && ModelRouter.canFallback(message)) {
+            if (
+                !committed &&
+                ModelRouter.canFallback(message) &&
+                (Number(message.status) !== 400 || this.playgroundOffers(model))
+            ) {
                 switched = true;
                 this.handler.logger.info(
                     `[Routing] ${model}: Build ${message.status}; trying Playground on account #${authIndex}.`

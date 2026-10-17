@@ -35,8 +35,13 @@ class QueueTimeoutError extends Error {
  * Responsible for managing asynchronous message enqueue and dequeue
  */
 class MessageQueue extends EventEmitter {
-    constructor(timeoutMs = 300000) {
+    constructor(timeoutMs) {
         super();
+        // Allow long model thinking time while keeping the original default.
+        if (timeoutMs === undefined) {
+            const configured = Number.parseInt(process.env.QUEUE_TIMEOUT_MS || "", 10);
+            timeoutMs = Number.isFinite(configured) ? Math.min(1800000, Math.max(1, configured)) : 300000;
+        }
         this.messages = [];
         this.waitingResolvers = [];
         this.defaultTimeout = timeoutMs;
@@ -75,7 +80,7 @@ class MessageQueue extends EventEmitter {
 
             // Create resolver with timeout BEFORE pushing to waitingResolvers
             // This prevents race condition where enqueue() sees timeoutId=null
-            const resolver = { reject, resolve, timeoutId: null };
+            const resolver = { deadlineAt: Date.now() + timeoutMs, reject, resolve, timeoutId: null };
 
             // Set timeout first to ensure resolver is fully initialized
             resolver.timeoutId = setTimeout(() => {

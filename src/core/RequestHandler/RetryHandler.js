@@ -37,7 +37,10 @@ class RetryHandler extends ConnectionHandler {
 
     _prepareGenerationProxyRequest({ googleBody, isStreaming, model, modelStreamingMode, requestId, res }) {
         const effectiveStreamMode = modelStreamingMode || this.config.streamingMode;
-        const useRealStream = isStreaming && effectiveStreamMode === "real" && !AntiTruncation.baseModel(model);
+        const useRealStream =
+            isStreaming &&
+            effectiveStreamMode === "real" &&
+            (!AntiTruncation.baseModel(model) || AntiTruncation.requiresOriginalModel(googleBody));
         const streamMode = useRealStream ? "real" : "fake";
         const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
         const proxyRequest = {
@@ -138,6 +141,7 @@ class RetryHandler extends ConnectionHandler {
     }
 
     async _prepareImmediateStatusRetry(errorDetails, requestId, tracker, sourceAuthIndex) {
+        if (errorDetails.retryable === false) return false;
         const originalQueue = this.connectionRegistry.messageQueues.get(requestId)?.queue;
         const requestIsActive = () =>
             originalQueue &&
@@ -223,6 +227,7 @@ class RetryHandler extends ConnectionHandler {
         errorDetails,
         { connectionResetContext = null, skipAccountSwitch = errorDetails?.skipAccountSwitch } = {}
     ) {
+        if (errorDetails?.retryable === false) return null;
         if (!skipAccountSwitch && !this._isConnectionResetError(errorDetails)) {
             return this.authSwitcher.handleRequestFailureAndSwitch(errorDetails, null);
         } else if (skipAccountSwitch) {
@@ -236,9 +241,18 @@ class RetryHandler extends ConnectionHandler {
         return null;
     }
 
-    async _executeRequestWithRetries(proxyRequest, messageQueue) {
+    async _executeRequestWithRetries(proxyRequest, messageQueue, res = null) {
         let lastError = null;
         let currentQueue = messageQueue;
+        const requestCancelled = () =>
+            (res && !this._isResponseWritable(res)) ||
+            currentQueue.closed ||
+            this.connectionRegistry.messageQueues.get(proxyRequest.request_id)?.queue !== currentQueue;
+        const cancelledResult = () => ({
+            error: { message: "Request is no longer active", skipAccountSwitch: true, status: 503 },
+            queue: currentQueue,
+            success: false,
+        });
         const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
         // Track the authIndex registered for the current queue, which may differ from the global current account.
         let currentQueueAuthIndex =
@@ -249,6 +263,9 @@ class RetryHandler extends ConnectionHandler {
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
         while (retryAttempt <= this.config.maxRetries) {
+            // Backoff/recovery may outlive the client or the queue it owned.
+            // Check before usage accounting and, critically, before upstream dispatch.
+            if (requestCancelled()) return cancelledResult();
             // Record attempt at the start of each retry, before forwarding.
             // This ensures failed attempts (e.g. 429 before any response) are also counted.
             this._getUsageStatsService()?.recordAttempt(
@@ -297,9 +314,10 @@ class RetryHandler extends ConnectionHandler {
                 }
 
                 if (
-                    proxyRequest.anti_truncation &&
-                    (Number(errorPayload.status) === 400 || errorPayload.retryable === false)
+                    errorPayload.retryable === false ||
+                    (proxyRequest.anti_truncation && Number(errorPayload.status) === 400)
                 ) {
+                    this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
                     return { error: { ...errorPayload, skipAccountSwitch: true }, queue: currentQueue, success: false };
                 }
 
@@ -333,6 +351,7 @@ class RetryHandler extends ConnectionHandler {
                         }
                     }
 
+                    if (res && !this._isResponseWritable(res)) return cancelledResult();
                     const canRetryOnCurrentAccount =
                         canRetryOnCurrentAccountCandidate &&
                         Boolean(this.connectionRegistry.getConnectionByAuth(currentAuthIndex, false));
@@ -484,6 +503,7 @@ class RetryHandler extends ConnectionHandler {
 
                 // Wait before the next retry
                 await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                if (requestCancelled()) return cancelledResult();
                 if (
                     !(await this._waitForSystemAndConnectionIfBusy(null, {
                         allowAnyReadyAccount: true,

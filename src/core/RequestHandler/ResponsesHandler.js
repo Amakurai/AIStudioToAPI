@@ -234,7 +234,7 @@ class ResponsesHandler extends RetryHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
 
                         if (!result.success) {
                             this._logFinalRequestFailure(

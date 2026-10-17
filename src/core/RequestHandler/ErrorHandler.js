@@ -9,6 +9,11 @@ const TransportHandler = require("./TransportHandler");
 const { QueueClosedError, QueueTimeoutError } = require("../../utils/MessageQueue");
 
 class ErrorHandler extends TransportHandler {
+    _getUpstreamErrorStatus(error) {
+        const status = Number(error?.status);
+        return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500;
+    }
+
     _isConnectionResetError(error) {
         if (!error) return false;
         // Check for QueueClosedError type
