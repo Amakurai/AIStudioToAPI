@@ -9,6 +9,7 @@ const AuthSwitcher = require("../../auth/AuthSwitcher");
 const FormatConverter = require("../FormatConverter");
 const ModelChannel = require("../ModelChannel");
 const PlaygroundTransport = require("../Playground/Transport");
+const createPlaygroundScope = require("../Playground/RequestScope");
 const { DEFAULT_TIMEOUTS } = require("./constants");
 
 class RequestHandler {
@@ -85,6 +86,19 @@ class RequestHandler {
      * @returns {string|null} Reason for rejecting the request, or null when it may proceed.
      */
     _unsupportedPlaygroundRequest(req) {
+        const { channel, method, model } = this._requestModel(req);
+        if (channel !== "playground") return null;
+        if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
+        if (model.includes("抗截断")) return "Playground models do not support anti-truncation.";
+        const generates =
+            method !== undefined
+                ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(method)
+                : ["/v1/chat/completions", "/v1/responses", "/v1/messages"].includes(req.path);
+        return generates ? null : "Playground models only support content generation.";
+    }
+
+    /** The model named by a public request (Gemini path or body `model`) and its channel. */
+    _requestModel(req) {
         const pathMatch = req.path.match(/\/models\/([^/:]+)(?::([A-Za-z]+))?/);
         let named = pathMatch ? pathMatch[1] : req.body?.model;
         try {
@@ -93,13 +107,14 @@ class RequestHandler {
             // Keep the raw name.
         }
         const { channel, model } = ModelChannel.parse(typeof named === "string" ? named : "");
-        if (channel !== "playground") return null;
-        if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
-        if (model.includes("抗截断")) return "Playground models do not support anti-truncation.";
-        const generates = pathMatch
-            ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(pathMatch[2])
-            : ["/v1/chat/completions", "/v1/responses", "/v1/messages"].includes(req.path);
-        return generates ? null : "Playground models only support content generation.";
+        return { channel, method: pathMatch ? (pathMatch[2] ?? null) : undefined, model };
+    }
+
+    /** Handler for a public request: `pg-` requests get a scope that leaves Build's account state alone. */
+    forRequest(req) {
+        if (this._requestModel(req).channel !== "playground") return this;
+        this._playgroundScope ||= createPlaygroundScope(this);
+        return this._playgroundScope;
     }
 
     _getUsageStatsService() {

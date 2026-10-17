@@ -531,11 +531,13 @@ class ConnectionRegistry extends EventEmitter {
      * Get the number of logical requests belonging to a specific account
      * Used by the request dispatcher for least-loaded account selection
      * @param {number} authIndex - The account index to inspect
+     * @param {"build"|"playground"|null} [channel] - Count only this channel's requests (default: all)
      * @returns {number} Number of active message queues for the account
      */
-    getQueueCountForAuth(authIndex) {
+    getQueueCountForAuth(authIndex, channel = null) {
         let count = 0;
         for (const entry of this.messageQueues.values()) {
+            if (channel && (entry.channel || "build") !== channel) continue;
             if (entry.authIndex === authIndex) {
                 const parent = entry.parentRequestId && this.messageQueues.get(entry.parentRequestId);
                 if (parent && !parent.queue.closed && parent.authIndex === authIndex) continue;

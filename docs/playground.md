@@ -16,6 +16,15 @@
 - Playground 页面加载时读取原生模型目录，可生成内容的模型加入 Playground 列表（不影响 Build 列表），token 上限覆盖配置值，并保存到 `data/playground-models.json`，重启后立即恢复。旧版 `data/model-routes.json` 中保存的目录会在首次启动时读取一次，其中的通道学习记录不再使用。
 - `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`）。抗截断、`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
 
+## 账号与并发
+
+两条链路共用同一个账号池，但互不改动对方的账号状态：
+
+- 同一账号可以同时处理 Build 和 Playground 请求：Build 使用 Build App 页面，可并发；Playground 使用该账号的专用临时页面，同一账号内串行，不同账号之间并发。默认 `MAX_CONTEXTS=1` 时池中只有一个账号，两条链路的请求都会落在这个账号上。
+- 分发时两条链路各自按负载选择账号：Build 只统计 Build 的在途请求，Playground 只统计 Playground 的在途请求，在 Playground 排队的请求不会让 Build 避开该账号。
+- `pg-` 请求不计入 `SWITCH_ON_USES` 轮换次数和 `FAILURE_THRESHOLD` 失败次数。Playground 的 429/503 不会冷却账号，也不会切换当前账号或重排账号池；这类错误只会让该请求改用尚未尝试的其他就绪账号，没有可用账号时直接返回错误。Playground 取消请求时也不会向 Build 页面发送指令。
+- Build 自身的轮换、冷却和换号仍按原规则进行。如果 Build 关闭了某个账号的上下文，该账号上正在进行的 Playground 请求会随之失败。
+
 Playground 的鉴权失败对该账号和模型冷却 5 分钟，限流、网络和服务错误冷却 1 分钟（仅保存在内存中）。首次明确鉴权失败且尚未输出时，以及冷却期间，快速返回可触发现有账号切换机制的 503，不重复等待同一个失败通道；成功后清除冷却。内容过滤和参数错误不进入此冷却；格式错误的请求（如缺少 `parts`）在本地返回不可重试的 400。请求在同账号队列中等待超时时，账号并无故障且尚未发送，返回可换号的 503，不进入冷却；界面提交阶段超时同样尚未推理，允许换号重试。
 
 设置 `PLAYGROUND_ENABLED=false` 并重启可关闭 Playground 链路：`pg-*` 模型不再列出，请求返回 400；Build 链路不受影响。

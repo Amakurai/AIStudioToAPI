@@ -524,7 +524,7 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.post("/v1/chat/completions", (req, res) => {
-            this.requestHandler.processOpenAIRequest(req, res);
+            this.requestHandler.forRequest(req).processOpenAIRequest(req, res);
         });
 
         app.post(["/v1/embeddings", "/v1/openai/embeddings"], (req, res) => {
@@ -533,7 +533,7 @@ class ProxyServerSystem extends EventEmitter {
 
         // OpenAI Response API compatible endpoint
         app.post("/v1/responses", (req, res) => {
-            this.requestHandler.processOpenAIResponseRequest(req, res);
+            this.requestHandler.forRequest(req).processOpenAIResponseRequest(req, res);
         });
 
         // OpenAI Response API count input tokens endpoint
@@ -543,7 +543,7 @@ class ProxyServerSystem extends EventEmitter {
 
         // Claude API compatible endpoint
         app.post("/v1/messages", (req, res) => {
-            this.requestHandler.processClaudeRequest(req, res);
+            this.requestHandler.forRequest(req).processClaudeRequest(req, res);
         });
 
         // Claude API count tokens endpoint
@@ -568,7 +568,7 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.all(/(.*)/, (req, res) => {
-            this.requestHandler.processRequest(req, res);
+            this.requestHandler.forRequest(req).processRequest(req, res);
         });
 
         return app;

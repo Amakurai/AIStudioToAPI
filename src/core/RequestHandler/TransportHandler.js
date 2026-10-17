@@ -78,6 +78,8 @@ class TransportHandler extends RequestHandler {
 
     _cancelBrowserRequest(requestId, authIndex, requestAttemptId = null) {
         if (this.playground?.cancel(requestId, requestAttemptId)) return;
+        // A Playground request never runs on the Build page; do not send it a cancel instruction.
+        if (this.connectionRegistry.messageQueues.get(requestId)?.channel === "playground") return;
         const targetAuthIndex = authIndex !== undefined ? authIndex : this.currentAuthIndex;
         const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
@@ -132,14 +134,6 @@ class TransportHandler extends RequestHandler {
         const named = match ? match[2] : body?.model;
         const { channel, model, prefixed } = ModelChannel.parse(named);
         proxyRequest.channel = channel;
-        if (channel === "playground" && !this.playground?.enabled) {
-            throw Object.assign(new Error("The Playground channel is disabled (PLAYGROUND_ENABLED=false)."), {
-                status: 400,
-            });
-        }
-        if (channel === "playground" && AntiTruncation.baseModel(model)) {
-            throw Object.assign(new Error("Playground models do not support anti-truncation."), { status: 400 });
-        }
         if (!prefixed) return;
         if (match) proxyRequest.path = `${match[1]}${model}${match[3]}`;
         if (!body) return;

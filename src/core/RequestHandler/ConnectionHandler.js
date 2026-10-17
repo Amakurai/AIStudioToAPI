@@ -405,13 +405,14 @@ class ConnectionHandler extends ErrorHandler {
 
         // Keep the ascending order from _getReadyAuthIndices so the round-robin
         // cursor walks accounts deterministically
+        // Build and Playground use separate pages per account, so each balances only its own load.
+        const channel = this.dispatchChannel || "build";
+        const load = authIndex => this.connectionRegistry.getQueueCountForAuth(authIndex, channel);
         let minQueueCount = Infinity;
         for (const authIndex of candidates) {
-            minQueueCount = Math.min(minQueueCount, this.connectionRegistry.getQueueCountForAuth(authIndex));
+            minQueueCount = Math.min(minQueueCount, load(authIndex));
         }
-        const leastLoaded = candidates.filter(
-            authIndex => this.connectionRegistry.getQueueCountForAuth(authIndex) === minQueueCount
-        );
+        const leastLoaded = candidates.filter(authIndex => load(authIndex) === minQueueCount);
 
         // Round-robin among the least-loaded accounts
         const selected = leastLoaded[this._dispatchCursor % leastLoaded.length];

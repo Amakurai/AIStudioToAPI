@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const AntiTruncation = require("../AntiTruncation");
 const PlaygroundCatalog = require("./Catalog");
 const PlaygroundSession = require("./Session");
 const { WireCodec, WireStream } = require("./WireCodec");
@@ -38,13 +39,16 @@ class PlaygroundTransport {
         const entry = this.handler.connectionRegistry.messageQueues.get(spec.request_id);
         if (!entry || entry.queue.closed) return;
         const match = spec.path?.match(/\/models\/([^/:]+):(generateContent|streamGenerateContent)$/);
-        if (!match) {
-            entry.queue.enqueue({
-                event_type: "error",
-                message: "Playground models only support generateContent and streamGenerateContent.",
-                retryable: false,
-                status: 400,
-            });
+        // Public routes reject these up front; reject here too instead of reaching Build or the page.
+        const rejection = !this.enabled
+            ? "The Playground channel is disabled (PLAYGROUND_ENABLED=false)."
+            : !match
+              ? "Playground models only support generateContent and streamGenerateContent."
+              : AntiTruncation.baseModel(match[1])
+                ? "Playground models do not support anti-truncation."
+                : null;
+        if (rejection) {
+            entry.queue.enqueue({ event_type: "error", message: rejection, retryable: false, status: 400 });
             return;
         }
         let model = match[1];

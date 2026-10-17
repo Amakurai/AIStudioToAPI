@@ -192,9 +192,8 @@ test("a Build error is returned as is and never retried on Playground", async t 
     assert.equal(h.playground.length, 0);
 });
 
-test("Build anti-truncation accepts the build- prefix; Playground rejects anti-truncation", () => {
+test("Build anti-truncation accepts the build- prefix; Playground never activates it", () => {
     const handler = Object.create(RequestHandler.prototype);
-    handler.playground = { enabled: true };
     const spec = {
         is_generative: true,
         path: `/v1beta/models/build-gemini-4-argon${encodeURIComponent("-抗截断")}:streamGenerateContent`,
@@ -205,15 +204,48 @@ test("Build anti-truncation accepts the build- prefix; Playground rejects anti-t
     assert.equal(spec.path, "/v1beta/models/gemini-4-argon:streamGenerateContent");
     assert.equal(spec.channel, "build");
     assert.equal(spec.anti_truncation, true);
-    assert.throws(
-        () =>
-            handler._initializeProxyRequestAttempt({
-                is_generative: true,
-                path: "/v1beta/models/pg-gemini-4-argon-抗截断:generateContent",
-                request_id: "r",
-            }),
-        error => error.status === 400 && /anti-truncation/.test(error.message)
-    );
+    const pg = {
+        is_generative: true,
+        path: "/v1beta/models/pg-gemini-4-argon-抗截断:generateContent",
+        request_id: "r",
+    };
+    // Never throws here: an exception would escape some handlers as an unhandled rejection.
+    handler._initializeProxyRequestAttempt(pg);
+    assert.equal(pg.channel, "playground");
+    assert.equal(pg.anti_truncation, undefined);
+});
+
+test("the Playground transport itself rejects anti-truncation and a disabled channel", async t => {
+    const PlaygroundTransport = require("../src/core/Playground/Transport");
+    for (const [enabled, model, pattern] of [
+        [true, "gemini-4-argon-抗截断", /anti-truncation/],
+        [false, "gemini-4-argon", /disabled/],
+    ]) {
+        const registry = new ConnectionRegistry(logger);
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aistudio-channel-reject-"));
+        t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
+        const transport = new PlaygroundTransport({
+            browserManager: { contexts: new Map() },
+            config: { playgroundCatalogPath: path.join(dir, "c.json"), playgroundEnabled: enabled },
+            connectionRegistry: registry,
+            logger,
+            timeouts: { FAKE_STREAM: 1000 },
+        });
+        const queue = registry.createMessageQueue("req", 0, "a1");
+        transport.forward(
+            {
+                body: "{}",
+                path: `/v1beta/models/${model}:generateContent`,
+                request_attempt_id: "a1",
+                request_id: "req",
+            },
+            0
+        );
+        const error = await queue.dequeue();
+        assert.equal(error.status, 400);
+        assert.equal(error.retryable, false);
+        assert.match(error.message, pattern);
+    }
 });
 
 test("prefixes are removed from model fields in embedding and token-count bodies", () => {
@@ -274,4 +306,96 @@ test("each channel lists its own models with its own prefix", t => {
     assert.equal(names("build").length, 2);
     h.handler.config.playgroundEnabled = false;
     assert.deepEqual(names("playground"), []);
+});
+
+function poolHarness(t) {
+    const h = harness(t, { maxRetries: 2, switchOnUses: 1 });
+    const handler = h.handler;
+    const cooled = [];
+    const switches = [];
+    handler.authSource = {
+        isAccountCoolingDown: () => false,
+        markAccountCoolingDown: index => cooled.push(index),
+    };
+    handler.authSwitcher.authSource = handler.authSource;
+    handler.authSwitcher.switchToNextAuth = async () => {
+        switches.push("switch");
+        return { success: false };
+    };
+    handler.browserManager.rebalanceContextPool = async () => switches.push("rebalance");
+    handler._getReadyAuthIndices = () => [0, 1];
+    handler._selectDispatchAuthIndex = RequestHandler.prototype._selectDispatchAuthIndex;
+    for (const authIndex of [0, 1])
+        handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+            send(data) {
+                const spec = JSON.parse(data);
+                if (spec.event_type === "cancel_request") return h.build.push(spec);
+                h.build.push(spec);
+                answer(handler.connectionRegistry.messageQueues.get(spec.request_id).queue);
+            },
+        });
+    return { ...h, cooled, switches };
+}
+
+test("a Playground 429 retries another account without touching Build account state", async t => {
+    const h = poolHarness(t);
+    const accounts = [];
+    h.handler.playground.forward = (spec, authIndex) => {
+        accounts.push(authIndex);
+        const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+        if (accounts.length === 1) queue.enqueue({ event_type: "error", message: "Resource exhausted", status: 429 });
+        else answer(queue);
+    };
+    const req = apiRequest("openai", "pg-gemini-4-argon");
+    const res = new FakeResponse();
+    h.handler.authSwitcher.failureCount = 2;
+    await h.handler.forRequest(req).processOpenAIRequest(req, res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(accounts.length, 2);
+    assert.notEqual(accounts[0], accounts[1]);
+    assert.deepEqual(h.cooled, []);
+    assert.deepEqual(h.switches, []);
+    assert.equal(h.handler.authSwitcher.usageCount, 0);
+    assert.equal(h.handler.authSwitcher.failureCount, 2);
+    assert.equal(h.handler.needsSwitchingAfterRequest, false);
+    assert.equal(h.build.length, 0, "no instruction reaches a Build page");
+});
+
+test("a failed Playground request never triggers a Build account switch", async t => {
+    const h = poolHarness(t);
+    h.handler.playground.forward = spec =>
+        h.handler.connectionRegistry.messageQueues
+            .get(spec.request_id)
+            .queue.enqueue({ event_type: "error", message: "busy", status: 503 });
+    const req = apiRequest("claude", "pg-gemini-4-argon");
+    const res = new FakeResponse();
+    await h.handler.forRequest(req).processClaudeRequest(req, res);
+    assert.equal(res.statusCode, 503);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(h.switches, []);
+    assert.deepEqual(h.cooled, []);
+    assert.equal(h.handler.authSwitcher.failureCount, 0);
+});
+
+test("Build requests still count usage and Build is the default handler", async t => {
+    const h = poolHarness(t);
+    const req = apiRequest("openai", "build-gemini-4-argon");
+    assert.equal(h.handler.forRequest(req), h.handler);
+    await h.handler.forRequest(req).processOpenAIRequest(req, new FakeResponse());
+    assert.equal(h.handler.authSwitcher.usageCount, 1);
+});
+
+test("each channel balances only its own load across accounts", t => {
+    const h = poolHarness(t);
+    const registry = h.handler.connectionRegistry;
+    const scope = h.handler.forRequest(apiRequest("openai", "pg-gemini-4-argon"));
+    scope.connectionRegistry.createMessageQueue("pg-active", 0, "a1");
+    registry.createMessageQueue("build-active", 1, "a1");
+    assert.equal(registry.messageQueues.get("pg-active").channel, "playground");
+    assert.equal(registry.getQueueCountForAuth(0), 1);
+    assert.equal(registry.getQueueCountForAuth(0, "build"), 0);
+    for (let i = 0; i < 4; i++) {
+        assert.equal(h.handler._selectDispatchAuthIndex(), 0, "Build ignores Playground load");
+        assert.equal(scope._selectDispatchAuthIndex(), 1, "Playground ignores Build load");
+    }
 });
