@@ -3,7 +3,8 @@
  * response handling with Build, but never changes Build's account state:
  * - no rotation (SWITCH_ON_USES) or failure (FAILURE_THRESHOLD) counting;
  * - a Playground 429/503 never cools down, switches or rebalances an account;
- * - dispatch balances Playground requests among themselves, so they never count as Build load.
+ * - dispatch balances Playground requests among themselves, so they never count as Build load;
+ * - Build's account cooldowns (Build quota) do not hide accounts from Playground, whose quota differs.
  * Playground keeps its own per-account/model cooldown in PlaygroundTransport.
  */
 const bindTo = target => value => (typeof value === "function" ? value.bind(target) : value);
@@ -34,6 +35,15 @@ function createPlaygroundScope(handler) {
         },
     });
 
+    const authSource = new Proxy(handler.authSource, {
+        get(target, key) {
+            if (key === "isAccountCoolingDown") return () => false;
+            if (key === "getAvailableRotationIndices")
+                return () => target.getRotationIndices?.() ?? target.getAvailableRotationIndices();
+            return bindTo(target)(Reflect.get(target, key, target));
+        },
+    });
+
     const scope = Object.create(handler, {
         _dispatchCursor: {
             get: () => handler._dispatchCursor,
@@ -41,6 +51,7 @@ function createPlaygroundScope(handler) {
                 handler._dispatchCursor = value;
             },
         },
+        authSource: { value: authSource },
         authSwitcher: { value: authSwitcher },
         connectionRegistry: { value: connectionRegistry },
         dispatchChannel: { value: "playground" },

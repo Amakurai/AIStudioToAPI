@@ -489,3 +489,82 @@ test("Playground dispatch skips accounts cooling down for the model, unless all 
     assert.ok([0, 1].includes(scope._selectDispatchAuthIndex()));
     assert.equal(scope._selectDispatchAuthIndex([0, 1], { allowFallback: false }), -1);
 });
+
+test("a Build 429 with limit: 0 tries other accounts but never cools, switches or rebalances", async t => {
+    for (const entitled of [1, null]) {
+        const h = poolHarness(t);
+        h.handler.config.switchOnUses = 0;
+        const tried = [];
+        for (const authIndex of [0, 1])
+            h.handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+                send(data) {
+                    const spec = JSON.parse(data);
+                    if (spec.event_type === "cancel_request") return;
+                    tried.push(authIndex);
+                    const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+                    if (authIndex === entitled) return answer(queue);
+                    queue.enqueue({
+                        event_type: "error",
+                        message: "429 RESOURCE_EXHAUSTED Quota exceeded for metric: x, limit: 0, model: gemini-4-argon",
+                        status: 429,
+                    });
+                },
+            });
+        h.handler._selectDispatchAuthIndex = function (exclude = [], options) {
+            return exclude.length ? RequestHandler.prototype._selectDispatchAuthIndex.call(this, exclude, options) : 0;
+        };
+        const req = apiRequest("openai", "build-gemini-4-argon");
+        const res = new FakeResponse();
+        await h.handler.processOpenAIRequest(req, res);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(res.statusCode, entitled === null ? 429 : 200, res.output);
+        assert.deepEqual(tried, [0, 1]);
+        assert.deepEqual(h.cooled, []);
+        assert.deepEqual(h.switches, []);
+        assert.equal(h.handler.authSwitcher.failureCount, 0);
+    }
+});
+
+test("an ordinary Build 429 still cools the account down", async t => {
+    const h = poolHarness(t);
+    h.handler.config.switchOnUses = 0;
+    for (const authIndex of [0, 1])
+        h.handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+            send(data) {
+                const spec = JSON.parse(data);
+                if (spec.event_type === "cancel_request") return;
+                const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+                if (authIndex === 1) return answer(queue);
+                queue.enqueue({ event_type: "error", message: "Resource exhausted, limit: 15", status: 429 });
+            },
+        });
+    h.handler._selectDispatchAuthIndex = function (exclude = [], options) {
+        return exclude.length ? RequestHandler.prototype._selectDispatchAuthIndex.call(this, exclude, options) : 0;
+    };
+    const res = new FakeResponse();
+    await h.handler.processOpenAIRequest(apiRequest("openai", "build-gemini-3.8-flash"), res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.deepEqual(h.cooled, [0]);
+});
+
+test("accounts cooling down for Build quota remain available to Playground", async t => {
+    const h = poolHarness(t);
+    h.handler.authSource.isAccountCoolingDown = () => true;
+    h.handler.authSource.getRotationIndices = () => [0, 1];
+    h.handler.authSource.getAvailableRotationIndices = () => [];
+    let served = 0;
+    h.handler.playground.forward = spec => {
+        served++;
+        answer(h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue);
+    };
+    const build = new FakeResponse();
+    h.handler._ensureBrowserBackedRequestReady = RequestHandler.prototype._ensureBrowserBackedRequestReady;
+    h.handler.browserManager.notifyUserActivity = () => {};
+    await h.handler.processOpenAIRequest(apiRequest("openai", "build-gemini-4-argon"), build);
+    assert.equal(build.statusCode, 429, "Build honours its own cooldown");
+    const req = apiRequest("openai", "pg-gemini-4-argon");
+    const res = new FakeResponse();
+    await h.handler.forRequest(req).processOpenAIRequest(req, res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(served, 1);
+});

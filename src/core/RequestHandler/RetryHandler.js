@@ -102,6 +102,15 @@ class RetryHandler extends ConnectionHandler {
         return !/API_KEY_INVALID|API key not valid/i.test(String(errorDetails?.message ?? ""));
     }
 
+    /**
+     * A 429 with `limit: 0` means this account's tier has no quota for the model at all. It is not a
+     * rate limit: cooling, switching or rebalancing the account would take it away from every other
+     * model without making this one available. Only another account can serve the request.
+     */
+    _isZeroQuotaError(errorDetails) {
+        return Number(errorDetails?.status) === 429 && /limit:\s*0\b/.test(String(errorDetails?.message ?? ""));
+    }
+
     _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex) {
         const attemptedAuthIndices = new Set();
         if (Number.isInteger(initialAuthIndex) && initialAuthIndex >= 0) {
@@ -163,11 +172,12 @@ class RetryHandler extends ConnectionHandler {
         if (Number.isInteger(sourceAuthIndex) && sourceAuthIndex >= 0) {
             tracker.attemptedAuthIndices.add(sourceAuthIndex);
         }
-        const isRateLimited = Number(errorDetails.status) === 429;
+        const zeroQuota = this._isZeroQuotaError(errorDetails);
+        const isRateLimited = Number(errorDetails.status) === 429 && !zeroQuota;
         if (isRateLimited) {
             this.authSource.markAccountCoolingDown?.(sourceAuthIndex, this.config.rateLimitCooldownMs ?? 60000);
         }
-        this.authSwitcher.failureCount++;
+        if (!zeroQuota) this.authSwitcher.failureCount++;
         const exclusions = () => [...tracker.attemptedAuthIndices];
         const select = () => this._selectDispatchAuthIndex(exclusions(), { allowFallback: false });
 
@@ -176,7 +186,7 @@ class RetryHandler extends ConnectionHandler {
             let nextAuthIndex = select();
             // Rotate the primary account when it failed, or initialize a standby account
             // when every ready account has already been tried by this request.
-            if (sourceAuthIndex === this.currentAuthIndex || nextAuthIndex < 0) {
+            if (!zeroQuota && (sourceAuthIndex === this.currentAuthIndex || nextAuthIndex < 0)) {
                 const result = await this.authSwitcher
                     .switchToNextAuth({ excludeIndices: exclusions() })
                     .catch(error => {
@@ -244,6 +254,10 @@ class RetryHandler extends ConnectionHandler {
             this.logger.info(
                 `[Request] Client error ${errorDetails.status} does not depend on the account; skipping account switch.`
             );
+            return null;
+        }
+        if (this._isZeroQuotaError(errorDetails)) {
+            this.logger.info("[Request] Model has no quota (limit: 0) on the tried accounts; skipping account switch.");
             return null;
         }
         if (!skipAccountSwitch && !this._isConnectionResetError(errorDetails)) {
