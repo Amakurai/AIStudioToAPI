@@ -7,6 +7,8 @@ const { DEFAULT_TIMEOUTS } = require("../RequestHandler/constants");
 
 /** Playground generation channel: serves `pg-` models on each account's existing browser context. */
 class PlaygroundTransport {
+    static MAX_DENIAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
     constructor(handler) {
         this.handler = handler;
         this.sessions = new WeakMap();
@@ -27,12 +29,23 @@ class PlaygroundTransport {
         return crypto.createHash("sha256").update(`${identity}\n${model}`).digest("hex");
     }
     cooldownUntil(model, authIndex) {
-        return this.cooldowns.get(this.cooldownKey(model, authIndex)) || 0;
+        return this.cooldowns.get(this.cooldownKey(model, authIndex))?.until || 0;
+    }
+    isCoolingDown(model, authIndex) {
+        return this.cooldownUntil(model, authIndex) > Date.now();
     }
     fail(model, authIndex, status) {
         if (![401, 403, 429, 502, 503, 504].includes(status)) return;
-        const ms = status === 401 || status === 403 ? 300000 : 60000;
-        this.cooldowns.set(this.cooldownKey(model, authIndex), Date.now() + ms);
+        const key = this.cooldownKey(model, authIndex);
+        const previous = this.cooldowns.get(key);
+        // An account without permission for a model keeps failing; double its cooldown on each
+        // consecutive denial (5 min up to 6 h) instead of paying for a failed attempt every 5 min.
+        const denials = status === 401 || status === 403 ? (previous?.denials || 0) + 1 : previous?.denials || 0;
+        const ms =
+            status === 401 || status === 403
+                ? Math.min(PlaygroundTransport.MAX_DENIAL_COOLDOWN_MS, 300000 * 2 ** (denials - 1))
+                : 60000;
+        this.cooldowns.set(key, { denials, until: Date.now() + ms });
     }
     /** Starts a Playground generation for a request whose path names the upstream (unprefixed) model. */
     forward(spec, authIndex) {

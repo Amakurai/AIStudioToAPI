@@ -90,6 +90,18 @@ class RetryHandler extends ConnectionHandler {
         };
     }
 
+    /**
+     * Malformed or oversized requests (e.g. token limit exceeded) fail the same way on every account:
+     * retrying them only repeats upstream calls, and counting them would rotate healthy accounts.
+     * Invalid API keys are account-specific and keep the normal handling.
+     */
+    _isDeterministicClientError(errorDetails, path = null) {
+        const status = Number(errorDetails?.status);
+        if (status === 404) return this._categorizeRequest(path, "request") === "embedding";
+        if (status !== 400 && status !== 413) return false;
+        return !/API_KEY_INVALID|API key not valid/i.test(String(errorDetails?.message ?? ""));
+    }
+
     _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex) {
         const attemptedAuthIndices = new Set();
         if (Number.isInteger(initialAuthIndex) && initialAuthIndex >= 0) {
@@ -228,6 +240,12 @@ class RetryHandler extends ConnectionHandler {
         { connectionResetContext = null, skipAccountSwitch = errorDetails?.skipAccountSwitch } = {}
     ) {
         if (errorDetails?.retryable === false) return null;
+        if (this._isDeterministicClientError(errorDetails)) {
+            this.logger.info(
+                `[Request] Client error ${errorDetails.status} does not depend on the account; skipping account switch.`
+            );
+            return null;
+        }
         if (!skipAccountSwitch && !this._isConnectionResetError(errorDetails)) {
             return this.authSwitcher.handleRequestFailureAndSwitch(errorDetails, null);
         } else if (skipAccountSwitch) {
@@ -398,13 +416,10 @@ class RetryHandler extends ConnectionHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
-                const isNonRetryableEmbeddingClientError =
-                    (errorStatus === 400 || errorStatus === 404) &&
-                    this._categorizeRequest(proxyRequest?.path, "request") === "embedding";
-                if (isNonRetryableEmbeddingClientError) {
+                if (this._isDeterministicClientError(errorPayload, proxyRequest?.path)) {
                     lastError = { ...errorPayload, skipAccountSwitch: true };
                     this.logger.warn(
-                        `[Request] Embedding request failed with non-retryable status ${errorPayload.status}; skipping retries and account switching.`
+                        `[Request] Request #${proxyRequest.request_id} failed with non-retryable client status ${errorPayload.status}; skipping retries and account switching.`
                     );
                     break;
                 }

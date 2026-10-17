@@ -9,7 +9,7 @@ const AuthSwitcher = require("../../auth/AuthSwitcher");
 const FormatConverter = require("../FormatConverter");
 const ModelChannel = require("../ModelChannel");
 const PlaygroundTransport = require("../Playground/Transport");
-const createPlaygroundScope = require("../Playground/RequestScope");
+const playgroundRequestScope = require("../Playground/RequestScope");
 const { DEFAULT_TIMEOUTS } = require("./constants");
 
 class RequestHandler {
@@ -112,9 +112,9 @@ class RequestHandler {
 
     /** Handler for a public request: `pg-` requests get a scope that leaves Build's account state alone. */
     forRequest(req) {
-        if (this._requestModel(req).channel !== "playground") return this;
-        this._playgroundScope ||= createPlaygroundScope(this);
-        return this._playgroundScope;
+        const { channel, model } = this._requestModel(req);
+        if (channel !== "playground") return this;
+        return playgroundRequestScope(this, FormatConverter.stripModelSuffixes(model));
     }
 
     _getUsageStatsService() {

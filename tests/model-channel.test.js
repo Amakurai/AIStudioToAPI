@@ -399,3 +399,93 @@ test("each channel balances only its own load across accounts", t => {
         assert.equal(scope._selectDispatchAuthIndex(), 1, "Playground ignores Build load");
     }
 });
+
+test("deterministic client errors are not retried and never count as account failures", async t => {
+    for (const [model, transport] of [
+        ["build-gemini-4-argon", "build"],
+        ["pg-gemini-4-argon", "playground"],
+    ]) {
+        const h = poolHarness(t);
+        h.handler.config.switchOnUses = 0; // isolate failure handling from usage rotation
+        const attempts = [];
+        const fail = spec => {
+            attempts.push(spec.request_id);
+            h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue.enqueue({
+                event_type: "error",
+                message: "INVALID_ARGUMENT: The input token count exceeds the maximum",
+                status: 400,
+            });
+        };
+        h.handler.playground.forward = fail;
+        for (const authIndex of [0, 1])
+            h.handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+                send: data => JSON.parse(data).event_type !== "cancel_request" && fail(JSON.parse(data)),
+            });
+        const req = apiRequest("openai", model);
+        const res = new FakeResponse();
+        await h.handler.forRequest(req).processOpenAIRequest(req, res);
+        assert.equal(res.statusCode, 400, transport);
+        assert.equal(attempts.length, 1, `${transport} must not repeat a deterministic 400`);
+        assert.equal(h.handler.authSwitcher.failureCount, 0);
+        assert.deepEqual(h.switches, []);
+    }
+});
+
+test("an invalid API key is account-specific and keeps the normal retry", async t => {
+    const h = poolHarness(t);
+    let attempts = 0;
+    for (const authIndex of [0, 1])
+        h.handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+            send(data) {
+                const spec = JSON.parse(data);
+                if (spec.event_type === "cancel_request") return;
+                const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+                if (++attempts === 1)
+                    queue.enqueue({ event_type: "error", message: "API key not valid. API_KEY_INVALID", status: 400 });
+                else answer(queue);
+            },
+        });
+    const req = apiRequest("openai", "build-gemini-4-argon");
+    const res = new FakeResponse();
+    await h.handler.processOpenAIRequest(req, res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(attempts, 2);
+});
+
+test("repeated Playground permission denials back off exponentially and reset on success", t => {
+    const PlaygroundTransport = require("../src/core/Playground/Transport");
+    const h = harness(t);
+    const transport = h.handler.playground;
+    const remaining = () => transport.cooldownUntil("gemini-4-argon", 0) - Date.now();
+    const minutes = ms => Math.round(ms / 60000);
+    const seen = [];
+    for (let i = 0; i < 9; i++) {
+        transport.fail("gemini-4-argon", 0, 403);
+        seen.push(minutes(remaining()));
+    }
+    assert.deepEqual(seen.slice(0, 5), [5, 10, 20, 40, 80]);
+    assert.equal(seen.at(-1), PlaygroundTransport.MAX_DENIAL_COOLDOWN_MS / 60000);
+    // A rate limit keeps the short cooldown without forgetting earlier denials.
+    transport.fail("gemini-4-argon", 0, 429);
+    assert.equal(minutes(remaining()), 1);
+    assert.equal(transport.isCoolingDown("gemini-4-argon", 1), false, "other accounts are unaffected");
+    assert.equal(transport.isCoolingDown("gemini-new", 0), false, "other models are unaffected");
+    transport.cooldowns.delete(transport.cooldownKey("gemini-4-argon", 0));
+    transport.fail("gemini-4-argon", 0, 403);
+    assert.equal(minutes(remaining()), 5);
+});
+
+test("Playground dispatch skips accounts cooling down for the model, unless all are cooling", t => {
+    const h = poolHarness(t);
+    const transport = h.handler.playground;
+    transport.fail("gemini-4-argon", 0, 403);
+    const scope = h.handler.forRequest(apiRequest("openai", "pg-gemini-4-argon-high"));
+    assert.equal(scope.playgroundModel, "gemini-4-argon");
+    for (let i = 0; i < 4; i++) assert.equal(scope._selectDispatchAuthIndex(), 1);
+    // Another model is not affected by this cooldown.
+    const other = h.handler.forRequest(apiRequest("openai", "pg-gemini-new"));
+    assert.deepEqual(new Set([0, 1, 2, 3].map(() => other._selectDispatchAuthIndex())), new Set([0, 1]));
+    transport.fail("gemini-4-argon", 1, 429);
+    assert.ok([0, 1].includes(scope._selectDispatchAuthIndex()));
+    assert.equal(scope._selectDispatchAuthIndex([0, 1], { allowFallback: false }), -1);
+});

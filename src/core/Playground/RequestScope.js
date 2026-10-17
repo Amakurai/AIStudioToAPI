@@ -1,5 +1,5 @@
 /**
- * Request handler view for `pg-` requests. It shares the account pool, format conversion and
+ * Request handler views for `pg-` requests. It shares the account pool, format conversion and
  * response handling with Build, but never changes Build's account state:
  * - no rotation (SWITCH_ON_USES) or failure (FAILURE_THRESHOLD) counting;
  * - a Playground 429/503 never cools down, switches or rebalances an account;
@@ -69,7 +69,27 @@ function createPlaygroundScope(handler) {
         return true;
     };
 
+    /**
+     * Prefer accounts whose Playground channel is not cooling down for this request's model, so a
+     * request does not spend a hop on an account known to be denied or rate limited.
+     */
+    scope._selectDispatchAuthIndex = function (excludeIndices = [], options = {}) {
+        const select = Object.getPrototypeOf(scope)._selectDispatchAuthIndex;
+        const model = this.playgroundModel;
+        if (!model) return select.call(this, excludeIndices, options);
+        const cooling = this._getReadyAuthIndices().filter(index => this.playground.isCoolingDown(model, index));
+        const preferred = select.call(this, [...excludeIndices, ...cooling], { ...options, allowFallback: false });
+        // Every untried account is cooling: let the transport report the cooldown quickly.
+        return preferred >= 0 ? preferred : select.call(this, excludeIndices, options);
+    };
+
     return scope;
 }
 
-module.exports = createPlaygroundScope;
+/** The shared Playground view, specialised with the upstream model of one request. */
+function playgroundRequestScope(handler, model) {
+    handler._playgroundScope ||= createPlaygroundScope(handler);
+    return Object.create(handler._playgroundScope, { playgroundModel: { value: model } });
+}
+
+module.exports = playgroundRequestScope;

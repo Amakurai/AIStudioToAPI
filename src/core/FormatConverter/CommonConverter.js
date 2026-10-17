@@ -187,6 +187,13 @@ class FormatConverter {
      *   thinkingLevel: string|null
      * }} Parsed model name and overrides
      */
+    /** The upstream model name without gateway suffixes (built-in tools, streaming mode, thinking level). */
+    static stripModelSuffixes(modelName) {
+        const { cleanModelName: withoutTools } = FormatConverter.parseModelBuiltInToolSuffixes(modelName);
+        const { cleanModelName: withoutStreaming } = FormatConverter.parseModelStreamingModeSuffix(withoutTools);
+        return FormatConverter.parseModelThinkingLevel(withoutStreaming).cleanModelName;
+    }
+
     parseModelSuffixes(modelName, { logPrefix = "[Adapter]", modelSource = "model name" } = {}) {
         const {
             cleanModelName: toolStrippedModel,
