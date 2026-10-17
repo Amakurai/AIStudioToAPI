@@ -10,6 +10,7 @@ const RetryHandler = require("./RetryHandler");
 const GeminiHandler = require("./GeminiHandler");
 const EmbeddingsHandler = require("./EmbeddingsHandler");
 const UploadHandler = require("./UploadHandler");
+const SpeechHandler = require("./SpeechHandler");
 const ChatCompletionsHandler = require("./ChatCompletionsHandler");
 const ResponsesHandler = require("./ResponsesHandler");
 const ClaudeHandler = require("./ClaudeHandler");
@@ -22,6 +23,7 @@ for (const Handler of [
     GeminiHandler,
     EmbeddingsHandler,
     UploadHandler,
+    SpeechHandler,
     ChatCompletionsHandler,
     ResponsesHandler,
     ClaudeHandler,

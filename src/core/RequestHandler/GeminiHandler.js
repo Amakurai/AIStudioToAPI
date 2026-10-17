@@ -63,7 +63,8 @@ class GeminiHandler extends RetryHandler {
 
             this._updateTrackedRequest(requestId, {
                 isStreaming: wantsStream,
-                model: this._extractModelFromPath(proxyRequest.path),
+                // Track the public name (with its build-/pg- prefix), as the other API formats do.
+                model: this._trackedModelName(req.path) ?? this._extractModelFromPath(proxyRequest.path),
                 path: proxyRequest.path,
                 requestCategory: this._categorizeRequest(
                     proxyRequest.path,
@@ -845,6 +846,18 @@ class GeminiHandler extends RetryHandler {
             response_transform: responseTransform,
             streaming_mode: modelStreamingMode || this.config.streamingMode,
         };
+    }
+
+    _trackedModelName(pathValue) {
+        const raw = this._extractModelFromPath(pathValue);
+        if (!raw) return null;
+        let name = raw;
+        try {
+            name = decodeURIComponent(raw);
+        } catch {
+            // Keep the raw name.
+        }
+        return this.formatConverter.constructor.stripModelSuffixes(name);
     }
 
     _extractModelFromPath(pathValue) {

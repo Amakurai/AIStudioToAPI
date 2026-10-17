@@ -696,3 +696,116 @@ test("Playground drops thoughts the request did not ask for", () => {
     );
     assert.deepEqual(WireCodec.withoutThoughts(chunk()).candidates[0].content.parts, [{ text: "ok" }]);
 });
+
+test("speech requests validate input and map OpenAI voices to Gemini voices", () => {
+    const SpeechHandler = require("../src/core/RequestHandler/SpeechHandler");
+    const ok = SpeechHandler.buildGeminiRequest({
+        input: "Hello",
+        model: "build-gemini-3.8-flash-tts",
+        voice: "alloy",
+    });
+    assert.equal(ok.request.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, "Kore");
+    assert.deepEqual(ok.request.generationConfig.responseModalities, ["AUDIO"]);
+    assert.equal(SpeechHandler.resolveVoice("puck"), "Puck");
+    assert.equal(SpeechHandler.resolveVoice(undefined), "Kore");
+    assert.equal(
+        SpeechHandler.buildGeminiRequest({ input: "Hi", instructions: "Say cheerfully", model: "m" }).request
+            .contents[0].parts[0].text,
+        "Say cheerfully: Hi"
+    );
+    assert.match(SpeechHandler.buildGeminiRequest({ input: "Hi", model: "m", voice: "nobody" }).error, /Unknown voice/);
+    assert.match(SpeechHandler.buildGeminiRequest({ input: " ", model: "m" }).error, /input/);
+    assert.match(SpeechHandler.buildGeminiRequest({ input: "Hi" }).error, /model/);
+});
+
+test("raw PCM from Gemini is wrapped as WAV, WAV passes through, and pcm output strips the header", () => {
+    const SpeechHandler = require("../src/core/RequestHandler/SpeechHandler");
+    const pcm = Buffer.from([1, 0, 2, 0, 3, 0, 4, 0]);
+    const wav = SpeechHandler.toAudio(
+        { data: pcm.toString("base64"), mimeType: "audio/L16;codec=pcm;rate=24000" },
+        "wav"
+    );
+    assert.equal(wav.contentType, "audio/wav");
+    assert.equal(wav.body.subarray(0, 4).toString(), "RIFF");
+    assert.equal(wav.body.readUInt32LE(24), 24000);
+    assert.equal(wav.body.readUInt32LE(40), pcm.length);
+    assert.deepEqual(wav.body.subarray(44), pcm);
+    const passthrough = SpeechHandler.toAudio({ data: wav.body.toString("base64"), mimeType: "audio/wav" }, "wav");
+    assert.deepEqual(passthrough.body, wav.body);
+    const raw = SpeechHandler.toAudio({ data: wav.body.toString("base64"), mimeType: "audio/wav" }, "pcm");
+    assert.deepEqual(raw.body, pcm);
+});
+
+test("POST /v1/audio/speech returns audio from a Build TTS model", async t => {
+    const SpeechHandler = require("../src/core/RequestHandler/SpeechHandler");
+    const h = poolHarness(t);
+    const pcm = Buffer.alloc(480, 7);
+    const sent = [];
+    for (const authIndex of [0, 1])
+        h.handler.connectionRegistry.connectionsByAuth.set(authIndex, {
+            send(data) {
+                const spec = JSON.parse(data);
+                if (spec.event_type === "cancel_request") return;
+                sent.push(spec);
+                const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+                queue.enqueue({ event_type: "response_headers", status: 200 });
+                const audio = { inlineData: { data: pcm.toString("base64"), mimeType: "audio/L16;rate=24000" } };
+                queue.enqueue({
+                    data: JSON.stringify({ candidates: [{ content: { parts: [audio] }, finishReason: "STOP" }] }),
+                    event_type: "chunk",
+                });
+                queue.enqueue({ type: "STREAM_END" });
+            },
+        });
+    const res = new FakeResponse();
+    let body;
+    res.end = value => {
+        body = value;
+        res.writableEnded = true;
+    };
+    await h.handler.processOpenAISpeechRequest(
+        {
+            body: { input: "Hello", model: "build-gemini-3.8-flash-tts", voice: "nova" },
+            headers: {},
+            method: "POST",
+            path: "/v1/audio/speech",
+            query: {},
+        },
+        res
+    );
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.get("Content-Type"), "audio/wav");
+    assert.deepEqual(body.subarray(44), pcm);
+    assert.equal(sent[0].path, "/v1beta/models/gemini-3.8-flash-tts:generateContent");
+    assert.equal(
+        JSON.parse(sent[0].body).generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName,
+        "Leda"
+    );
+    assert.ok(SpeechHandler);
+});
+
+test("Playground TTS on the speech endpoint is rejected before dispatch", t => {
+    const h = harness(t);
+    assert.match(
+        h.handler._unsupportedPlaygroundRequest({
+            body: { input: "hi", model: "pg-gemini-3.8-flash-tts" },
+            method: "POST",
+            path: "/v1/audio/speech",
+        }),
+        /use build-gemini-3.8-flash-tts/
+    );
+});
+
+test("native Gemini requests are tracked under their public channel name", t => {
+    const h = harness(t);
+    assert.equal(
+        h.handler._trackedModelName("/v1beta/models/pg-gemma-4-31b-it-high:generateContent"),
+        "pg-gemma-4-31b-it"
+    );
+    assert.equal(
+        h.handler._trackedModelName(
+            `/v1beta/models/build-gemini-4-argon${encodeURIComponent("-抗截断")}:generateContent`
+        ),
+        "build-gemini-4-argon-抗截断"
+    );
+});
