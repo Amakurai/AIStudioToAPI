@@ -8,6 +8,7 @@
 const AuthSwitcher = require("../../auth/AuthSwitcher");
 const FormatConverter = require("../FormatConverter");
 const ModelChannel = require("../ModelChannel");
+const PlaygroundCatalog = require("../Playground/Catalog");
 const PlaygroundTransport = require("../Playground/Transport");
 const playgroundRequestScope = require("../Playground/RequestScope");
 const { DEFAULT_TIMEOUTS } = require("./constants");
@@ -90,6 +91,8 @@ class RequestHandler {
         if (channel !== "playground") return null;
         if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
         if (model.includes("抗截断")) return "Playground models do not support anti-truncation.";
+        const unsupported = PlaygroundCatalog.unsupportedReason(FormatConverter.stripModelSuffixes(model));
+        if (unsupported) return unsupported;
         const generates =
             method !== undefined
                 ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(method)

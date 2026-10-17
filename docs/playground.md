@@ -14,6 +14,7 @@
 - 不带前缀的旧模型名（如 `gemini-3.8-flash`）仍按 Build 处理，兼容现有客户端，但不再出现在模型列表中。
 - `GET /v1/models` 与 `GET /v1beta/models` 分别列出 `build-*` 与 `pg-*` 模型，`upstream_channel`/`upstreamChannel` 字段为 `build` 或 `playground`。控制台“模型通道”按链路分组展示。
 - Playground 页面加载时读取原生模型目录，可生成内容的模型加入 Playground 列表（不影响 Build 列表），token 上限覆盖配置值，并保存到 `data/playground-models.json`，重启后立即恢复。旧版 `data/model-routes.json` 中保存的目录会在首次启动时读取一次，其中的通道学习记录不再使用。
+- 语音合成（TTS）、转写（transcribe）、Lyria 音乐、Omni、Deep Research 和 Antigravity 等模型在 Playground 中不是聊天输入页面，适配层无法驱动，实测会在 95–190 秒后超时并占住该账号的 Playground 页面。这些模型不列入 `pg-` 列表，请求在本地返回 400，请改用对应的 `build-` 模型（Build 的 5 个 TTS 模型已实测可用）。
 - `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`）。抗截断、`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
 
 ## 账号与并发
@@ -44,7 +45,7 @@ Playground 的鉴权失败对该账号和模型冷却 5 分钟，连续被拒时
 }
 ```
 
-Playground 适配层支持文本、多轮对话、系统指令、函数调用和工具回传、内联媒体及常用生成参数；保留工具调用 ID、思考签名、结束原因和 token 用量。原生分块响应转换为 Gemini JSON/SSE，再交给现有 API 格式转换器。与公开 API 一致，只有 `includeThoughts: true` 时才返回思考内容；仅设置 `thinkingLevel`/`thinkingBudget` 或未设置思考配置时不返回，界面模板默认的显示思考也会被关闭。生成参数同时接受 camelCase 与 snake_case 写法。安全设置中 MakerSuite 未提供的公开类别（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）保持原生默认，不再导致 400。
+Playground 适配层支持文本、多轮对话、系统指令、函数调用和工具回传、内联媒体及常用生成参数；保留工具调用 ID、思考签名、结束原因和 token 用量。原生分块响应转换为 Gemini JSON/SSE，再交给现有 API 格式转换器。与公开 API 一致，只有 `includeThoughts: true` 时才返回思考内容（Gemma 等模板即使未请求也会输出思考，返回前会被过滤）；仅设置 `thinkingLevel`/`thinkingBudget` 或未设置思考配置时不返回，界面模板默认的显示思考也会被关闭。生成参数同时接受 camelCase 与 snake_case 写法。安全设置中 MakerSuite 未提供的公开类别（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）保持原生默认，不再导致 400。
 
 Build 抗截断模型的 OpenAI 输出使用独立配置 `ANTI_TRUNCATION_STREAMING_MODE=real`（默认），每段完成校验后立即发出，不再受普通模型的 `STREAMING_MODE=fake` 影响。需要完整缓冲时可显式设置为 `fake`。
 

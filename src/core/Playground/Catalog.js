@@ -28,6 +28,20 @@ class PlaygroundCatalog {
         }
     }
 
+    /**
+     * Model families whose Playground page is not the chat prompt page this adapter drives
+     * (speech, transcription, music, agents). Requests would only time out after minutes while
+     * holding the account's Playground page, so they are not listed and are rejected up front.
+     */
+    static UNSUPPORTED = /(?:^|-)tts(?:-|$)|-transcribe(?:-|$)|^lyria-|^gemini-omni-|^deep-research-|^antigravity-/;
+
+    /** @returns {string|null} Why Playground cannot serve this upstream model, or null. */
+    static unsupportedReason(model) {
+        const name = String(model || "").replace(/^models\//, "");
+        if (!PlaygroundCatalog.UNSUPPORTED.test(name)) return null;
+        return `Playground does not support ${name} (speech, transcription, music and agent models use a different page); use build-${name} if it is available.`;
+    }
+
     static validName(name) {
         return typeof name === "string" && /^models\/[a-z0-9._-]+$/.test(name);
     }
@@ -36,7 +50,7 @@ class PlaygroundCatalog {
     models() {
         const merged = new Map(this.configured.map(model => [model.name, { ...model }]));
         for (const model of this.discovered) merged.set(model.name, { ...merged.get(model.name), ...model });
-        return [...merged.values()];
+        return [...merged.values()].filter(model => !PlaygroundCatalog.unsupportedReason(model.name));
     }
 
     discover(raw) {

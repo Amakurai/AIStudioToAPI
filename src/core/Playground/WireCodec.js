@@ -413,6 +413,20 @@ class WireCodec {
             };
         return result;
     }
+    /** Like the public API, thoughts are returned only when includeThoughts is true. */
+    static includesThoughts(request) {
+        return pick(pick(pick(request, "generationConfig"), "thinkingConfig"), "includeThoughts") === true;
+    }
+
+    // Some model templates (e.g. Gemma) emit thoughts even when the request leaves them off.
+    static withoutThoughts(chunk) {
+        for (const candidate of chunk.candidates || []) {
+            if (Array.isArray(candidate.content?.parts))
+                candidate.content.parts = candidate.content.parts.filter(part => part?.thought !== true);
+        }
+        return chunk;
+    }
+
     static merge(target, chunk) {
         for (const [k, v] of Object.entries(chunk)) if (k !== "candidates") target[k] = v;
         for (const c of chunk.candidates || []) {

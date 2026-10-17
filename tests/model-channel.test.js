@@ -622,3 +622,77 @@ test("the same failure on several accounts is not counted against the current ac
     await single.handler.processOpenAIRequest(apiRequest("openai", "build-gemini-3.8-flash"), new FakeResponse());
     assert.equal(single.handler.authSwitcher.failureCount, 1);
 });
+
+test("Playground does not list or accept speech, transcription, music and agent models", async t => {
+    const PlaygroundCatalog = require("../src/core/Playground/Catalog");
+    const unsupported = [
+        "gemini-2.5-flash-preview-tts",
+        "gemini-3.1-flash-tts-preview",
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.5-transcribe",
+        "lyria-3-clip-preview",
+        "gemini-omni-flash-preview",
+        "deep-research-preview-04-2026",
+        "antigravity-preview-09-2026",
+    ];
+    for (const model of unsupported) assert.match(PlaygroundCatalog.unsupportedReason(model), /use build-/);
+    for (const model of ["gemini-4-argon", "gemini-3.8-flash", "gemma-4-31b-it", "gemini-3.1-flash-image"])
+        assert.equal(PlaygroundCatalog.unsupportedReason(model), null, model);
+
+    const h = harness(t);
+    h.handler.playground.catalog.discover([
+        [...unsupported, "gemini-3.8-flash"].map(name => [
+            `models/${name}`,
+            null,
+            "",
+            name,
+            "",
+            1,
+            1,
+            ["generateContent"],
+        ]),
+    ]);
+    assert.deepEqual(
+        h.handler.channelModels().playground.map(m => m.name),
+        ["models/pg-gemini-4-argon", "models/pg-gemini-3.8-flash"]
+    );
+    const reason = model =>
+        h.handler._unsupportedPlaygroundRequest({
+            body: {},
+            method: "POST",
+            path: `/v1beta/models/${model}:generateContent`,
+        });
+    assert.match(reason("pg-gemini-3.8-flash-tts"), /does not support gemini-3.8-flash-tts/);
+    assert.match(reason("pg-gemini-3.5-transcribe-high"), /does not support gemini-3.5-transcribe/);
+    assert.equal(reason("build-gemini-3.8-flash-tts"), null);
+
+    const queue = h.handler.connectionRegistry.createMessageQueue("tts", 0, "a1");
+    // The harness stubs forward; exercise the real transport here.
+    require("../src/core/Playground/Transport").prototype.forward.call(
+        h.handler.playground,
+        {
+            body: "{}",
+            path: "/v1beta/models/gemini-3.8-flash-tts:generateContent",
+            request_attempt_id: "a1",
+            request_id: "tts",
+        },
+        0
+    );
+    const error = await queue.dequeue();
+    assert.equal(error.status, 400);
+    assert.equal(error.retryable, false);
+});
+
+test("Playground drops thoughts the request did not ask for", () => {
+    const { WireCodec } = require("../src/core/Playground/WireCodec");
+    const chunk = () => ({
+        candidates: [{ content: { parts: [{ text: "thinking", thought: true }, { text: "ok" }], role: "model" } }],
+    });
+    assert.equal(WireCodec.includesThoughts({}), false);
+    assert.equal(WireCodec.includesThoughts({ generationConfig: { thinkingConfig: { includeThoughts: true } } }), true);
+    assert.equal(
+        WireCodec.includesThoughts({ generation_config: { thinking_config: { include_thoughts: true } } }),
+        true
+    );
+    assert.deepEqual(WireCodec.withoutThoughts(chunk()).candidates[0].content.parts, [{ text: "ok" }]);
+});

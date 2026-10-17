@@ -5,6 +5,14 @@ const PlaygroundSession = require("./Session");
 const { WireCodec, WireStream } = require("./WireCodec");
 const { DEFAULT_TIMEOUTS } = require("../RequestHandler/constants");
 
+const decodeURIComponentSafe = value => {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+};
+
 /** Playground generation channel: serves `pg-` models on each account's existing browser context. */
 class PlaygroundTransport {
     static MAX_DENIAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
@@ -59,7 +67,7 @@ class PlaygroundTransport {
               ? "Playground models only support generateContent and streamGenerateContent."
               : AntiTruncation.baseModel(match[1])
                 ? "Playground models do not support anti-truncation."
-                : null;
+                : PlaygroundCatalog.unsupportedReason(decodeURIComponentSafe(match[1]));
         if (rejection) {
             entry.queue.enqueue({ event_type: "error", message: rejection, retryable: false, status: 400 });
             return;
@@ -140,8 +148,11 @@ class PlaygroundTransport {
                 session = new PlaygroundSession(context, raw => this.catalog.discover(raw));
                 this.sessions.set(context, session);
             }
+            const request = JSON.parse(spec.body);
+            const includeThoughts = WireCodec.includesThoughts(request);
             const parser = new WireStream(raw => {
-                const chunk = WireCodec.decode(raw, model);
+                const decoded = WireCodec.decode(raw, model);
+                const chunk = includeThoughts ? decoded : WireCodec.withoutThoughts(decoded);
                 completed ||= !!chunk.candidates?.some(c => c.finishReason) || !!chunk.promptFeedback?.blockReason;
                 if (!realStream) WireCodec.merge(merged, chunk);
                 if (realStream && active()) {
@@ -150,7 +161,7 @@ class PlaygroundTransport {
                 }
             });
             this.handler.logger.info(`[Playground] ${model} (account #${authIndex}).`);
-            await session.request(model, JSON.parse(spec.body), {
+            await session.request(model, request, {
                 onData: value => {
                     if (!active() || typeof value !== "string") return;
                     parser.feed(value);
