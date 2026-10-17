@@ -7,7 +7,8 @@
 
 const AuthSwitcher = require("../../auth/AuthSwitcher");
 const FormatConverter = require("../FormatConverter");
-const ModelRouter = require("../ModelRouter");
+const ModelChannel = require("../ModelChannel");
+const PlaygroundTransport = require("../Playground/Transport");
 const { DEFAULT_TIMEOUTS } = require("./constants");
 
 class RequestHandler {
@@ -33,7 +34,7 @@ class RequestHandler {
              * import("../FormatConverter/ResponsesNonStreamResponseConverter")}
              */ (new FormatConverter(logger, serverSystem));
 
-        this.modelRouter = new ModelRouter(this);
+        this.playground = new PlaygroundTransport(this);
         this.needsSwitchingAfterRequest = false;
 
         // Round-robin cursor for multi-account dispatch: rotates among equally
@@ -66,6 +67,39 @@ class RequestHandler {
 
     set isSystemBusy(value) {
         this.authSwitcher.isSystemBusy = value === true;
+    }
+
+    /** Public model metadata per channel; names carry the channel prefix (`models/build-…`, `models/pg-…`). */
+    channelModels() {
+        const publish = (channel, models) =>
+            models.map(model => ({ ...model, name: `models/${ModelChannel.publicName(channel, model.name)}` }));
+        return {
+            build: publish("build", this.config.modelList || []),
+            playground: publish("playground", this.playground.models()),
+        };
+    }
+
+    /**
+     * Requests for a `pg-` model are rejected up front unless they generate content: Playground has
+     * no anti-truncation, token counting, embeddings, uploads or model lookup.
+     * @returns {string|null} Reason for rejecting the request, or null when it may proceed.
+     */
+    _unsupportedPlaygroundRequest(req) {
+        const pathMatch = req.path.match(/\/models\/([^/:]+)(?::([A-Za-z]+))?/);
+        let named = pathMatch ? pathMatch[1] : req.body?.model;
+        try {
+            named = decodeURIComponent(named);
+        } catch {
+            // Keep the raw name.
+        }
+        const { channel, model } = ModelChannel.parse(typeof named === "string" ? named : "");
+        if (channel !== "playground") return null;
+        if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
+        if (model.includes("抗截断")) return "Playground models do not support anti-truncation.";
+        const generates = pathMatch
+            ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(pathMatch[2])
+            : ["/v1/chat/completions", "/v1/responses", "/v1/messages"].includes(req.path);
+        return generates ? null : "Playground models only support content generation.";
     }
 
     _getUsageStatsService() {

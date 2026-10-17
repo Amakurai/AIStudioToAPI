@@ -6,6 +6,7 @@
  */
 
 const AntiTruncation = require("../AntiTruncation");
+const ModelChannel = require("../ModelChannel");
 
 const axios = require("axios");
 const mime = require("mime-types");
@@ -764,7 +765,7 @@ class FormatConverter {
     // Preserve Flash/Argon assistant-prefill compatibility by making the next user turn explicit.
     _applyTrailingUserTurnGuard(googleRequest, model) {
         if (!googleRequest || !Array.isArray(googleRequest.contents)) return;
-        const modelLower = (AntiTruncation.baseModel(model) || String(model || "")).toLowerCase();
+        const modelLower = (AntiTruncation.baseModel(model) || ModelChannel.parse(model).model).toLowerCase();
         if (!["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"].includes(modelLower))
             return;
         if (googleRequest.contents.length === 0) return;

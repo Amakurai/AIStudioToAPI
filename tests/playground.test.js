@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { WireCodec, WireStream } = require("../src/core/Playground/WireCodec");
-const ModelRouter = require("../src/core/ModelRouter");
+const PlaygroundTransport = require("../src/core/Playground/Transport");
 const ConnectionRegistry = require("../src/core/ConnectionRegistry");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 const body = () => ({ contents: [{ parts: [{ text: "Hi" }], role: "user" }] });
@@ -91,14 +91,15 @@ function harness(t, mode = "fake") {
         browserManager: { contexts: new Map([[1, { context }]]) },
         config: {
             modelList: [{ name: "models/gemini-3.8-flash" }, { name: "models/gemini-4-argon" }],
-            modelRoutesPath: path.join(dir, "routes.json"),
+            playgroundCatalogPath: path.join(dir, "playground-models.json"),
             playgroundEnabled: true,
+            playgroundModelList: [{ name: "models/gemini-4-argon" }],
         },
         connectionRegistry: registry,
         logger,
         timeouts: { FAKE_STREAM: 1000 },
     };
-    const router = new ModelRouter(handler);
+    const router = new PlaygroundTransport(handler);
     const queue = registry.createMessageQueue("req", 1, "attempt1");
     const spec = {
         body: JSON.stringify(body()),
@@ -117,34 +118,10 @@ function harness(t, mode = "fake") {
     return { calls: () => calls, context, handler, queue, registry, router, spec };
 }
 
-test("model channels include aliases and are restored after restart", t => {
-    const h = harness(t);
-    assert.equal(h.router.channel("gemini-4-argon-抗截断"), "playground");
-    assert.equal(h.router.channel("models/gemini-3.8-flash"), "build");
-    h.router.remember("gemini-3.8-flash", 1);
-    assert.equal(new ModelRouter(h.handler).channel("gemini-3.8-flash-抗截断", 1), "playground");
-});
-
-test("only explicit Build permission or zero-quota failures trigger fallback", () => {
-    for (const message of [
-        { message: "PERMISSION_DENIED", status: 403 },
-        { message: "model not found", status: 404 },
-        { message: "Quota exceeded, limit: 0, model: gemini-4-argon", status: 429 },
-    ])
-        assert.equal(ModelRouter.canFallback({ event_type: "error", ...message }), true);
-    for (const message of [
-        { message: "quota exhausted, limit: 10", status: 429 },
-        { message: "safety filter", status: 403 },
-        { message: "transient failure", status: 503 },
-        { message: "invalid request", status: 400 },
-    ])
-        assert.equal(ModelRouter.canFallback({ event_type: "error", ...message }), false);
-});
-
 test("native stream and buffered requests get Gemini output via the existing queue", async t => {
     for (const mode of ["real", "fake"]) {
         const h = harness(t, mode);
-        assert.equal(h.router.forward(h.spec, 1), true);
+        h.router.forward(h.spec, 1);
         const headers = await h.queue.dequeue();
         assert.equal(headers.status, 200);
         assert.equal(headers.headers["x-aistudio-channel"], "playground");
@@ -153,35 +130,6 @@ test("native stream and buffered requests get Gemini output via the existing que
         assert.equal(data.candidates[0].content.parts[0].text, "hello");
         assert.equal((await h.queue.dequeue()).type, "STREAM_END");
     }
-});
-
-test("Build fallback runs once on the same account and ignores late Build frames", async t => {
-    const h = harness(t);
-    h.spec.path = "/v1beta/models/gemini-3.8-flash:generateContent";
-    assert.equal(h.router.forward(h.spec, 1), false);
-    const receive = message =>
-        h.registry._handleIncomingMessage(
-            JSON.stringify({ request_attempt_id: "attempt1", request_id: "req", ...message }),
-            1
-        );
-    receive({ event_type: "error", message: "PERMISSION_DENIED", status: 403 });
-    receive({ data: "late Build output", event_type: "chunk" });
-    receive({ event_type: "stream_close" });
-    assert.equal((await h.queue.dequeue()).status, 200);
-    assert.match((await h.queue.dequeue()).data, /hello/);
-    assert.equal((await h.queue.dequeue()).type, "STREAM_END");
-    assert.equal(h.calls(), 1);
-    assert.equal(h.router.channel("gemini-3.8-flash", 1), "playground");
-});
-
-test("a committed Build stream never switches transport", async t => {
-    const h = harness(t);
-    h.spec.path = "/v1beta/models/gemini-3.8-flash:streamGenerateContent";
-    h.router.forward(h.spec, 1);
-    const entry = h.registry.messageQueues.get("req");
-    assert.equal(entry.onUpstreamMessage({ event_type: "response_headers", status: 200 }), false);
-    assert.equal(entry.onUpstreamMessage({ event_type: "error", message: "PERMISSION_DENIED", status: 403 }), false);
-    assert.equal(h.calls(), 0);
 });
 
 test("cancellation and timeouts abort Playground without returning late content", async t => {
@@ -207,29 +155,6 @@ test("cancellation and timeouts abort Playground without returning late content"
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(aborted, true);
     assert.equal(h.queue.messages.length, 0);
-});
-
-test("unsupported requests and ordinary quotas remain on Build", t => {
-    const h = harness(t);
-    for (const endpoint of ["countTokens", "batchEmbedContents"])
-        assert.equal(h.router.forward({ ...h.spec, path: `/v1beta/models/gemini-4-argon:${endpoint}` }, 1), false);
-    h.handler.config.playgroundEnabled = false;
-    assert.equal(h.router.forward(h.spec, 1), false);
-});
-
-test("discovery keeps existing Build models and adds new Playground models without duplicates", t => {
-    const h = harness(t);
-    const raw = [
-        [
-            ["models/gemini-3.8-flash", null, "", "Flash", "", 1000, 100, ["generateContent"]],
-            ["models/gemini-new", null, "", "New", "", 2000, 200, ["generateContent"]],
-        ],
-    ];
-    h.router.discover(raw);
-    h.router.discover(raw);
-    assert.equal(h.handler.config.modelList.filter(m => m.name === "models/gemini-new").length, 1);
-    assert.equal(h.router.channel("gemini-new"), "playground");
-    assert.equal(h.router.channel("gemini-3.8-flash"), "build");
 });
 
 test("cancelled Playground waiters settle promptly and never take the active page", async () => {
@@ -301,39 +226,6 @@ test("Playground timeouts report 504 and stale attempts cannot publish errors", 
     assert.equal(next.queue.messages.length, 0);
 });
 
-test("channel groups contain each configured name exactly once", t => {
-    const h = harness(t);
-    assert.deepEqual(h.router.groups(), { build: ["gemini-3.8-flash"], playground: ["gemini-4-argon"] });
-    h.handler.config.playgroundEnabled = false;
-    assert.deepEqual(h.router.groups(), { build: ["gemini-3.8-flash", "gemini-4-argon"], playground: [] });
-});
-
-test("learned routes and cooldowns are scoped to account and expire", t => {
-    const h = harness(t);
-    h.router.remember("gemini-3.8-flash", 1);
-    assert.equal(h.router.channel("gemini-3.8-flash", 1), "playground");
-    assert.equal(h.router.channel("gemini-3.8-flash", 2), "build");
-    h.router.fail("gemini-3.8-flash", 1, 403);
-    assert.ok(h.router.record("gemini-3.8-flash", 1).failedUntil > Date.now());
-    assert.equal(h.router.record("gemini-3.8-flash", 2), undefined);
-    h.router.record("gemini-3.8-flash", 1).successAt = Date.now() - 86400001;
-    assert.equal(h.router.channel("gemini-3.8-flash", 1), "build");
-    h.router.remember("gemini-3.8-flash", 1);
-    assert.equal(h.router.record("gemini-3.8-flash", 1).failedUntil, 0);
-});
-
-test("catalog names and limits survive restart without globalizing account preferences", t => {
-    const h = harness(t);
-    h.router.discover([[["models/gemini-new", null, "", "New", "Description", 2000, 200, ["generateContent"]]]]);
-    h.router.remember("gemini-3.8-flash", 1);
-    h.handler.config.modelList = [{ name: "models/gemini-3.8-flash" }, { name: "models/gemini-4-argon" }];
-    const restored = new ModelRouter(h.handler);
-    assert.equal(h.handler.config.modelList.find(m => m.name === "models/gemini-new").outputTokenLimit, 200);
-    assert.equal(restored.channel("gemini-new"), "playground");
-    assert.equal(restored.channel("gemini-3.8-flash", 1), "playground");
-    assert.equal(restored.channel("gemini-3.8-flash", 2), "build");
-});
-
 test("true streaming does not accumulate a second complete response", async t => {
     const h = harness(t, "real");
     const original = WireCodec.merge;
@@ -356,11 +248,11 @@ test("true streaming does not accumulate a second complete response", async t =>
 test("cooling Playground accounts fail quickly without dispatch or extending cooldown", async t => {
     const h = harness(t);
     h.router.fail("gemini-4-argon", 1, 429);
-    const until = h.router.record("gemini-4-argon", 1).failedUntil;
+    const until = h.router.cooldownUntil("gemini-4-argon", 1);
     h.router.forward(h.spec, 1);
     assert.equal((await h.queue.dequeue()).status, 503);
     assert.equal(h.calls(), 0);
-    assert.equal(h.router.record("gemini-4-argon", 1).failedUntil, until);
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), until);
 });
 
 test("first Playground permission failure can switch accounts, but committed streams cannot retry", async t => {
@@ -382,7 +274,63 @@ test("first Playground permission failure can switch accounts, but committed str
         const error = await h.queue.dequeue();
         assert.equal(error.status, committed ? 403 : 503);
         if (committed) assert.equal(error.retryable, false);
-        assert.ok(h.router.record("gemini-4-argon", 1).failedUntil > Date.now());
-        assert.equal(h.router.record("gemini-4-argon", 2), undefined);
+        assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
+        assert.equal(h.router.cooldownUntil("gemini-4-argon", 2), 0);
     }
+});
+
+test("non-generation endpoints are rejected by the Playground transport", async t => {
+    for (const endpoint of ["countTokens", "batchEmbedContents"]) {
+        const h = harness(t);
+        h.router.forward({ ...h.spec, path: `/v1beta/models/gemini-4-argon:${endpoint}` }, 1);
+        const error = await h.queue.dequeue();
+        assert.equal(error.status, 400);
+        assert.equal(error.retryable, false);
+        assert.equal(h.calls(), 0);
+    }
+});
+
+test("the Playground catalog keeps configured models, adds discovered ones once and survives restart", t => {
+    const h = harness(t);
+    const raw = [
+        [
+            ["models/gemini-4-argon", null, "", "Argon", "", 1000, 100, ["generateContent"]],
+            ["models/gemini-new", null, "", "New", "", 2000, 200, ["generateContent"]],
+            ["models/embedding-only", null, "", "Embed", "", 1, 1, ["embedContent"]],
+        ],
+    ];
+    h.router.catalog.discover(raw);
+    h.router.catalog.discover(raw);
+    const names = h.router.models().map(m => m.name);
+    assert.deepEqual(names, ["models/gemini-4-argon", "models/gemini-new"]);
+    assert.equal(h.router.models()[0].outputTokenLimit, 100);
+    // Build's list is never touched by Playground discovery.
+    assert.deepEqual(
+        h.handler.config.modelList.map(m => m.name),
+        ["models/gemini-3.8-flash", "models/gemini-4-argon"]
+    );
+    const restored = new PlaygroundTransport(h.handler);
+    assert.deepEqual(
+        restored.models().map(m => m.name),
+        names
+    );
+    h.handler.config.playgroundEnabled = false;
+    assert.deepEqual(restored.models(), []);
+});
+
+test("a catalog saved by the removed router is restored once", t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aistudio-catalog-legacy-"));
+    t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
+    fs.writeFileSync(
+        path.join(dir, "model-routes.json"),
+        JSON.stringify({ accounts: {}, models: [{ name: "models/gemini-old" }], version: 2 })
+    );
+    const transport = new PlaygroundTransport({
+        config: { playgroundCatalogPath: path.join(dir, "playground-models.json"), playgroundEnabled: true },
+        logger,
+    });
+    assert.deepEqual(
+        transport.models().map(m => m.name),
+        ["models/gemini-old"]
+    );
 });

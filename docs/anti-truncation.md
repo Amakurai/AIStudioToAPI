@@ -2,9 +2,11 @@
 
 **只需选择下列模型名，即自动启用工具输出抗截断。无需额外请求头、客户端脚本或配置开关。**
 
-- `gemini-3.7-flash-抗截断`
-- `gemini-3.8-flash-抗截断`
-- `gemini-4-argon-抗截断`
+- `build-gemini-3.7-flash-抗截断`
+- `build-gemini-3.8-flash-抗截断`
+- `build-gemini-4-argon-抗截断`
+
+抗截断只属于 Build 链路，`build-` 前缀可省略；Playground 的 `pg-` 模型不提供抗截断，请求会返回 400。
 
 仅这三个精确别名启用；原模型及其他模型保持原有行为。请求头不能给其他模型开启此功能。模型列表会显示这三个别名，网关请求上游时自动去掉后缀。中文原生接口路径可以使用 URL 编码；不与搜索、代码执行、思考等级等其他模型后缀组合。
 
@@ -19,7 +21,7 @@
 
 OpenAI Chat Completions、Responses、Claude Messages 和 Gemini 原生生成接口均自动使用同一套分段工具输出协议，返回各接口的普通助手正文，客户端无需执行内部工具。Gemini 原生接口使用路径中的模型别名；其他接口使用请求里的 `model`。
 
-普通 Argon 使用 `gemini-4-argon`，同样支持思考等级、流式模式和内置工具后缀（例如 `gemini-4-argon-high-fake-search`）。OpenAI、Responses、Claude 转换后的对话若以模型回复或工具结果结尾，会沿用 3.7/3.8 的规则补一个最小 user 轮次。抗截断别名也保留该处理。
+普通 Argon 使用 `build-gemini-4-argon`（Build）或 `pg-gemini-4-argon`（Playground），同样支持思考等级、流式模式和内置工具后缀（例如 `gemini-4-argon-high-fake-search`）。OpenAI、Responses、Claude 转换后的对话若以模型回复或工具结果结尾，会沿用 3.7/3.8 的规则补一个最小 user 轮次。抗截断别名也保留该处理。
 
 Argon 的模型 ID 来自 AI Studio 界面；模型列表暂不填未经确认的 token 上限及采样默认值。实际可用性和工具协议支持仍需通过有权限的上游账号验证。
 

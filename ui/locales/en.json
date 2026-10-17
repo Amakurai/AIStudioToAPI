@@ -174,7 +174,7 @@
     "maxContextsHint": "0 means unlimited; applies at runtime, resets to the env value after restart",
     "maxRetries": "Error Retries",
     "modelChannels": "Model Channels",
-    "modelChannelsHelp": "Groups show default channels. Requests adapt to each account; successful choices are remembered for 24 hours.",
+    "modelChannelsHelp": "Two independent channels: build- models use Build, pg- models use Playground. Neither falls back to the other.",
     "modelUsage": "Model Usage",
     "modelUsageBreakdown": "Model Usage Breakdown",
     "networkError": "Network connection failed. Please check your network settings.",

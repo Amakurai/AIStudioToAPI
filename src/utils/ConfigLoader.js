@@ -239,6 +239,17 @@ class ConfigLoader {
             config.modelList = [{ name: "models/gemini-flash-lite-latest" }];
         }
 
+        // Playground has its own list; models discovered from the Playground page are added at runtime.
+        const playgroundModelsPath = path.join(process.cwd(), "configs", "playground-models.json");
+        try {
+            const playgroundModels = JSON.parse(fs.readFileSync(playgroundModelsPath, "utf-8"))?.models;
+            config.playgroundModelList = Array.isArray(playgroundModels) ? playgroundModels : [];
+        } catch (error) {
+            config.playgroundModelList = [];
+            if (error.code !== "ENOENT")
+                this.logger.error(`[System] Failed to read or parse playground-models.json: ${error.message}`);
+        }
+
         this._printConfiguration(config);
         return config;
     }

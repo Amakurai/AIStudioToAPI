@@ -13,9 +13,9 @@
 - 📝 **模型支持**：通过 AI Studio 访问各种 Gemini 模型，包括生图模型和 TTS 语音合成模型
 - 🎨 **主页展示控制**：提供可视化的 Web 控制台，支持账号管理、VNC 登录等操作
 
-## Build / Playground 自动分流
+## Build / Playground 双链路
 
-已登录账号可直接使用 Playground 通道。Argon 及其抗截断版本默认走 Playground；其他模型保留 Build 优先，遇到明确的通道权限问题时自动尝试 Playground 并记住成功选择。控制台展示模型分组，无需额外抓取 Cookie。详见 [Playground 兼容说明](docs/playground.md)。
+Build 和 Playground 是两条独立链路，由模型名前缀决定：`build-` 前缀（如 `build-gemini-4-argon`、`build-gemini-4-argon-抗截断`）走 Build，模型列表来自 `configs/models.json`；`pg-` 前缀（如 `pg-gemini-4-argon`）走 Playground，模型列表来自 `configs/playground-models.json` 及 Playground 页面的原生目录。两条链路互不回退，Playground 不支持抗截断。不带前缀的旧模型名仍按 Build 处理。共用已登录账号池，无需额外抓取 Cookie。详见 [Playground 说明](docs/playground.md)。
 
 ## 🚀 快速开始
 
@@ -371,4 +371,4 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ### 抗截断模型
 
-直接选择 `gemini-3.7-flash-抗截断`、`gemini-3.8-flash-抗截断` 或 `gemini-4-argon-抗截断`，即自动启用工具输出抗截断：原始对话直接发送，模型通过工具按序交付正文，未完成时有限续写；单段完整回答可在一次上游调用内完成。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。
+直接选择 `build-gemini-3.7-flash-抗截断`、`build-gemini-3.8-flash-抗截断` 或 `build-gemini-4-argon-抗截断`（`build-` 前缀可省略），即自动启用工具输出抗截断：原始对话直接发送，模型通过工具按序交付正文，未完成时有限续写；单段完整回答可在一次上游调用内完成。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。

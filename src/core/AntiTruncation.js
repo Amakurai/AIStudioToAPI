@@ -55,7 +55,8 @@ class AntiTruncation {
         } catch {
             return null;
         }
-        const match = decoded.match(/^(gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/);
+        // Anti-truncation is a Build feature; the explicit `build-` channel prefix is optional.
+        const match = decoded.match(/^(?:build-)?(gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/);
         return match ? match[1] : null;
     }
 

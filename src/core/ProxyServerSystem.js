@@ -477,17 +477,21 @@ class ProxyServerSystem extends EventEmitter {
         app.use(this._createAuthMiddleware());
 
         // API routes
+        // Each channel lists its own models: build-* from configs/models.json, pg-* from Playground.
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
-            const models = this.config.modelList.map(model => ({
-                context_window: model.inputTokenLimit,
-                created: Math.floor(Date.now() / 1000),
-                id: model.name.replace("models/", ""),
-                max_tokens: model.outputTokenLimit,
-                object: "model",
-                owned_by: "google",
-                upstream_channel: this.requestHandler.modelRouter.channel(model.name),
-            }));
+            const channels = this.requestHandler.channelModels();
+            const models = Object.entries(channels).flatMap(([channel, list]) =>
+                list.map(model => ({
+                    context_window: model.inputTokenLimit,
+                    created: Math.floor(Date.now() / 1000),
+                    id: model.name.replace("models/", ""),
+                    max_tokens: model.outputTokenLimit,
+                    object: "model",
+                    owned_by: "google",
+                    upstream_channel: channel,
+                }))
+            );
 
             res.status(200).json({
                 data: models,
@@ -496,12 +500,27 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.get(["/v1beta/models"], (req, res) => {
+            const channels = this.requestHandler.channelModels();
             res.status(200).json({
-                models: this.config.modelList.map(model => ({
-                    ...model,
-                    upstreamChannel: this.requestHandler.modelRouter.channel(model.name),
-                })),
+                models: Object.entries(channels).flatMap(([channel, list]) =>
+                    list.map(model => ({ ...model, upstreamChannel: channel }))
+                ),
             });
+        });
+
+        app.use((req, res, next) => {
+            const reason = this.requestHandler._unsupportedPlaygroundRequest(req);
+            if (!reason) return next();
+            this.logger.warn(`[Request] Rejected Playground request ${req.method} ${req.path}: ${reason}`);
+            const apiFormat = req.path.startsWith("/v1/messages")
+                ? "claude"
+                : req.path.startsWith("/v1/responses")
+                  ? "response_api"
+                  : /^\/v1\/(?:chat|embeddings|openai)/.test(req.path)
+                    ? "openai"
+                    : "gemini";
+            this.requestHandler._setResponseApiFormat(res, apiFormat);
+            this.requestHandler._sendErrorResponse(res, 400, reason);
         });
 
         app.post("/v1/chat/completions", (req, res) => {

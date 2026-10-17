@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { WireCodec } = require("../src/core/Playground/WireCodec");
 const PlaygroundSession = require("../src/core/Playground/Session");
-const ModelRouter = require("../src/core/ModelRouter");
+const PlaygroundTransport = require("../src/core/Playground/Transport");
 const ConnectionRegistry = require("../src/core/ConnectionRegistry");
 
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
@@ -25,14 +25,14 @@ function harness(t, { mode = "fake", fakeStream = 1000, streamChunk, request = b
         browserManager: { contexts: new Map([[1, { context }]]) },
         config: {
             modelList: [{ name: "models/gemini-4-argon" }],
-            modelRoutesPath: path.join(dir, "routes.json"),
+            playgroundCatalogPath: path.join(dir, "playground-models.json"),
             playgroundEnabled: true,
         },
         connectionRegistry: registry,
         logger,
         timeouts: { FAKE_STREAM: fakeStream, STREAM_CHUNK: streamChunk },
     };
-    const router = new ModelRouter(handler);
+    const router = new PlaygroundTransport(handler);
     const queue = registry.createMessageQueue("req", 1, "attempt1");
     const spec = {
         body: JSON.stringify(request),
@@ -145,7 +145,7 @@ test("#1 a request timing out while queued behind the account's active request d
     assert.equal(error.status, 503, "busy account must use the immediate account-switch path");
     assert.notEqual(error.retryable, false, "nothing was dispatched, so another account may retry");
     assert.match(error.message, /queued/);
-    assert.equal(h.router.record("gemini-4-argon", 1)?.failedUntil ?? 0, 0);
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
 });
 
 test("#1 a timeout after dispatch still reports 504 and cools the account down", async t => {
@@ -160,7 +160,7 @@ test("#1 a timeout after dispatch still reports 504 and cools the account down",
     h.router.forward(h.spec, 1);
     const error = (await drain(h.queue)).at(-1);
     assert.equal(error.status, 504);
-    assert.ok(h.router.record("gemini-4-argon", 1).failedUntil > Date.now());
+    assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
 });
 
 test("#2 an active real stream may outlive the total deadline while chunks keep arriving", async t => {
@@ -217,7 +217,7 @@ test("#3 malformed contents are a non-retryable 400 that never cool the account 
     assert.equal(error.status, 400);
     assert.equal(error.retryable, false);
     assert.match(error.message, /contents\[0\]\.parts must be an array/);
-    assert.equal(h.router.record("gemini-4-argon", 1), undefined);
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
 });
 
 test("#4 a UI submission timeout before inference may be retried on another account", async () => {

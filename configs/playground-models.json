@@ -1,0 +1,10 @@
+{
+    "models": [
+        {
+            "name": "models/gemini-4-argon",
+            "displayName": "Gemini 4 Argon (Playground)",
+            "description": "Gemini 4 Argon through AI Studio Playground. Availability depends on the upstream account.",
+            "supportedGenerationMethods": ["generateContent"]
+        }
+    ]
+}

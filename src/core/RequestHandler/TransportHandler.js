@@ -6,6 +6,7 @@
  */
 
 const AntiTruncation = require("../AntiTruncation");
+const ModelChannel = require("../ModelChannel");
 
 const RequestHandler = require("./CommonHandler");
 
@@ -76,7 +77,7 @@ class TransportHandler extends RequestHandler {
     }
 
     _cancelBrowserRequest(requestId, authIndex, requestAttemptId = null) {
-        if (this.modelRouter?.cancel(requestId, requestAttemptId)) return;
+        if (this.playground?.cancel(requestId, requestAttemptId)) return;
         const targetAuthIndex = authIndex !== undefined ? authIndex : this.currentAuthIndex;
         const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
@@ -113,9 +114,48 @@ class TransportHandler extends RequestHandler {
         this._cancelBrowserRequest(proxyRequest.request_id, currentQueueAuthIndex, proxyRequest.request_attempt_id);
     }
 
+    /**
+     * Pick the upstream channel from the model prefix once per request and remove the prefix
+     * from the path and body, so each transport only sees upstream model names.
+     */
+    _resolveProxyRequestChannel(proxyRequest) {
+        if (proxyRequest.channel) return;
+        const match = proxyRequest.path?.match(/^(.*\/models\/)([^/:?]+)(.*)$/);
+        let body;
+        if (typeof proxyRequest.body === "string" && /"(?:models\/)?(?:build|pg)-/.test(proxyRequest.body)) {
+            try {
+                body = JSON.parse(proxyRequest.body);
+            } catch {
+                // Not JSON (e.g. uploads); only the path can carry a model.
+            }
+        }
+        const named = match ? match[2] : body?.model;
+        const { channel, model, prefixed } = ModelChannel.parse(named);
+        proxyRequest.channel = channel;
+        if (channel === "playground" && !this.playground?.enabled) {
+            throw Object.assign(new Error("The Playground channel is disabled (PLAYGROUND_ENABLED=false)."), {
+                status: 400,
+            });
+        }
+        if (channel === "playground" && AntiTruncation.baseModel(model)) {
+            throw Object.assign(new Error("Playground models do not support anti-truncation."), { status: 400 });
+        }
+        if (!prefixed) return;
+        if (match) proxyRequest.path = `${match[1]}${model}${match[3]}`;
+        if (!body) return;
+        const strip = value => (typeof value === "string" ? `models/${ModelChannel.parse(value).model}` : value);
+        if (!match && typeof body.model === "string") body.model = ModelChannel.parse(body.model).model;
+        if (body.generateContentRequest?.model)
+            body.generateContentRequest.model = strip(body.generateContentRequest.model);
+        if (Array.isArray(body.requests))
+            for (const request of body.requests) if (request?.model) request.model = strip(request.model);
+        proxyRequest.body = JSON.stringify(body);
+    }
+
     _initializeProxyRequestAttempt(proxyRequest) {
+        this._resolveProxyRequestChannel(proxyRequest);
         const match = proxyRequest.path?.match(/^(.*\/models\/)([^/:]+)(:[^?]+.*)$/);
-        const baseModel = match && AntiTruncation.baseModel(match[2]);
+        const baseModel = proxyRequest.channel === "build" && match && AntiTruncation.baseModel(match[2]);
         if (baseModel) {
             proxyRequest.path = `${match[1]}${baseModel}${match[3]}`;
             if (proxyRequest.body && match[3] === ":countTokens") {
@@ -170,7 +210,10 @@ class TransportHandler extends RequestHandler {
             void AntiTruncation.forward(this, proxyRequest, authIndex);
             return;
         }
-        if (this.modelRouter?.forward(proxyRequest, authIndex)) return;
+        if (proxyRequest.channel === "playground") {
+            this.playground.forward(proxyRequest, authIndex);
+            return;
+        }
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
             this.logger.debug(
