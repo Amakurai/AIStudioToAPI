@@ -3,7 +3,10 @@
  * Description: OpenAI-compatible text-to-speech (POST /v1/audio/speech) on Gemini TTS models.
  */
 
+const ModelChannel = require("../ModelChannel");
+const PlaygroundCatalog = require("../Playground/Catalog");
 const RetryHandler = require("./RetryHandler");
+const { pcmFormat, pcmToWav } = require("../../utils/Audio");
 
 // Gemini TTS prebuilt voices; OpenAI voice names map to a similar-sounding one. Other voice names
 // (e.g. the 3.8 voices such as Fola or Rami) pass through for the upstream model to validate.
@@ -66,8 +69,12 @@ class SpeechHandler extends RetryHandler {
         );
     }
 
-    /** Validates an OpenAI speech body and builds the Gemini request, or returns an error message. */
-    static buildGeminiRequest(body) {
+    /**
+     * Validates an OpenAI speech body and builds the Gemini request, or returns an error message.
+     * With `voiceStyle`, `instructions` becomes the voice style of a Playground speech block (3.8
+     * pages), which the model follows; a prefix in the text would be read aloud by 3.8 models.
+     */
+    static buildGeminiRequest(body, { voiceStyle = false } = {}) {
         if (!body || typeof body !== "object") return { error: "Request body must be a JSON object." };
         if (typeof body.model !== "string" || !body.model) return { error: "model is required." };
         if (typeof body.input !== "string" || !body.input.trim()) return { error: "input must be a non-empty string." };
@@ -81,7 +88,14 @@ class SpeechHandler extends RetryHandler {
         return {
             request: {
                 contents: [
-                    { parts: [{ text: instructions ? `${instructions}: ${body.input}` : body.input }], role: "user" },
+                    {
+                        parts: [
+                            voiceStyle && instructions
+                                ? { speechMetadata: { style: instructions }, text: body.input }
+                                : { text: instructions ? `${instructions}: ${body.input}` : body.input },
+                        ],
+                        role: "user",
+                    },
                 ],
                 generationConfig: {
                     responseModalities: ["AUDIO"],
@@ -93,21 +107,7 @@ class SpeechHandler extends RetryHandler {
 
     /** Raw 16-bit little-endian mono PCM in a WAV container. */
     static pcmToWav(pcm, sampleRate = 24000, channels = 1) {
-        const header = Buffer.alloc(44);
-        header.write("RIFF", 0);
-        header.writeUInt32LE(36 + pcm.length, 4);
-        header.write("WAVE", 8);
-        header.write("fmt ", 12);
-        header.writeUInt32LE(16, 16);
-        header.writeUInt16LE(1, 20);
-        header.writeUInt16LE(channels, 22);
-        header.writeUInt32LE(sampleRate, 24);
-        header.writeUInt32LE(sampleRate * channels * 2, 28);
-        header.writeUInt16LE(channels * 2, 32);
-        header.writeUInt16LE(16, 34);
-        header.write("data", 36);
-        header.writeUInt32LE(pcm.length, 40);
-        return Buffer.concat([header, pcm]);
+        return pcmToWav(pcm, sampleRate, channels);
     }
 
     /** Gemini models return either raw L16 PCM (`audio/L16;rate=24000`) or a WAV file. */
@@ -121,8 +121,7 @@ class SpeechHandler extends RetryHandler {
             const dataOffset = data.indexOf("data", 12, "latin1");
             return { body: dataOffset >= 0 ? data.subarray(dataOffset + 8) : data, contentType: "audio/pcm" };
         }
-        const rate = Number(mimeType.match(/rate=(\d+)/)?.[1]) || 24000;
-        const channels = Number(mimeType.match(/channels=(\d+)/)?.[1]) || 1;
+        const { channels, sampleRate: rate } = pcmFormat(mimeType);
         if (format === "pcm") return { body: data, contentType: `audio/pcm;rate=${rate}` };
         return { body: SpeechHandler.pcmToWav(data, rate, channels), contentType: "audio/wav" };
     }
@@ -139,7 +138,14 @@ class SpeechHandler extends RetryHandler {
         res.__proxyResponseStreamMode = null;
 
         try {
-            const { error, request } = SpeechHandler.buildGeminiRequest(req.body);
+            const target = ModelChannel.parse(req.body?.model);
+            const { error, request } = SpeechHandler.buildGeminiRequest(req.body, {
+                voiceStyle:
+                    target.channel === "playground" &&
+                    PlaygroundCatalog.usesSpeechBlocks(
+                        this.formatConverter.constructor.stripModelSuffixes(target.model)
+                    ),
+            });
             if (error) return this._sendErrorResponse(res, 400, error, "invalid_request_error");
             // OpenAI defaults to mp3; Gemini only produces PCM/WAV, so every non-PCM format is served as WAV.
             const format = req.body.response_format === "pcm" ? "pcm" : "wav";

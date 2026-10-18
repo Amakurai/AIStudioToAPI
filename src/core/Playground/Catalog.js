@@ -42,6 +42,15 @@ class PlaygroundCatalog {
         return PlaygroundCatalog.SPEECH.test(String(model || "").replace(/^models\//, ""));
     }
 
+    /**
+     * 3.8 and newer TTS pages are a screenplay of speech blocks: each text part may carry a speaker
+     * and a voice style (speech_metadata). 2.5/3.1 pages send one `## Transcript:` text instead.
+     */
+    static usesSpeechBlocks(model) {
+        const name = String(model || "").replace(/^models\//, "");
+        return PlaygroundCatalog.isSpeech(name) && !/^gemini-(?:2\.5|3\.1)-/.test(name);
+    }
+
     /** @returns {string|null} Why Playground cannot serve this upstream model, or null. */
     static unsupportedReason(model) {
         const name = String(model || "").replace(/^models\//, "");

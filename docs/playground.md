@@ -65,10 +65,14 @@ Build 抗截断模型的 OpenAI 输出使用独立配置 `ANTI_TRUNCATION_STREAM
 
 - 原生请求仍是 MakerSuite `GenerateContent`：`responseModalities` 编码为生成配置 `[14]`（AUDIO = 3），`speechConfig` 编码为 `[15]`，内部字段与公开 proto 一致（`voiceConfig` = 1、`languageCode` = 2、`multiSpeakerVoiceConfig` = 3）。未指定音色时使用页面默认音色（3.8 为 `Fola`，2.5/3.1 为 `Zephyr`）。
 - 适配层打开语音页面的“Create new dialog”：2.5/3.1 切换到 Text 视图使用单个文本框，3.8 使用单个语音块，按原文取得签名。2.5/3.1 页面总会把文本包成 `## Transcript:\n<文本>`（AI Studio 自己的 TTS 提示格式），签名覆盖该文本，因此发往上游的请求同样加上这一前缀，与页面自身发送的内容一致；实测不会被读出。3.8 原样发送。
-- 3.8 的多说话人请求要求每个文本 part 标明说话人（part 字段 41 `speech_metadata.speaker`，页面每个语音块一个 part）。公开格式 `Joe: ...\nJane: ...` 会按 `speakerVoiceConfigs` 中的说话人名拆成逐句 part；不带说话人前缀的行并入上一句，第一句之前出现无法归属的文本时返回 400。part 自带 `speechMetadata.speaker` 时原样透传。2.5/3.1 直接读取公开格式，不拆分。
-- 上游以多段 24kHz 16-bit 单声道 L16 PCM 流式返回音频。非流式响应会把连续的同格式 PCM 段拼接成一个 part（与公开 API 一致），`/v1/audio/speech` 再封装为 WAV 或按 `response_format=pcm` 返回原始 PCM；真流式按段转发。
+- 3.8 及更新的 TTS 页面由语音块组成，每个文本 part 可带 `speech_metadata`（part 字段 41：`[说话人, 声音风格]`）。part 的 `speechMetadata: { speaker, style }` 原样透传；`style` 即页面语音块的 Style（“Describe the voice style”）。
+- 3.8 的多说话人请求要求每个文本 part 标明说话人。公开格式 `Joe: ...\nJane: ...` 会按 `speakerVoiceConfigs` 中的说话人名拆成逐句 part（说话人行可以缩进，不带说话人前缀的行并入上一句）。第一句之前的文本（如官方示例 `TTS the following conversation between Joe and Jane:`、`Make Joe sound tired:`）是表演指示而非台词，作为每一句的声音风格发送，不会被读出；完全没有说话人行时返回 400。2.5/3.1 直接读取公开格式，不拆分。3.8 不接受 `systemInstruction`（上游返回 “Developer instruction is not enabled for this model”）。
+- `/v1/audio/speech` 的 `instructions` 在 `pg-` 3.8 模型上作为声音风格发送（实测前缀写法 `指示: 正文` 会被 3.8 读出：同一句话 3.84 秒对比 1.92 秒）；Build 与 2.5/3.1 仍按 `指示: 正文` 发送。非 TTS 的 `pg-` 模型请求该端点在本地返回 400。
+- 上游以多段 24kHz 16-bit 单声道 L16 PCM 流式返回音频，结束分块另带一个空 text part。Playground 会把连续的同格式 PCM 段拼接成一个 part 并去掉空 text part（与公开 API 一致）；TTS 的真流式请求同样等生成完成后以一个 SSE 事件发送整段音频，避免 OpenAI/Claude 格式中出现几十个无法单独播放的音频片段。`/v1/audio/speech` 再封装为 WAV 或按 `response_format=pcm` 返回原始 PCM。
+- OpenAI Chat Completions 与 Claude Messages 中的音频以 `![Generated Audio](data:audio/wav;base64,...)` 输出（原始 PCM 封装为 WAV，浏览器可直接播放；Build 链路同样适用）。假流式输出时整段媒体 data URI 作为一帧发送，不再按 128 字符切分（此前每片停顿 20 ms，3 秒音频约多等 30 秒，图片更久）。
+- 语音页面偶尔先显示上一次使用模型的视图切换，适配层点选 Text 视图后以实际出现的输入框为准，不会因等待不存在的输入框超时。
 
-2026-10-18 实测（独立浏览器，未影响线上服务）：5 个 TTS 模型均返回 `STOP` 和音频；3.8 单说话人（`Fola`）、3.8 双说话人（`Rami`/`Fola`，含同页面复用，第二次约 2.4 秒）、2.5 双说话人、3.1 默认音色、3.8 lite 指定 `languageCode` 均成功；2.5 的 “Good morning.” 生成 1.05 秒音频，说明 `## Transcript:` 前缀没有被读出。
+2026-10-18 实测（独立浏览器，未影响线上服务）：5 个 TTS 模型均返回 `STOP` 和音频；3.8 单说话人（`Fola`）、3.8 双说话人（`Rami`/`Fola`，含同页面复用，第二次约 2.4 秒）、2.5 双说话人、3.1 默认音色、3.8 lite 指定 `languageCode` 均成功；2.5 的 “Good morning.” 生成 1.05 秒音频，说明 `## Transcript:` 前缀没有被读出。官方多说话人示例（引导语 + 缩进的说话人行）在 3.8 上生成 3.3 秒双人音频，引导语未被读出。
 
 ## 当前边界
 

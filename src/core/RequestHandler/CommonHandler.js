@@ -91,8 +91,11 @@ class RequestHandler {
         if (channel !== "playground") return null;
         if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
         if (model.includes("抗截断")) return "Playground models do not support anti-truncation.";
-        const unsupported = PlaygroundCatalog.unsupportedReason(FormatConverter.stripModelSuffixes(model));
+        const upstream = FormatConverter.stripModelSuffixes(model);
+        const unsupported = PlaygroundCatalog.unsupportedReason(upstream);
         if (unsupported) return unsupported;
+        if (req.path === "/v1/audio/speech" && !PlaygroundCatalog.isSpeech(upstream))
+            return `${upstream} is not a text-to-speech model; use a TTS model such as pg-gemini-3.8-flash-tts.`;
         const generates =
             method !== undefined
                 ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(method)

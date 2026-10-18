@@ -579,9 +579,8 @@ class ChatCompletionsConverter extends FormatConverter {
                     delta.content = part.text;
                     hasContent = true;
                 } else if (part.inlineData) {
-                    const image = part.inlineData;
-                    delta.content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
-                    this.logger.info("[Adapter] Successfully parsed image from streaming response chunk.");
+                    delta.content = this._inlineDataMarkdown(part.inlineData);
+                    this.logger.info("[Adapter] Successfully parsed media from streaming response chunk.");
                     hasContent = true;
                 } else if (part.functionCall) {
                     // Convert Gemini functionCall to OpenAI tool_calls format
@@ -726,8 +725,7 @@ class ChatCompletionsConverter extends FormatConverter {
                 } else if (part.text) {
                     content += part.text;
                 } else if (part.inlineData) {
-                    const image = part.inlineData;
-                    content += `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+                    content += this._inlineDataMarkdown(part.inlineData);
                 } else if (part.functionCall) {
                     // Convert Gemini functionCall to OpenAI tool_calls format
                     const funcCall = part.functionCall;

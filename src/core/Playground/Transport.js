@@ -121,6 +121,9 @@ class PlaygroundTransport {
         arm(timeoutMs);
         let started = false;
         const realStream = spec.streaming_mode === "real" && spec.path.endsWith(":streamGenerateContent");
+        // Speech streams dozens of short PCM parts that clients cannot play one by one (each becomes
+        // a separate data URI in OpenAI/Claude output); send it as one joined clip instead.
+        const progressive = realStream && !PlaygroundCatalog.isSpeech(model);
         const merged = {};
         let completed = false;
         const headers = () => {
@@ -154,8 +157,8 @@ class PlaygroundTransport {
                 const decoded = WireCodec.decode(raw, model);
                 const chunk = includeThoughts ? decoded : WireCodec.withoutThoughts(decoded);
                 completed ||= !!chunk.candidates?.some(c => c.finishReason) || !!chunk.promptFeedback?.blockReason;
-                if (!realStream) WireCodec.merge(merged, chunk);
-                if (realStream && active()) {
+                if (!progressive) WireCodec.merge(merged, chunk);
+                if (progressive && active()) {
                     headers();
                     queue.enqueue({ data: `data: ${JSON.stringify(chunk)}\n\n`, event_type: "chunk" });
                 }
@@ -180,9 +183,10 @@ class PlaygroundTransport {
                 });
             }
             this.cooldowns.delete(this.cooldownKey(model, authIndex));
-            if (!realStream) {
+            if (!progressive) {
                 headers();
-                queue.enqueue({ data: JSON.stringify(WireCodec.joinAudio(merged)), event_type: "chunk" });
+                const body = JSON.stringify(WireCodec.joinAudio(merged));
+                queue.enqueue({ data: realStream ? `data: ${body}\n\n` : body, event_type: "chunk" });
             }
             queue.enqueue({ type: "STREAM_END" });
         } catch (error) {

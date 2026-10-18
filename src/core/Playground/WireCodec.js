@@ -1,5 +1,6 @@
 /** MakerSuite JSPB protocol adapter. Protocol notes: docs/playground.md. */
 const crypto = require("crypto");
+const PlaygroundCatalog = require("./Catalog");
 const FINISH_REASONS = [
     "FINISH_REASON_UNSPECIFIED",
     "STOP",
@@ -240,8 +241,11 @@ class WireCodec {
             const f = pick(p, key);
             if (f) out[index] = compact([f.name, this.struct(f[valueKey] || {}), f.id]);
         }
-        const speaker = pick(pick(p, "speechMetadata"), "speaker");
-        if (typeof speaker === "string" && speaker) out[40] = [speaker];
+        // speech_metadata: [speaker, voice style], as the 3.8 page sends per speech block.
+        const metadata = pick(p, "speechMetadata");
+        const speaker = typeof metadata?.speaker === "string" && metadata.speaker ? metadata.speaker : null;
+        const style = typeof metadata?.style === "string" && metadata.style.trim() ? metadata.style.trim() : null;
+        if (speaker || style) out[40] = compact([speaker, style]);
         if (p.thought) out[0] = true;
         if (pick(p, "thoughtSignature")) out[14] = pick(p, "thoughtSignature");
         if (pick(p, "executableCode")) out[8] = normalizeText(pick(p, "executableCode").code);
@@ -254,43 +258,47 @@ class WireCodec {
         return [c.parts.map((p, i) => this.part(p, `${where}.parts[${i}]`)), c.role || "user"];
     }
     /**
-     * "Joe: Hi\nJane: Hello" -> [{ speaker: "Joe", text: "Hi" }, { speaker: "Jane", text: "Hello" }].
-     * Lines without a speaker prefix continue the previous turn. Null when text precedes the first turn.
+     * "Direction:\nJoe: Hi\nJane: Hello" -> { preamble: "Direction:", turns: [{ speaker: "Joe", text: "Hi" }, ...] }.
+     * Speaker lines may be indented; other lines continue the previous turn. Null without any turn.
      */
     static speakerTurns(text, speakers) {
         const names = [...speakers].sort((a, b) => b.length - a.length);
+        const preamble = [];
         const turns = [];
         for (const line of text.split("\n")) {
-            const speaker = names.find(name => line.startsWith(`${name}:`));
-            if (speaker) turns.push({ speaker, text: line.slice(speaker.length + 1).trimStart() });
+            const trimmed = line.trimStart();
+            const speaker = names.find(name => trimmed.startsWith(`${name}:`));
+            if (speaker) turns.push({ speaker, text: trimmed.slice(speaker.length + 1).trimStart() });
             else if (turns.length) turns.at(-1).text += `\n${line}`;
-            else if (line.trim()) return null;
+            else preamble.push(line);
         }
         for (const turn of turns) turn.text = turn.text.trimEnd();
-        return turns.length ? turns : null;
+        return turns.length ? { preamble: preamble.join("\n").trim(), turns } : null;
     }
     /**
      * 3.8 TTS models reject multi-speaker requests unless every text part names its speaker
      * (the page sends one part per speech block). Split the public transcript format
-     * ("Joe: ...\nJane: ...") into such parts. 2.5/3.1 models read the transcript as is.
+     * ("Joe: ...\nJane: ...") into such parts. Text before the first turn (as in "TTS the following
+     * conversation between Joe and Jane:" or "Make Joe sound tired:") is a direction, not a line, so
+     * it becomes each turn's voice style. 2.5/3.1 models read the transcript as is.
      */
     static speakerParts(model, body, contents) {
         const multi = pick(pick(pick(body, "generationConfig"), "speechConfig"), "multiSpeakerVoiceConfig");
         const speakers = (pick(multi, "speakerVoiceConfigs") || []).map(s => s?.speaker).filter(Boolean);
-        if (!speakers.length || !/(?:^|-)tts(?:-|$)/.test(model) || /^gemini-(?:2\.5|3\.1)-/.test(model))
-            return contents;
+        if (!speakers.length || !PlaygroundCatalog.usesSpeechBlocks(model)) return contents;
         return contents.map(([parts, role], index) => {
             if (role !== "user") return [parts, role];
             const split = parts.flatMap(part => {
-                if (typeof part[1] !== "string" || part[40]) return [part];
-                const turns = this.speakerTurns(part[1], speakers);
-                if (!turns)
+                if (typeof part[1] !== "string" || part[40]?.[0]) return [part];
+                const parsed = this.speakerTurns(part[1], speakers);
+                if (!parsed)
                     throw invalid(
-                        `contents[${index}]: multi-speaker text must start each turn with a configured speaker name (e.g. "${speakers[0]}: ...")`
+                        `contents[${index}]: multi-speaker text must name a configured speaker on each line (e.g. "${speakers[0]}: ...")`
                     );
-                return turns.map(turn => {
+                const style = [parsed.preamble, part[40]?.[1]].filter(Boolean).join("\n") || null;
+                return parsed.turns.map(turn => {
                     const out = [null, turn.text];
-                    out[40] = [turn.speaker];
+                    out[40] = compact([turn.speaker, style]);
                     return out;
                 });
             });
@@ -532,7 +540,7 @@ class WireCodec {
             /^audio\/(?:l16|pcm)\b/i.test(part?.inlineData?.mimeType || "") && typeof part.inlineData.data === "string";
         for (const candidate of response.candidates || []) {
             const parts = candidate.content?.parts;
-            if (!Array.isArray(parts) || parts.filter(pcm).length < 2) continue;
+            if (!Array.isArray(parts) || !parts.some(pcm)) continue;
             const joined = [];
             const runs = [];
             for (const part of parts) {
@@ -546,6 +554,8 @@ class WireCodec {
                     run.buffers.push(Buffer.from(part.inlineData.data, "base64"));
                     continue;
                 }
+                // The final speech chunk carries an empty text part; it is not output.
+                if (part?.text === "" && Object.keys(part).length === 1) continue;
                 if (pcm(part)) {
                     const copy = { ...part, inlineData: { ...part.inlineData } };
                     runs.push({ buffers: [Buffer.from(part.inlineData.data, "base64")], part: copy });

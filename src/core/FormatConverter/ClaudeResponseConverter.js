@@ -644,7 +644,7 @@ class ClaudeResponseConverter extends FormatConverter {
                     // Image output - convert to markdown image format for streaming
                     ensureTextBlock();
                     // Send image as markdown text delta
-                    const imageMarkdown = `![Generated Image](data:${part.inlineData.mimeType};base64,${part.inlineData.data})`;
+                    const imageMarkdown = this._inlineDataMarkdown(part.inlineData);
                     events.push({
                         delta: { text: imageMarkdown, type: "text_delta" },
                         index: streamState.textBlockIndex,
@@ -808,7 +808,7 @@ class ClaudeResponseConverter extends FormatConverter {
                 } else if (part.inlineData) {
                     // Image output - convert to base64 format
                     content.push({
-                        text: `![Generated Image](data:${part.inlineData.mimeType};base64,${part.inlineData.data})`,
+                        text: this._inlineDataMarkdown(part.inlineData),
                         type: "text",
                     });
                 } else if (part.toolCall || part.toolResponse || part.executableCode || part.codeExecutionResult) {

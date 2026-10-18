@@ -289,11 +289,15 @@ class PlaygroundSession {
         await create.click({ timeout });
         const textView = page.getByRole("radio", { exact: true, name: "Text" });
         const block = page.getByRole("textbox", { exact: true, name: "Speech block text" });
-        // Both page kinds open with a speech block; only 2.5/3.1 also render the view switch.
+        // Both page kinds open with a speech block; only 2.5/3.1 also render the view switch. A page
+        // may briefly show the switch of the previously used model, so fall back to the block.
         await block.first().waitFor({ timeout });
-        if (!(await textView.count())) return block;
-        await textView.click({ timeout });
-        return page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
+        if (!(await textView.isVisible())) return block.first();
+        await textView.click({ timeout }).catch(() => {});
+        const prompt = page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
+        await prompt.or(block).first().waitFor({ timeout });
+        // 2.5/3.1 send the same `## Transcript:` text from either view.
+        return (await prompt.count()) ? prompt : block.first();
     }
 }
 module.exports = PlaygroundSession;

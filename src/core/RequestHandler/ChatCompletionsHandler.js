@@ -355,7 +355,10 @@ class ChatCompletionsHandler extends RetryHandler {
                     : typeof delta?.reasoning_content === "string"
                       ? "reasoning_content"
                       : null;
-            if (!field || !delta[field] || delta.tool_calls || choice.finish_reason || frame.usage) {
+            // Generated media is one markdown data URI that clients only render when complete;
+            // 128-character slices would also add a 20 ms pause per slice (minutes for an image).
+            const media = field === "content" && /!\[Generated (?:Image|Audio)\]\(data:/.test(delta.content);
+            if (!field || !delta[field] || media || delta.tool_calls || choice.finish_reason || frame.usage) {
                 if (!(await write(frame))) return false;
                 continue;
             }

@@ -881,10 +881,44 @@ test("Playground encodes speechConfig and matches the 2.5/3.1 transcript prefix"
     );
     assert.equal(
         WireCodec.speakerTurns("Joe: a\nmore\n\nJane:b", ["Jane", "Joe"])
-            .map(t => `${t.speaker}=${t.text}`)
+            .turns.map(t => `${t.speaker}=${t.text}`)
             .join("|"),
         "Joe=a\nmore|Jane=b"
     );
+    // The documented example: a direction line, then indented turns. The direction is the voice style.
+    const documented = WireCodec.encode("gemini-3.8-flash-tts", {
+        contents: [
+            {
+                parts: [
+                    {
+                        text: "TTS the following conversation between Joe and Jane:\n    Joe: How's it going?\n    Jane: Not too bad.",
+                    },
+                ],
+            },
+        ],
+        generationConfig: {
+            speechConfig: {
+                multiSpeakerVoiceConfig: {
+                    speakerVoiceConfigs: [
+                        { speaker: "Joe", voiceConfig: voice("Rami") },
+                        { speaker: "Jane", voiceConfig: voice("Fola") },
+                    ],
+                },
+            },
+        },
+    });
+    assert.deepEqual(
+        documented[1][0][0].map(part => [part[1], part[40]]),
+        [
+            ["How's it going?", ["Joe", "TTS the following conversation between Joe and Jane:"]],
+            ["Not too bad.", ["Jane", "TTS the following conversation between Joe and Jane:"]],
+        ]
+    );
+    // A single block's voice style: [speaker = null, style], as the page sends.
+    const styled = WireCodec.encode("gemini-3.8-flash-tts", {
+        contents: [{ parts: [{ speechMetadata: { style: " Calm. " }, text: "Hi" }] }],
+    });
+    assert.equal(JSON.stringify(styled[1][0][0][0][40]), JSON.stringify([null, "Calm."]));
     const withMetadata = WireCodec.encode("gemini-3.8-flash-tts", {
         contents: [{ parts: [{ speechMetadata: { speaker: "Joe" }, text: "Joe: kept" }] }],
         generationConfig: {
@@ -905,7 +939,7 @@ test("Playground encodes speechConfig and matches the 2.5/3.1 transcript prefix"
                 contents: [{ parts: [{ text: "Hi" }] }],
                 generationConfig: multiConfig,
             }),
-        error => error.status === 400 && /speaker name/.test(error.message)
+        error => error.status === 400 && /configured speaker/.test(error.message)
     );
     // 2.5/3.1 read the public transcript format as is.
     const classic = WireCodec.encode("gemini-2.5-flash-preview-tts", {
@@ -936,6 +970,73 @@ test("Playground encodes speechConfig and matches the 2.5/3.1 transcript prefix"
     const other = WireCodec.encode("gemini-2.5-flash-preview-tts", { contents: [{ parts: [{ text: "Hi" }] }] });
     WireCodec.alignTranscript(other, [other[0], [[[[null, "## Transcript:\nBye"]], "user"]]]);
     assert.notEqual(WireCodec.hash(other), WireCodec.hash([other[0], [[[[null, "## Transcript:\nBye"]], "user"]]]));
+});
+
+test("joinAudio drops the empty text part that ends a speech stream", () => {
+    const { WireCodec } = require("../src/core/Playground/WireCodec");
+    const audio = { inlineData: { data: "AQA=", mimeType: "audio/l16; rate=24000" } };
+    const response = { candidates: [{ content: { parts: [audio, { text: "" }] } }] };
+    assert.deepEqual(WireCodec.joinAudio(response).candidates[0].content.parts, [audio]);
+    // Text responses keep their parts untouched.
+    const text = { candidates: [{ content: { parts: [{ text: "" }, { text: "a" }] } }] };
+    assert.equal(WireCodec.joinAudio(text).candidates[0].content.parts.length, 2);
+});
+
+test("speech output in chat formats is a playable WAV data URI, sent whole by fake streaming", async () => {
+    const FormatConverter = new (require("../src/core/FormatConverter"))(logger);
+    const pcm = Buffer.from([1, 0, 2, 0]);
+    const markdown = FormatConverter._inlineDataMarkdown({
+        data: pcm.toString("base64"),
+        mimeType: "audio/l16; rate=24000; channels=1",
+    });
+    const match = markdown.match(/^!\[Generated Audio\]\(data:audio\/wav;base64,(.+)\)$/);
+    assert.ok(match, markdown);
+    const wav = Buffer.from(match[1], "base64");
+    assert.equal(wav.subarray(0, 4).toString(), "RIFF");
+    assert.deepEqual(wav.subarray(44), pcm);
+    assert.equal(
+        FormatConverter._inlineDataMarkdown({ data: "eA==", mimeType: "image/png" }),
+        "![Generated Image](data:image/png;base64,eA==)"
+    );
+
+    const handler = Object.create(RequestHandler.prototype);
+    handler._isResponseWritable = () => true;
+    const res = new FakeResponse();
+    const frame = content => `data: ${JSON.stringify({ choices: [{ delta: { content }, index: 0 }] })}\n\n`;
+    const media = `![Generated Audio](data:audio/wav;base64,${"A".repeat(1000)})`;
+    const started = Date.now();
+    await handler._writeOpenAIFakeStreamChunks(res, frame(media) + frame("x".repeat(300)));
+    const frames = res.output.split("\n\n").filter(Boolean);
+    // The media frame stays whole; text is still split into 128-character slices.
+    assert.equal(frames.length, 4);
+    assert.equal(JSON.parse(frames[0].slice(6)).choices[0].delta.content, media);
+    assert.ok(Date.now() - started < 500);
+});
+
+test("the speech endpoint rejects non-TTS pg models and sends instructions as the 3.8 voice style", t => {
+    const h = harness(t);
+    const reason = model =>
+        h.handler._unsupportedPlaygroundRequest({
+            body: { input: "hi", model },
+            method: "POST",
+            path: "/v1/audio/speech",
+        });
+    assert.match(reason("pg-gemini-4-argon"), /not a text-to-speech model/);
+    assert.equal(reason("pg-gemini-2.5-flash-preview-tts"), null);
+    assert.equal(reason("build-gemini-4-argon"), null);
+
+    const SpeechHandler = require("../src/core/RequestHandler/SpeechHandler");
+    const body = { input: "Have a nice day", instructions: "Cheerful", model: "pg-gemini-3.8-flash-tts" };
+    assert.deepEqual(SpeechHandler.buildGeminiRequest(body, { voiceStyle: true }).request.contents[0].parts, [
+        { speechMetadata: { style: "Cheerful" }, text: "Have a nice day" },
+    ]);
+    assert.deepEqual(SpeechHandler.buildGeminiRequest(body).request.contents[0].parts, [
+        { text: "Cheerful: Have a nice day" },
+    ]);
+    const PlaygroundCatalog = require("../src/core/Playground/Catalog");
+    assert.equal(PlaygroundCatalog.usesSpeechBlocks("gemini-3.8-flash-lite-tts"), true);
+    assert.equal(PlaygroundCatalog.usesSpeechBlocks("models/gemini-3.1-flash-tts-preview"), false);
+    assert.equal(PlaygroundCatalog.usesSpeechBlocks("gemini-4-argon"), false);
 });
 
 test("joinAudio joins only consecutive PCM parts of one format", () => {

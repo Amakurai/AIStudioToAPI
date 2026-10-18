@@ -132,6 +132,32 @@ test("native stream and buffered requests get Gemini output via the existing que
     }
 });
 
+test("real-streamed speech is sent as one joined clip, not one event per PCM part", async t => {
+    const h = harness(t, "real");
+    h.spec.path = "/v1beta/models/gemini-3.8-flash-tts:streamGenerateContent";
+    const audioChunk = (bytes, finish) => {
+        const part = [];
+        part[2] = ["audio/l16; rate=24000; channels=1", Buffer.from(bytes).toString("base64")];
+        // chunk = [candidates], candidate = [[parts, role], finishReason]
+        return [[[[[part], "model"], ...(finish ? [1] : [])]]];
+    };
+    h.router.sessions.set(h.context, {
+        async request(_model, _body, { onData }) {
+            onData(JSON.stringify([[audioChunk([1, 0]), audioChunk([2, 0]), audioChunk([3, 0], true)]]));
+        },
+    });
+    h.router.forward(h.spec, 1);
+    const headers = await h.queue.dequeue();
+    assert.equal(headers.status, 200, headers.message);
+    assert.equal(headers.headers["content-type"], "text/event-stream");
+    const chunk = await h.queue.dequeue();
+    assert.ok(chunk.data.startsWith("data: "));
+    const parts = JSON.parse(chunk.data.slice(6)).candidates[0].content.parts;
+    assert.equal(parts.length, 1);
+    assert.deepEqual(Buffer.from(parts[0].inlineData.data, "base64"), Buffer.from([1, 0, 2, 0, 3, 0]));
+    assert.equal((await h.queue.dequeue()).type, "STREAM_END");
+});
+
 test("cancellation and timeouts abort Playground without returning late content", async t => {
     const h = harness(t);
     let aborted = false;

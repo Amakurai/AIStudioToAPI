@@ -7,6 +7,7 @@
 
 const AntiTruncation = require("../AntiTruncation");
 const ModelChannel = require("../ModelChannel");
+const { playableInlineData } = require("../../utils/Audio");
 
 const axios = require("axios");
 const mime = require("mime-types");
@@ -297,6 +298,13 @@ class FormatConverter {
             { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold },
             { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold },
         ];
+    }
+
+    /** Markdown for generated media; raw PCM speech becomes a playable WAV data URI. */
+    _inlineDataMarkdown(inlineData) {
+        const { data, mimeType } = playableInlineData(inlineData);
+        const label = /^audio\//i.test(String(mimeType || "")) ? "Generated Audio" : "Generated Image";
+        return `![${label}](data:${mimeType};base64,${data})`;
     }
 
     normalizeImageUrl(imageSource) {
