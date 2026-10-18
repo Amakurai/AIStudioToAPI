@@ -26,8 +26,20 @@ class PlaygroundTransport {
     get enabled() {
         return !!this.handler.config.playgroundEnabled;
     }
+    /** Upstream models plus an anti-truncation alias for each base model Playground serves. */
     models() {
-        return this.enabled ? this.catalog.models() : [];
+        if (!this.enabled) return [];
+        const models = this.catalog.models();
+        const aliases = models
+            .filter(model => AntiTruncation.baseModel(`${model.name.replace(/^models\//, "")}-抗截断`))
+            .map(model => ({
+                ...model,
+                description:
+                    "Segmented tool text transport with bounded continuation and repair on Playground. Ordinary text output by default; text-only, no client tools.",
+                displayName: `${model.displayName || model.name.replace(/^models\//, "")} 抗截断`,
+                name: `${model.name}-抗截断`,
+            }));
+        return [...models, ...aliases];
     }
     cooldownKey(model, authIndex) {
         const name = this.handler.authSource?.accountNameMap?.get(authIndex);
@@ -61,12 +73,13 @@ class PlaygroundTransport {
         if (!entry || entry.queue.closed) return;
         const match = spec.path?.match(/\/models\/([^/:]+):(generateContent|streamGenerateContent)$/);
         // Public routes reject these up front; reject here too instead of reaching Build or the page.
+        // Anti-truncation aliases never get here: AntiTruncation.forward sends base-model rounds.
         const rejection = !this.enabled
             ? "The Playground channel is disabled (PLAYGROUND_ENABLED=false)."
             : !match
               ? "Playground models only support generateContent and streamGenerateContent."
               : AntiTruncation.baseModel(match[1])
-                ? "Playground models do not support anti-truncation."
+                ? "Anti-truncation aliases must be sent through the anti-truncation transport."
                 : PlaygroundCatalog.unsupportedReason(decodeURIComponentSafe(match[1]));
         if (rejection) {
             entry.queue.enqueue({ event_type: "error", message: rejection, retryable: false, status: 400 });

@@ -328,8 +328,11 @@ test("the Playground catalog keeps configured models, adds discovered ones once 
     h.router.catalog.discover(raw);
     h.router.catalog.discover(raw);
     const names = h.router.models().map(m => m.name);
-    assert.deepEqual(names, ["models/gemini-4-argon", "models/gemini-new"]);
+    // Supported base models also get their anti-truncation alias, with the base model's limits.
+    assert.deepEqual(names, ["models/gemini-4-argon", "models/gemini-new", "models/gemini-4-argon-抗截断"]);
     assert.equal(h.router.models()[0].outputTokenLimit, 100);
+    assert.equal(h.router.models()[2].outputTokenLimit, 100);
+    assert.equal(h.router.models()[2].displayName, "Argon 抗截断");
     // Build's list is never touched by Playground discovery.
     assert.deepEqual(
         h.handler.config.modelList.map(m => m.name),

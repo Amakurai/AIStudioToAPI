@@ -55,8 +55,9 @@ class AntiTruncation {
         } catch {
             return null;
         }
-        // Anti-truncation is a Build feature; the explicit `build-` channel prefix is optional.
-        const match = decoded.match(/^(?:build-)?(gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/);
+        // Both channels carry the same aliases (`build-` is optional, `pg-` selects Playground);
+        // the channel is resolved from the prefix, this only returns the upstream model.
+        const match = decoded.match(/^(?:build-|pg-)?(gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/);
         return match ? match[1] : null;
     }
 

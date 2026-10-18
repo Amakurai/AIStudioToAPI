@@ -192,7 +192,7 @@ test("a Build error is returned as is and never retried on Playground", async t 
     assert.equal(h.playground.length, 0);
 });
 
-test("Build anti-truncation accepts the build- prefix; Playground never activates it", () => {
+test("anti-truncation aliases activate on both channels and keep their channel", () => {
     const handler = Object.create(RequestHandler.prototype);
     const spec = {
         is_generative: true,
@@ -209,16 +209,18 @@ test("Build anti-truncation accepts the build- prefix; Playground never activate
         path: "/v1beta/models/pg-gemini-4-argon-抗截断:generateContent",
         request_id: "r",
     };
-    // Never throws here: an exception would escape some handlers as an unhandled rejection.
     handler._initializeProxyRequestAttempt(pg);
+    assert.equal(pg.path, "/v1beta/models/gemini-4-argon:generateContent");
     assert.equal(pg.channel, "playground");
-    assert.equal(pg.anti_truncation, undefined);
+    assert.equal(pg.anti_truncation, true);
+    assert.equal(pg.streaming_mode, "fake");
 });
 
-test("the Playground transport itself rejects anti-truncation and a disabled channel", async t => {
+test("the Playground transport itself rejects alias paths and a disabled channel", async t => {
     const PlaygroundTransport = require("../src/core/Playground/Transport");
     for (const [enabled, model, pattern] of [
-        [true, "gemini-4-argon-抗截断", /anti-truncation/],
+        // Aliases are sent as base-model rounds; a raw alias path must never reach the page.
+        [true, "gemini-4-argon-抗截断", /anti-truncation transport/],
         [false, "gemini-4-argon", /disabled/],
     ]) {
         const registry = new ConnectionRegistry(logger);
@@ -283,10 +285,14 @@ test("pg-* requests other than content generation are rejected up front", t => {
     assert.equal(reason("POST", "/v1/responses", { model: "pg-gemini-4-argon" }), null);
     assert.equal(reason("POST", "/v1beta/models/pg-gemini-4-argon:streamGenerateContent"), null);
     assert.equal(reason("POST", "/v1/chat/completions", { model: "build-gemini-4-argon-抗截断" }), null);
-    assert.match(reason("POST", "/v1/chat/completions", { model: "pg-gemini-4-argon-抗截断" }), /anti-truncation/);
-    assert.match(
+    assert.equal(reason("POST", "/v1/chat/completions", { model: "pg-gemini-4-argon-抗截断" }), null);
+    assert.equal(
         reason("POST", `/v1beta/models/pg-gemini-4-argon${encodeURIComponent("-抗截断")}:generateContent`),
-        /anti-truncation/
+        null
+    );
+    assert.match(
+        reason("POST", `/v1beta/models/pg-gemini-4-argon${encodeURIComponent("-抗截断")}:countTokens`),
+        /only support content generation/
     );
     assert.match(reason("POST", "/v1beta/models/pg-gemini-4-argon:countTokens"), /only support content generation/);
     assert.match(reason("POST", "/v1/messages/count_tokens", { model: "pg-gemini-4-argon" }), /only support/);
@@ -300,9 +306,13 @@ test("each channel lists its own models with its own prefix", t => {
     const h = harness(t);
     const names = channel => h.handler.channelModels()[channel].map(model => model.name);
     assert.deepEqual(names("build"), ["models/build-gemini-3.8-flash", "models/build-gemini-4-argon"]);
-    assert.deepEqual(names("playground"), ["models/pg-gemini-4-argon"]);
+    assert.deepEqual(names("playground"), ["models/pg-gemini-4-argon", "models/pg-gemini-4-argon-抗截断"]);
     h.handler.playground.catalog.discover([[["models/gemini-new", null, "", "New", "", 1, 1, ["generateContent"]]]]);
-    assert.deepEqual(names("playground"), ["models/pg-gemini-4-argon", "models/pg-gemini-new"]);
+    assert.deepEqual(names("playground"), [
+        "models/pg-gemini-4-argon",
+        "models/pg-gemini-new",
+        "models/pg-gemini-4-argon-抗截断",
+    ]);
     assert.equal(names("build").length, 2);
     h.handler.config.playgroundEnabled = false;
     assert.deepEqual(names("playground"), []);
@@ -375,6 +385,87 @@ test("a failed Playground request never triggers a Build account switch", async 
     assert.deepEqual(h.switches, []);
     assert.deepEqual(h.cooled, []);
     assert.equal(h.handler.authSwitcher.failureCount, 0);
+});
+
+// One append_output turn from the Playground upstream.
+const segment = (seq, text, done) => ({
+    candidates: [
+        {
+            content: { parts: [{ functionCall: { args: { done, seq, text }, name: "append_output" } }], role: "model" },
+            finishReason: "STOP",
+        },
+    ],
+    usageMetadata: { candidatesTokenCount: 5, promptTokenCount: 10, totalTokenCount: 15 },
+});
+
+function sendSegment(queue, reply) {
+    queue.enqueue({ event_type: "response_headers", status: 200 });
+    queue.enqueue({ data: JSON.stringify(reply), event_type: "chunk" });
+    queue.enqueue({ type: "STREAM_END" });
+}
+
+const pgAlias = api =>
+    api === "gemini" ? `pg-gemini-4-argon${encodeURIComponent("-抗截断")}` : "pg-gemini-4-argon-抗截断";
+
+test("pg anti-truncation aliases run the segment protocol on Playground across all public APIs", async t => {
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const h = poolHarness(t);
+            const registry = h.handler.connectionRegistry;
+            const rounds = [];
+            h.handler.playground.forward = spec => {
+                rounds.push({ ...spec, queueChannel: registry.messageQueues.get(spec.request_id).channel });
+                sendSegment(
+                    registry.messageQueues.get(spec.request_id).queue,
+                    rounds.length === 1 ? segment(1, "第一段，", false) : segment(2, "第二段。", true)
+                );
+            };
+            const req = apiRequest(api, pgAlias(api));
+            const res = new FakeResponse();
+            await h.handler.forRequest(req)[method](req, res);
+            assert.equal(res.statusCode, 200, res.output);
+            assert.ok(res.output.includes("第一段，") && res.output.includes("第二段。"), res.output);
+            assert.ok(!res.output.includes("append_output"), "internal tools stay hidden");
+            assert.equal(rounds.length, 2);
+            for (const round of rounds) {
+                assert.equal(round.path, "/v1beta/models/gemini-4-argon:generateContent");
+                assert.equal(round.channel, "playground");
+                assert.equal(round.queueChannel, "playground");
+                assert.equal(round.anti_truncation, false);
+                assert.equal(JSON.parse(round.body).tools[0].functionDeclarations[0].name, "append_output");
+            }
+            const acknowledged = JSON.parse(rounds[1].body).contents.flatMap(turn => turn.parts);
+            assert.ok(acknowledged.some(part => part.functionResponse?.name === "append_output"));
+            assert.equal(h.build.length, 0, "no round reaches a Build page");
+            assert.equal(h.handler.authSwitcher.usageCount, 0);
+            assert.equal(registry.messageQueues.size, 0);
+        });
+    }
+});
+
+test("a Playground 429 mid-answer retries only that round on another account", async t => {
+    const h = poolHarness(t);
+    const registry = h.handler.connectionRegistry;
+    const accounts = [];
+    h.handler.playground.forward = (spec, authIndex) => {
+        accounts.push(authIndex);
+        const queue = registry.messageQueues.get(spec.request_id).queue;
+        if (accounts.length === 1) sendSegment(queue, segment(1, "前文，", false));
+        else if (accounts.length === 2) queue.enqueue({ event_type: "error", message: "exhausted", status: 429 });
+        else sendSegment(queue, segment(2, "后文。", true));
+    };
+    const req = apiRequest("openai", "pg-gemini-4-argon-抗截断");
+    const res = new FakeResponse();
+    await h.handler.forRequest(req).processOpenAIRequest(req, res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(JSON.parse(res.output).choices[0].message.content, "前文，后文。");
+    assert.equal(accounts.length, 3);
+    assert.equal(accounts[0], accounts[1]);
+    assert.notEqual(accounts[1], accounts[2]);
+    assert.deepEqual(h.cooled, []);
+    assert.deepEqual(h.switches, []);
+    assert.equal(h.handler.authSwitcher.usageCount, 0);
+    assert.equal(h.build.length, 0);
 });
 
 test("Build requests still count usage and Build is the default handler", async t => {
@@ -658,7 +749,13 @@ test("Playground does not list or accept transcription, music and agent models",
     ]);
     assert.deepEqual(
         h.handler.channelModels().playground.map(m => m.name),
-        ["models/pg-gemini-4-argon", "models/pg-gemini-3.8-flash", "models/pg-gemini-3.8-flash-tts"]
+        [
+            "models/pg-gemini-4-argon",
+            "models/pg-gemini-3.8-flash",
+            "models/pg-gemini-3.8-flash-tts",
+            "models/pg-gemini-4-argon-抗截断",
+            "models/pg-gemini-3.8-flash-抗截断",
+        ]
     );
     const reason = model =>
         h.handler._unsupportedPlaygroundRequest({

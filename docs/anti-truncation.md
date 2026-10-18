@@ -5,10 +5,13 @@
 - `build-gemini-3.7-flash-抗截断`
 - `build-gemini-3.8-flash-抗截断`
 - `build-gemini-4-argon-抗截断`
+- `pg-gemini-3.7-flash-抗截断`
+- `pg-gemini-3.8-flash-抗截断`
+- `pg-gemini-4-argon-抗截断`
 
-抗截断只属于 Build 链路，`build-` 前缀可省略；Playground 的 `pg-` 模型不提供抗截断，请求会返回 400。
+Build 与 Playground 两条链路都支持，前缀决定链路：`build-` 前缀可省略，`pg-` 前缀走 Playground。两条链路使用同一套分段协议，互不回退。
 
-仅这三个精确别名启用；原模型及其他模型保持原有行为。请求头不能给其他模型开启此功能。模型列表会显示这三个别名，网关请求上游时自动去掉后缀。中文原生接口路径可以使用 URL 编码；不与搜索、代码执行、思考等级等其他模型后缀组合。
+仅这三个基础模型的精确别名启用；原模型及其他模型保持原有行为。请求头不能给其他模型开启此功能。模型列表会显示这些别名：Build 的别名来自 `configs/models.json`，Playground 的别名按 Playground 目录中实际存在的基础模型自动生成（沿用基础模型的 token 上限），网关请求上游时自动去掉后缀。中文原生接口路径可以使用 URL 编码；不与搜索、代码执行、思考等级等其他模型后缀组合。
 
 ```json
 {
@@ -35,6 +38,15 @@ Argon 的模型 ID 来自 AI Studio 界面；模型列表暂不填未经确认�
 历史中的模型思考内容（如 Claude 回传的 thinking 块，转换后为 `thought: true` 的部分）会在发送前移除，不再导致多轮请求被拒；文本部分上的 `thoughtSignature` 原样保留。只含思考内容的模型轮次整轮移除。
 
 工具历史保留真实调用 ID、完整模型回复和 thought signature，参见 [Gemini 官方说明](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)。不建立全局任务读取接口，不支持跨请求或断线后的会话恢复。
+
+## Playground 链路
+
+`pg-*-抗截断` 与 Build 别名共用上述分段协议和全部限制，区别只在每一轮上游调用的发送方式：
+
+- 每轮内部调用都是一次普通的 Playground `generateContent`（非流式）：在该账号的专用 Playground 页面取得原生签名后发送，同一账号内串行。因此每轮会额外增加取得签名的延迟（通常数秒），多段回答的总耗时高于 Build。
+- 账号规则沿用 Playground：不计入 `SWITCH_ON_USES` 和 `FAILURE_THRESHOLD`；某一轮遇到 429/503 等可换号状态时，只把这一轮换到尚未尝试的其他就绪账号重发，已确认的正文和续写历史保留，不冷却、不切换或重排 Build 账号池。没有可用账号时按上文返回未完成结果（首段确认前则返回错误）。
+- 内部调用不会发往 Build 页面；取消时只停止 Playground 页面上的当前一轮。
+- 安全设置与普通 `pg-` 请求相同：未显式指定时使用 `SAFETY_SETTINGS_THRESHOLD`（默认 `OFF`）覆盖四个可配置类别。`PROHIBITED_CONTENT` 等不可配置的拦截仍按“明确审核拦截”处理。
 
 ## 流式输出与限制
 

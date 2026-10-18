@@ -5,6 +5,7 @@
  * Author: Ellinav, iBenzene, bbbugg
  */
 
+const AntiTruncation = require("../AntiTruncation");
 const AuthSwitcher = require("../../auth/AuthSwitcher");
 const FormatConverter = require("../FormatConverter");
 const ModelChannel = require("../ModelChannel");
@@ -83,15 +84,14 @@ class RequestHandler {
 
     /**
      * Requests for a `pg-` model are rejected up front unless they generate content: Playground has
-     * no anti-truncation, token counting, embeddings, uploads or model lookup.
+     * no token counting, embeddings, uploads or model lookup.
      * @returns {string|null} Reason for rejecting the request, or null when it may proceed.
      */
     _unsupportedPlaygroundRequest(req) {
         const { channel, method, model } = this._requestModel(req);
         if (channel !== "playground") return null;
         if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
-        if (model.includes("抗截断")) return "Playground models do not support anti-truncation.";
-        const upstream = FormatConverter.stripModelSuffixes(model);
+        const upstream = AntiTruncation.baseModel(model) || FormatConverter.stripModelSuffixes(model);
         const unsupported = PlaygroundCatalog.unsupportedReason(upstream);
         if (unsupported) return unsupported;
         if (req.path === "/v1/audio/speech" && !PlaygroundCatalog.isSpeech(upstream))
@@ -120,7 +120,11 @@ class RequestHandler {
     forRequest(req) {
         const { channel, model } = this._requestModel(req);
         if (channel !== "playground") return this;
-        return playgroundRequestScope(this, FormatConverter.stripModelSuffixes(model));
+        // Cooldowns are kept per upstream model, so an anti-truncation alias uses its base model.
+        return playgroundRequestScope(
+            this,
+            AntiTruncation.baseModel(model) || FormatConverter.stripModelSuffixes(model)
+        );
     }
 
     _getUsageStatsService() {

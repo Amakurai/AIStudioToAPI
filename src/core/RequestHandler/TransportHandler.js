@@ -149,7 +149,7 @@ class TransportHandler extends RequestHandler {
     _initializeProxyRequestAttempt(proxyRequest) {
         this._resolveProxyRequestChannel(proxyRequest);
         const match = proxyRequest.path?.match(/^(.*\/models\/)([^/:]+)(:[^?]+.*)$/);
-        const baseModel = proxyRequest.channel === "build" && match && AntiTruncation.baseModel(match[2]);
+        const baseModel = match && AntiTruncation.baseModel(match[2]);
         if (baseModel) {
             proxyRequest.path = `${match[1]}${baseModel}${match[3]}`;
             if (proxyRequest.body && match[3] === ":countTokens") {

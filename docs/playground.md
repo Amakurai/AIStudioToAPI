@@ -7,7 +7,7 @@
 | 前缀     | 链路           | 模型列表来源                                           | 抗截断                                   |
 | -------- | -------------- | ------------------------------------------------------ | ---------------------------------------- |
 | `build-` | Build App 代理 | `configs/models.json`                                  | 支持（`build-gemini-4-argon-抗截断` 等） |
-| `pg-`    | Playground     | `configs/playground-models.json` + Playground 原生目录 | 不支持                                   |
+| `pg-`    | Playground     | `configs/playground-models.json` + Playground 原生目录 | 支持（`pg-gemini-4-argon-抗截断` 等）    |
 
 - 模型名前缀唯一决定链路，请求进入时剥掉前缀再发往上游，例如 `build-gemini-4-argon` 与 `pg-gemini-4-argon` 是同一个上游模型的两条链路。思考等级、流式模式和内置工具后缀照常叠加在后面（如 `pg-gemini-4-argon-high`）。
 - 两条链路互不回退：Build 的 403、404、429、400 等错误直接按 Build 原有的重试与换号流程处理，不会改走 Playground；Playground 的错误同样只在 Playground 内处理。
@@ -15,7 +15,8 @@
 - `GET /v1/models` 与 `GET /v1beta/models` 分别列出 `build-*` 与 `pg-*` 模型，`upstream_channel`/`upstreamChannel` 字段为 `build` 或 `playground`。控制台“模型通道”按链路分组展示。
 - Playground 页面加载时读取原生模型目录，可生成内容的模型加入 Playground 列表（不影响 Build 列表），token 上限覆盖配置值，并保存到 `data/playground-models.json`，重启后立即恢复。旧版 `data/model-routes.json` 中保存的目录会在首次启动时读取一次，其中的通道学习记录不再使用。
 - 转写（transcribe）、Lyria 音乐、Omni、Deep Research 和 Antigravity 等模型在 Playground 中不是聊天输入页面，适配层无法驱动，实测会在 95–190 秒后超时并占住该账号的 Playground 页面。这些模型不列入 `pg-` 列表，请求在本地返回 400，请改用对应的 `build-` 模型。语音合成（TTS）模型走专用的语音页面，见下文“语音合成（TTS）”。
-- `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`，TTS 模型另支持 OpenAI `/v1/audio/speech`）。抗截断、`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
+- `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`，TTS 模型另支持 OpenAI `/v1/audio/speech`）。`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
+- 抗截断：`pg-gemini-3.7-flash-抗截断`、`pg-gemini-3.8-flash-抗截断`、`pg-gemini-4-argon-抗截断` 使用与 Build 相同的分段工具输出协议，每轮内部调用都是一次 Playground 生成；模型列表只为 Playground 目录中存在的基础模型列出别名。详见 [抗截断模型说明](anti-truncation.md#playground-链路)。
 
 ## 账号与并发
 
@@ -91,3 +92,5 @@ Build 抗截断模型的 OpenAI 输出使用独立配置 `ANTI_TRUNCATION_STREAM
 2026-10-13 部署验证：Argon 的 OpenAI 真流式请求与抗截断请求返回成功；真实函数调用及工具结果回传完成；120 行、13,814 字符的抗截断输出与校验原文 SHA-256 完全一致（约 84 秒）。原有 `gemini-3.8-flash` 生成请求亦返回成功。离线回归共 274 项通过，源码 ESLint、样式检查及前端构建通过（保留既有 Vue `v-html` 和构建体积警告）。
 
 优化后验证：279 项离线回归通过；真实工具调用与回传在同一页面内完成，没有重新导航。相同 120 行、13,814 字符样本仍逐字一致；本次首段时间为 20.1 秒（此前 81.7 秒），总耗时 74.8 秒（此前 83.8 秒）。这是不同账号上的单次观测，不代表固定延迟。新路由实例从磁盘将模型列表从 35 项恢复到 41 项，无需联网生成。另覆盖首次权限失败换号、账号隔离、冷却和过期记录，以及真流式不累积完整回复。
+
+2026-10-18 Playground 抗截断部署验证：`pg-gemini-4-argon-抗截断` 经 OpenAI 真流式请求（`max_tokens=4096`）逐字复制 120 行、13,814 字符样本，共 4 段 4 轮上游调用，结束原因 `stop`，与原文 SHA-256 完全一致；首段 23.1 秒，总耗时 102.0 秒（单次观测，不代表固定延迟）。全部内部调用均走 Playground 页面，未发往 Build。

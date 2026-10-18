@@ -1,4 +1,4 @@
-/* Explicit real-model test: node tests/duplex-live.js --run [--upstream] [--model=gemini-3.8-flash] */
+/* Explicit real-model test: node tests/duplex-live.js --run [--upstream] [--channel=pg] [--model=gemini-3.8-flash] */
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
@@ -12,6 +12,11 @@ async function main() {
     const model = args.find(arg => arg.startsWith("--model="))?.slice(8) || "gemini-3.8-flash";
     if (!["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"].includes(model))
         throw new Error("Unexpected test model");
+    // Playground signs every round in its page, so a multi-segment answer needs more time.
+    const channel = args.find(arg => arg.startsWith("--channel="))?.slice(10) || "build";
+    if (!["build", "pg"].includes(channel)) throw new Error("Unexpected channel");
+    const publicModel = `${channel}-${model}`;
+    const timeoutMs = channel === "pg" ? 600000 : 300000;
     const root = path.join(__dirname, "..");
     const env = require("dotenv").parse(fs.readFileSync(path.join(root, ".env")));
     const key = (env.API_KEYS || "123456")
@@ -35,7 +40,7 @@ async function main() {
             body: JSON.stringify(body),
             headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", ...headers },
             method: "POST",
-            signal: AbortSignal.timeout(Math.max(1, 300000 - (Date.now() - start))),
+            signal: AbortSignal.timeout(Math.max(1, timeoutMs - (Date.now() - start))),
         });
         if (!response.ok) {
             await response.body?.cancel();
@@ -43,7 +48,7 @@ async function main() {
         }
         return response;
     };
-    console.log(JSON.stringify({ event: "start", expectedCharacters: [...expected].length, model, upstream }));
+    console.log(JSON.stringify({ channel, event: "start", expectedCharacters: [...expected].length, model, upstream }));
     if (upstream) {
         const result = await Duplex.generate(
             {
@@ -51,7 +56,7 @@ async function main() {
                 generationConfig: { maxOutputTokens: 4096, temperature: 0 },
             },
             async body => {
-                const response = await (await request(`/v1beta/models/${model}:generateContent`, body)).json();
+                const response = await (await request(`/v1beta/models/${publicModel}:generateContent`, body)).json();
                 const candidate = response.candidates?.[0];
                 const call = candidate?.content?.parts?.find(part => part.functionCall)?.functionCall;
                 const info = {
@@ -78,7 +83,7 @@ async function main() {
             {
                 max_tokens: 4096,
                 messages: [{ content: prompt, role: "user" }],
-                model: model + "-抗截断",
+                model: publicModel + "-抗截断",
                 stream: true,
                 temperature: 0,
             },
@@ -125,6 +130,7 @@ async function main() {
         activation: "model_suffix",
         actualCharacters: [...text].length,
         actualHash: hash(text),
+        channel,
         elapsedMs: Date.now() - start,
         exactMatch: text === expected,
         expectedCharacters: [...expected].length,
@@ -139,7 +145,7 @@ async function main() {
     };
     const dir = path.join(root, "artifacts/anti-truncation/duplex");
     fs.mkdirSync(dir, { recursive: true });
-    const stem = `${upstream ? "local-upstream" : toolOutput ? "deployed-client" : "deployed-auto"}-${model}`;
+    const stem = `${upstream ? "local-upstream" : toolOutput ? "deployed-client" : "deployed-auto"}-${channel === "pg" ? publicModel : model}`;
     fs.writeFileSync(path.join(dir, `${stem}-actual.txt`), text);
     fs.writeFileSync(path.join(dir, `${stem}-summary.json`), JSON.stringify(summary, null, 2) + "\n");
     console.log(JSON.stringify({ event: "result", ...summary }));
