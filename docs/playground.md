@@ -14,8 +14,8 @@
 - 不带前缀的旧模型名（如 `gemini-3.8-flash`）仍按 Build 处理，兼容现有客户端，但不再出现在模型列表中。
 - `GET /v1/models` 与 `GET /v1beta/models` 分别列出 `build-*` 与 `pg-*` 模型，`upstream_channel`/`upstreamChannel` 字段为 `build` 或 `playground`。控制台“模型通道”按链路分组展示。
 - Playground 页面加载时读取原生模型目录，可生成内容的模型加入 Playground 列表（不影响 Build 列表），token 上限覆盖配置值，并保存到 `data/playground-models.json`，重启后立即恢复。旧版 `data/model-routes.json` 中保存的目录会在首次启动时读取一次，其中的通道学习记录不再使用。
-- 语音合成（TTS）、转写（transcribe）、Lyria 音乐、Omni、Deep Research 和 Antigravity 等模型在 Playground 中不是聊天输入页面，适配层无法驱动，实测会在 95–190 秒后超时并占住该账号的 Playground 页面。这些模型不列入 `pg-` 列表，请求在本地返回 400，请改用对应的 `build-` 模型（Build 的 5 个 TTS 模型已实测可用）。
-- `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`）。抗截断、`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
+- 转写（transcribe）、Lyria 音乐、Omni、Deep Research 和 Antigravity 等模型在 Playground 中不是聊天输入页面，适配层无法驱动，实测会在 95–190 秒后超时并占住该账号的 Playground 页面。这些模型不列入 `pg-` 列表，请求在本地返回 400，请改用对应的 `build-` 模型。语音合成（TTS）模型走专用的语音页面，见下文“语音合成（TTS）”。
+- `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`，TTS 模型另支持 OpenAI `/v1/audio/speech`）。抗截断、`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
 
 ## 账号与并发
 
@@ -58,6 +58,17 @@ Build 抗截断模型的 OpenAI 输出使用独立配置 `ANTI_TRUNCATION_STREAM
 适配层在临时页面中提交与原始内容具有相同签名材料的文本，拦截原生生成请求取得当次请求的签名及权益请求头；这次界面提交不进入推理服务。随后使用完整结构化请求在同一页面发起真实生成。原生签名材料不一致时明确报错，不发送内容被改变的请求。流式读取直接等待浏览器 reader 的下一块数据，不再定时轮询或维护浏览器生产队列；真流式转发只跟踪完成状态，不额外累计整份回复。
 
 鉴权请求头仅驻留内存，不写入路由文件或日志。取消或超时会停止专用页面的请求；响应被截断时返回错误，不伪装成正常完成。
+
+## 语音合成（TTS）
+
+`pg-gemini-3.8-flash-tts`、`pg-gemini-3.8-flash-lite-tts`、`pg-gemini-3.1-flash-tts-preview`、`pg-gemini-2.5-flash-preview-tts`、`pg-gemini-2.5-pro-preview-tts` 使用 Playground 的 `generate-speech` 页面，可通过 OpenAI `/v1/audio/speech` 或 Gemini `generateContent`（`responseModalities: ["AUDIO"]` + `speechConfig`）调用，账号、并发、冷却规则与其他 `pg-` 模型相同。
+
+- 原生请求仍是 MakerSuite `GenerateContent`：`responseModalities` 编码为生成配置 `[14]`（AUDIO = 3），`speechConfig` 编码为 `[15]`，内部字段与公开 proto 一致（`voiceConfig` = 1、`languageCode` = 2、`multiSpeakerVoiceConfig` = 3）。未指定音色时使用页面默认音色（3.8 为 `Fola`，2.5/3.1 为 `Zephyr`）。
+- 适配层打开语音页面的“Create new dialog”：2.5/3.1 切换到 Text 视图使用单个文本框，3.8 使用单个语音块，按原文取得签名。2.5/3.1 页面总会把文本包成 `## Transcript:\n<文本>`（AI Studio 自己的 TTS 提示格式），签名覆盖该文本，因此发往上游的请求同样加上这一前缀，与页面自身发送的内容一致；实测不会被读出。3.8 原样发送。
+- 3.8 的多说话人请求要求每个文本 part 标明说话人（part 字段 41 `speech_metadata.speaker`，页面每个语音块一个 part）。公开格式 `Joe: ...\nJane: ...` 会按 `speakerVoiceConfigs` 中的说话人名拆成逐句 part；不带说话人前缀的行并入上一句，第一句之前出现无法归属的文本时返回 400。part 自带 `speechMetadata.speaker` 时原样透传。2.5/3.1 直接读取公开格式，不拆分。
+- 上游以多段 24kHz 16-bit 单声道 L16 PCM 流式返回音频。非流式响应会把连续的同格式 PCM 段拼接成一个 part（与公开 API 一致），`/v1/audio/speech` 再封装为 WAV 或按 `response_format=pcm` 返回原始 PCM；真流式按段转发。
+
+2026-10-18 实测（独立浏览器，未影响线上服务）：5 个 TTS 模型均返回 `STOP` 和音频；3.8 单说话人（`Fola`）、3.8 双说话人（`Rami`/`Fola`，含同页面复用，第二次约 2.4 秒）、2.5 双说话人、3.1 默认音色、3.8 lite 指定 `languageCode` 均成功；2.5 的 “Good morning.” 生成 1.05 秒音频，说明 `## Transcript:` 前缀没有被读出。
 
 ## 当前边界
 

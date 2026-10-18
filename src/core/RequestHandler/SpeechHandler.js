@@ -5,7 +5,8 @@
 
 const RetryHandler = require("./RetryHandler");
 
-// Gemini TTS prebuilt voices; OpenAI voice names map to a similar-sounding one.
+// Gemini TTS prebuilt voices; OpenAI voice names map to a similar-sounding one. Other voice names
+// (e.g. the 3.8 voices such as Fola or Rami) pass through for the upstream model to validate.
 const GEMINI_VOICES = [
     "Achernar",
     "Achird",
@@ -61,7 +62,7 @@ class SpeechHandler extends RetryHandler {
         return (
             GEMINI_VOICES.find(known => known.toLowerCase() === key.toLowerCase()) ||
             OPENAI_VOICES[key.toLowerCase()] ||
-            null
+            (/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) ? key : null)
         );
     }
 
@@ -74,7 +75,7 @@ class SpeechHandler extends RetryHandler {
         const voiceName = SpeechHandler.resolveVoice(body.voice);
         if (!voiceName)
             return {
-                error: `Unknown voice "${body.voice}". Use an OpenAI voice name or a Gemini voice: ${GEMINI_VOICES.join(", ")}.`,
+                error: `Invalid voice "${body.voice}". Use an OpenAI voice name or a Gemini voice name such as ${GEMINI_VOICES.slice(0, 5).join(", ")}.`,
             };
         const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
         return {

@@ -182,7 +182,7 @@ class PlaygroundTransport {
             this.cooldowns.delete(this.cooldownKey(model, authIndex));
             if (!realStream) {
                 headers();
-                queue.enqueue({ data: JSON.stringify(merged), event_type: "chunk" });
+                queue.enqueue({ data: JSON.stringify(WireCodec.joinAudio(merged)), event_type: "chunk" });
             }
             queue.enqueue({ type: "STREAM_END" });
         } catch (error) {

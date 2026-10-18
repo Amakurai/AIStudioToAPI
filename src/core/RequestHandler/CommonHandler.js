@@ -96,7 +96,7 @@ class RequestHandler {
         const generates =
             method !== undefined
                 ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(method)
-                : ["/v1/chat/completions", "/v1/responses", "/v1/messages"].includes(req.path);
+                : ["/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/audio/speech"].includes(req.path);
         return generates ? null : "Playground models only support content generation.";
     }
 

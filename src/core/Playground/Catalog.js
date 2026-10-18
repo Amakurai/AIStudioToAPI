@@ -29,17 +29,24 @@ class PlaygroundCatalog {
     }
 
     /**
-     * Model families whose Playground page is not the chat prompt page this adapter drives
-     * (speech, transcription, music, agents). Requests would only time out after minutes while
-     * holding the account's Playground page, so they are not listed and are rejected up front.
+     * Model families whose Playground page this adapter cannot drive (transcription, music,
+     * agents). Requests would only time out after minutes while holding the account's Playground
+     * page, so they are not listed and are rejected up front.
      */
-    static UNSUPPORTED = /(?:^|-)tts(?:-|$)|-transcribe(?:-|$)|^lyria-|^gemini-omni-|^deep-research-|^antigravity-/;
+    static UNSUPPORTED = /-transcribe(?:-|$)|^lyria-|^gemini-omni-|^deep-research-|^antigravity-/;
+
+    /** Speech (TTS) models run on the generate-speech page instead of the chat prompt page. */
+    static SPEECH = /(?:^|-)tts(?:-|$)/;
+
+    static isSpeech(model) {
+        return PlaygroundCatalog.SPEECH.test(String(model || "").replace(/^models\//, ""));
+    }
 
     /** @returns {string|null} Why Playground cannot serve this upstream model, or null. */
     static unsupportedReason(model) {
         const name = String(model || "").replace(/^models\//, "");
         if (!PlaygroundCatalog.UNSUPPORTED.test(name)) return null;
-        return `Playground does not support ${name} (speech, transcription, music and agent models use a different page); use build-${name} if it is available.`;
+        return `Playground does not support ${name} (transcription, music and agent models use a different page); use build-${name} if it is available.`;
     }
 
     static validName(name) {

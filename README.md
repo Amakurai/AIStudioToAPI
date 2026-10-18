@@ -201,7 +201,7 @@ services:
 - `POST /v1/embeddings`: 生成文本嵌入向量。
 - `POST /v1/responses`: OpenAI Responses API 兼容接口，用于对话生成，不支持图像生成，支持非流式、真流式和假流式。
 - `POST /v1/responses/input_tokens`: 计算 OpenAI Responses API 请求的输入 token 数量。
-- `POST /v1/audio/speech`: 文本转语音，使用 Build 的 TTS 模型（如 `build-gemini-3.8-flash-tts`）。`voice` 可填 OpenAI 音色名（自动映射）或 Gemini 音色名（如 `Kore`、`Puck`），可选 `instructions` 描述语气。Gemini 只输出 PCM/WAV：`response_format` 为 `pcm` 时返回 24kHz 16-bit 单声道原始 PCM，其余格式（包括默认的 mp3）均返回 WAV；不支持 `speed`。
+- `POST /v1/audio/speech`: 文本转语音，使用 Build 或 Playground 的 TTS 模型（如 `build-gemini-3.8-flash-tts`、`pg-gemini-3.8-flash-tts`）。`voice` 可填 OpenAI 音色名（自动映射）或 Gemini 音色名（如 `Kore`、`Puck`，3.8 的 `Fola`、`Rami` 等其他音色名原样透传），可选 `instructions` 描述语气。Gemini 只输出 PCM/WAV：`response_format` 为 `pcm` 时返回 24kHz 16-bit 单声道原始 PCM，其余格式（包括默认的 mp3）均返回 WAV；不支持 `speed`。
 
 ### ♊ Gemini 原生 API 格式
 

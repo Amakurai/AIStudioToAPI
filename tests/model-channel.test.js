@@ -623,12 +623,9 @@ test("the same failure on several accounts is not counted against the current ac
     assert.equal(single.handler.authSwitcher.failureCount, 1);
 });
 
-test("Playground does not list or accept speech, transcription, music and agent models", async t => {
+test("Playground does not list or accept transcription, music and agent models", async t => {
     const PlaygroundCatalog = require("../src/core/Playground/Catalog");
     const unsupported = [
-        "gemini-2.5-flash-preview-tts",
-        "gemini-3.1-flash-tts-preview",
-        "gemini-3.8-flash-lite-tts",
         "gemini-3.5-transcribe",
         "lyria-3-clip-preview",
         "gemini-omni-flash-preview",
@@ -636,12 +633,19 @@ test("Playground does not list or accept speech, transcription, music and agent 
         "antigravity-preview-09-2026",
     ];
     for (const model of unsupported) assert.match(PlaygroundCatalog.unsupportedReason(model), /use build-/);
-    for (const model of ["gemini-4-argon", "gemini-3.8-flash", "gemma-4-31b-it", "gemini-3.1-flash-image"])
+    for (const model of [
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemma-4-31b-it",
+        "gemini-3.1-flash-image",
+        "gemini-2.5-flash-preview-tts",
+        "gemini-3.8-flash-tts",
+    ])
         assert.equal(PlaygroundCatalog.unsupportedReason(model), null, model);
 
     const h = harness(t);
     h.handler.playground.catalog.discover([
-        [...unsupported, "gemini-3.8-flash"].map(name => [
+        [...unsupported, "gemini-3.8-flash", "gemini-3.8-flash-tts"].map(name => [
             `models/${name}`,
             null,
             "",
@@ -654,7 +658,7 @@ test("Playground does not list or accept speech, transcription, music and agent 
     ]);
     assert.deepEqual(
         h.handler.channelModels().playground.map(m => m.name),
-        ["models/pg-gemini-4-argon", "models/pg-gemini-3.8-flash"]
+        ["models/pg-gemini-4-argon", "models/pg-gemini-3.8-flash", "models/pg-gemini-3.8-flash-tts"]
     );
     const reason = model =>
         h.handler._unsupportedPlaygroundRequest({
@@ -662,19 +666,19 @@ test("Playground does not list or accept speech, transcription, music and agent 
             method: "POST",
             path: `/v1beta/models/${model}:generateContent`,
         });
-    assert.match(reason("pg-gemini-3.8-flash-tts"), /does not support gemini-3.8-flash-tts/);
+    assert.equal(reason("pg-gemini-3.8-flash-tts"), null);
     assert.match(reason("pg-gemini-3.5-transcribe-high"), /does not support gemini-3.5-transcribe/);
-    assert.equal(reason("build-gemini-3.8-flash-tts"), null);
+    assert.equal(reason("build-gemini-3.5-transcribe"), null);
 
-    const queue = h.handler.connectionRegistry.createMessageQueue("tts", 0, "a1");
+    const queue = h.handler.connectionRegistry.createMessageQueue("transcribe", 0, "a1");
     // The harness stubs forward; exercise the real transport here.
     require("../src/core/Playground/Transport").prototype.forward.call(
         h.handler.playground,
         {
             body: "{}",
-            path: "/v1beta/models/gemini-3.8-flash-tts:generateContent",
+            path: "/v1beta/models/gemini-3.5-transcribe:generateContent",
             request_attempt_id: "a1",
-            request_id: "tts",
+            request_id: "transcribe",
         },
         0
     );
@@ -713,7 +717,12 @@ test("speech requests validate input and map OpenAI voices to Gemini voices", ()
             .contents[0].parts[0].text,
         "Say cheerfully: Hi"
     );
-    assert.match(SpeechHandler.buildGeminiRequest({ input: "Hi", model: "m", voice: "nobody" }).error, /Unknown voice/);
+    // Voices outside the known list (e.g. 3.8 voices) pass through for upstream to validate.
+    assert.equal(SpeechHandler.resolveVoice("Fola"), "Fola");
+    assert.match(
+        SpeechHandler.buildGeminiRequest({ input: "Hi", model: "m", voice: "no body!" }).error,
+        /Invalid voice/
+    );
     assert.match(SpeechHandler.buildGeminiRequest({ input: " ", model: "m" }).error, /input/);
     assert.match(SpeechHandler.buildGeminiRequest({ input: "Hi" }).error, /model/);
 });
@@ -784,16 +793,171 @@ test("POST /v1/audio/speech returns audio from a Build TTS model", async t => {
     assert.ok(SpeechHandler);
 });
 
-test("Playground TTS on the speech endpoint is rejected before dispatch", t => {
+test("POST /v1/audio/speech sends pg-* TTS models to Playground and joins streamed PCM", async t => {
     const h = harness(t);
-    assert.match(
-        h.handler._unsupportedPlaygroundRequest({
-            body: { input: "hi", model: "pg-gemini-3.8-flash-tts" },
-            method: "POST",
-            path: "/v1/audio/speech",
-        }),
-        /use build-gemini-3.8-flash-tts/
+    const req = {
+        body: { input: "hi", model: "pg-gemini-3.8-flash-tts", voice: "Fola" },
+        headers: {},
+        method: "POST",
+        path: "/v1/audio/speech",
+        query: {},
+    };
+    assert.equal(h.handler._unsupportedPlaygroundRequest(req), null);
+    const { WireCodec } = require("../src/core/Playground/WireCodec");
+    const chunks = [Buffer.from([1, 0, 2, 0]), Buffer.from([3, 0]), Buffer.from([4, 0, 5, 0])];
+    h.handler.playground.forward = spec => {
+        h.playground.push({ ...spec });
+        const merged = {};
+        for (const chunk of chunks) {
+            const part = {
+                inlineData: { data: chunk.toString("base64"), mimeType: "audio/l16; rate=24000; channels=1" },
+            };
+            WireCodec.merge(merged, { candidates: [{ content: { parts: [part], role: "model" }, index: 0 }] });
+        }
+        merged.candidates[0].finishReason = "STOP";
+        const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+        queue.enqueue({ event_type: "response_headers", status: 200 });
+        queue.enqueue({ data: JSON.stringify(WireCodec.joinAudio(merged)), event_type: "chunk" });
+        queue.enqueue({ type: "STREAM_END" });
+    };
+    const res = new FakeResponse();
+    let body;
+    res.end = value => {
+        body = value;
+        res.writableEnded = true;
+    };
+    await h.handler.forRequest(req).processOpenAISpeechRequest(req, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(h.build.length, 0);
+    assert.equal(h.playground[0].channel, "playground");
+    assert.equal(h.playground[0].path, "/v1beta/models/gemini-3.8-flash-tts:generateContent");
+    assert.deepEqual(body.subarray(44), Buffer.concat(chunks));
+    assert.equal(h.handler.authSwitcher.usageCount, 0);
+});
+
+test("Playground encodes speechConfig and matches the 2.5/3.1 transcript prefix", () => {
+    const { WireCodec } = require("../src/core/Playground/WireCodec");
+    const voice = name => ({ prebuiltVoiceConfig: { voiceName: name } });
+    const single = WireCodec.encode("gemini-3.8-flash-tts", {
+        contents: [{ parts: [{ text: "Hi" }], role: "user" }],
+        generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: voice("Fola") } },
+    });
+    assert.deepEqual(single[3][14], [3]);
+    assert.deepEqual(single[3][15], [[["Fola"]]]);
+    const multi = WireCodec.encode("gemini-3.8-flash-tts", {
+        contents: [{ parts: [{ text: "Joe: Hi\nJane: Hello" }] }],
+        generation_config: {
+            speech_config: {
+                language_code: "en-US",
+                multi_speaker_voice_config: {
+                    speaker_voice_configs: [
+                        { speaker: "Joe", voice_config: voice("Kore") },
+                        { speaker: "Jane", voiceConfig: voice("Puck") },
+                    ],
+                },
+            },
+        },
+    });
+    // Same layout as the page's own two-speaker request: [null, null, [null, [[speaker, [[voice]]], ...]]].
+    assert.deepEqual(multi[3][15], [
+        null,
+        "en-US",
+        [
+            null,
+            [
+                ["Joe", [["Kore"]]],
+                ["Jane", [["Puck"]]],
+            ],
+        ],
+    ]);
+    // 3.8 needs one part per speaker turn, each naming its speaker (part field 41), as the page sends.
+    const turns = multi[1][0][0];
+    assert.deepEqual(
+        turns.map(part => [part[1], part[40]]),
+        [
+            ["Hi", ["Joe"]],
+            ["Hello", ["Jane"]],
+        ]
     );
+    assert.equal(
+        WireCodec.speakerTurns("Joe: a\nmore\n\nJane:b", ["Jane", "Joe"])
+            .map(t => `${t.speaker}=${t.text}`)
+            .join("|"),
+        "Joe=a\nmore|Jane=b"
+    );
+    const withMetadata = WireCodec.encode("gemini-3.8-flash-tts", {
+        contents: [{ parts: [{ speechMetadata: { speaker: "Joe" }, text: "Joe: kept" }] }],
+        generationConfig: {
+            speechConfig: {
+                multiSpeakerVoiceConfig: { speakerVoiceConfigs: [{ speaker: "Joe", voiceConfig: voice("Kore") }] },
+            },
+        },
+    });
+    assert.deepEqual(withMetadata[1][0][0][0][40], ["Joe"]);
+    const multiConfig = {
+        speechConfig: {
+            multiSpeakerVoiceConfig: { speakerVoiceConfigs: [{ speaker: "Joe", voiceConfig: voice("Kore") }] },
+        },
+    };
+    assert.throws(
+        () =>
+            WireCodec.encode("gemini-3.8-flash-tts", {
+                contents: [{ parts: [{ text: "Hi" }] }],
+                generationConfig: multiConfig,
+            }),
+        error => error.status === 400 && /speaker name/.test(error.message)
+    );
+    // 2.5/3.1 read the public transcript format as is.
+    const classic = WireCodec.encode("gemini-2.5-flash-preview-tts", {
+        contents: [{ parts: [{ text: "Joe: Hi" }] }],
+        generationConfig: multiConfig,
+    });
+    assert.equal(JSON.stringify(classic[1][0][0]), JSON.stringify([[null, "Joe: Hi"]]));
+    assert.throws(
+        () =>
+            WireCodec.encode("m", {
+                contents: [{ parts: [{ text: "Hi" }] }],
+                generationConfig: { speechConfig: { voiceConfig: {} } },
+            }),
+        error => error.status === 400 && /voiceName/.test(error.message)
+    );
+
+    const wire = WireCodec.encode("gemini-2.5-flash-preview-tts", {
+        contents: [{ parts: [{ text: "Good morning." }] }],
+    });
+    const native = [wire[0], [[[[null, "## Transcript:\nGood morning."]], "user"]]];
+    WireCodec.alignTranscript(wire, native);
+    assert.equal(wire[1][0][0][0][1], "## Transcript:\nGood morning.");
+    assert.equal(WireCodec.hash(wire), WireCodec.hash(native));
+    // 3.8 pages send the text unchanged; any other difference still fails the content check.
+    const plain = WireCodec.encode("gemini-3.8-flash-tts", { contents: [{ parts: [{ text: "Hi" }] }] });
+    WireCodec.alignTranscript(plain, [plain[0], [[[[null, "Hi"]], "user"]]]);
+    assert.equal(plain[1][0][0][0][1], "Hi");
+    const other = WireCodec.encode("gemini-2.5-flash-preview-tts", { contents: [{ parts: [{ text: "Hi" }] }] });
+    WireCodec.alignTranscript(other, [other[0], [[[[null, "## Transcript:\nBye"]], "user"]]]);
+    assert.notEqual(WireCodec.hash(other), WireCodec.hash([other[0], [[[[null, "## Transcript:\nBye"]], "user"]]]));
+});
+
+test("joinAudio joins only consecutive PCM parts of one format", () => {
+    const { WireCodec } = require("../src/core/Playground/WireCodec");
+    const pcm = (bytes, mimeType = "audio/l16; rate=24000") => ({
+        inlineData: { data: Buffer.from(bytes).toString("base64"), mimeType },
+    });
+    const response = {
+        candidates: [
+            {
+                content: {
+                    parts: [pcm([1, 0]), pcm([2, 0]), { text: "x" }, pcm([3, 0]), pcm([4, 0], "audio/wav")],
+                },
+            },
+        ],
+    };
+    const parts = WireCodec.joinAudio(response).candidates[0].content.parts;
+    assert.equal(parts.length, 4);
+    assert.deepEqual(Buffer.from(parts[0].inlineData.data, "base64"), Buffer.from([1, 0, 2, 0]));
+    assert.deepEqual(parts[1], { text: "x" });
+    assert.deepEqual(Buffer.from(parts[2].inlineData.data, "base64"), Buffer.from([3, 0]));
+    assert.equal(parts[3].inlineData.mimeType, "audio/wav");
 });
 
 test("native Gemini requests are tracked under their public channel name", t => {

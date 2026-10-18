@@ -193,6 +193,38 @@ class WireCodec {
         // accepts every scalar and null rather than restricting the value to a string.
         return ["STRING", "NUMBER", "BOOLEAN", "NULL"];
     }
+    static voiceConfig(v, where) {
+        const voiceName = pick(pick(v, "prebuiltVoiceConfig"), "voiceName");
+        if (typeof voiceName !== "string" || !voiceName)
+            throw invalid(`${where}.prebuiltVoiceConfig.voiceName is required`);
+        return [[voiceName]];
+    }
+    /** SpeechConfig: voiceConfig = 1, languageCode = 2, multiSpeakerVoiceConfig = 3. */
+    static speechConfig(s) {
+        const where = "generationConfig.speechConfig";
+        if (!s || typeof s !== "object" || Array.isArray(s)) throw invalid(`${where} must be an object`);
+        const out = [null, null, null];
+        const voice = pick(s, "voiceConfig");
+        if (voice) out[0] = this.voiceConfig(voice, `${where}.voiceConfig`);
+        const languageCode = pick(s, "languageCode");
+        if (languageCode) out[1] = String(languageCode);
+        const multi = pick(s, "multiSpeakerVoiceConfig");
+        if (multi) {
+            const speakers = pick(multi, "speakerVoiceConfigs");
+            if (!Array.isArray(speakers) || !speakers.length)
+                throw invalid(`${where}.multiSpeakerVoiceConfig.speakerVoiceConfigs must be a non-empty array`);
+            out[2] = [
+                null,
+                speakers.map((speaker, i) => {
+                    const at = `${where}.multiSpeakerVoiceConfig.speakerVoiceConfigs[${i}]`;
+                    if (typeof speaker?.speaker !== "string" || !speaker.speaker)
+                        throw invalid(`${at}.speaker is required`);
+                    return [speaker.speaker, this.voiceConfig(pick(speaker, "voiceConfig"), `${at}.voiceConfig`)];
+                }),
+            ];
+        }
+        return compact(out);
+    }
     static part(p, where = "part") {
         if (!p || typeof p !== "object" || Array.isArray(p)) throw invalid(`unsupported content part at ${where}`);
         const out = [];
@@ -208,6 +240,8 @@ class WireCodec {
             const f = pick(p, key);
             if (f) out[index] = compact([f.name, this.struct(f[valueKey] || {}), f.id]);
         }
+        const speaker = pick(pick(p, "speechMetadata"), "speaker");
+        if (typeof speaker === "string" && speaker) out[40] = [speaker];
         if (p.thought) out[0] = true;
         if (pick(p, "thoughtSignature")) out[14] = pick(p, "thoughtSignature");
         if (pick(p, "executableCode")) out[8] = normalizeText(pick(p, "executableCode").code);
@@ -218,6 +252,50 @@ class WireCodec {
     static content(c, where = "contents") {
         if (!c || typeof c !== "object" || !Array.isArray(c.parts)) throw invalid(`${where}.parts must be an array`);
         return [c.parts.map((p, i) => this.part(p, `${where}.parts[${i}]`)), c.role || "user"];
+    }
+    /**
+     * "Joe: Hi\nJane: Hello" -> [{ speaker: "Joe", text: "Hi" }, { speaker: "Jane", text: "Hello" }].
+     * Lines without a speaker prefix continue the previous turn. Null when text precedes the first turn.
+     */
+    static speakerTurns(text, speakers) {
+        const names = [...speakers].sort((a, b) => b.length - a.length);
+        const turns = [];
+        for (const line of text.split("\n")) {
+            const speaker = names.find(name => line.startsWith(`${name}:`));
+            if (speaker) turns.push({ speaker, text: line.slice(speaker.length + 1).trimStart() });
+            else if (turns.length) turns.at(-1).text += `\n${line}`;
+            else if (line.trim()) return null;
+        }
+        for (const turn of turns) turn.text = turn.text.trimEnd();
+        return turns.length ? turns : null;
+    }
+    /**
+     * 3.8 TTS models reject multi-speaker requests unless every text part names its speaker
+     * (the page sends one part per speech block). Split the public transcript format
+     * ("Joe: ...\nJane: ...") into such parts. 2.5/3.1 models read the transcript as is.
+     */
+    static speakerParts(model, body, contents) {
+        const multi = pick(pick(pick(body, "generationConfig"), "speechConfig"), "multiSpeakerVoiceConfig");
+        const speakers = (pick(multi, "speakerVoiceConfigs") || []).map(s => s?.speaker).filter(Boolean);
+        if (!speakers.length || !/(?:^|-)tts(?:-|$)/.test(model) || /^gemini-(?:2\.5|3\.1)-/.test(model))
+            return contents;
+        return contents.map(([parts, role], index) => {
+            if (role !== "user") return [parts, role];
+            const split = parts.flatMap(part => {
+                if (typeof part[1] !== "string" || part[40]) return [part];
+                const turns = this.speakerTurns(part[1], speakers);
+                if (!turns)
+                    throw invalid(
+                        `contents[${index}]: multi-speaker text must start each turn with a configured speaker name (e.g. "${speakers[0]}: ...")`
+                    );
+                return turns.map(turn => {
+                    const out = [null, turn.text];
+                    out[40] = [turn.speaker];
+                    return out;
+                });
+            });
+            return [split, role];
+        });
     }
     static encode(model, body) {
         try {
@@ -280,6 +358,8 @@ class WireCodec {
                 return value;
             });
         }
+        const speechConfig = pick(gc, "speechConfig");
+        if (speechConfig) generation[15] = this.speechConfig(speechConfig);
         const imageConfig = pick(gc, "imageConfig");
         if (imageConfig)
             generation[26] = [pick(imageConfig, "aspectRatio") || null, pick(imageConfig, "imageSize") || null];
@@ -344,7 +424,11 @@ class WireCodec {
         });
         const out = [];
         out[0] = `models/${model.replace(/^models\//, "")}`;
-        out[1] = body.contents.map((c, i) => this.content(c, `contents[${i}]`));
+        out[1] = this.speakerParts(
+            out[0].slice("models/".length),
+            body,
+            body.contents.map((c, i) => this.content(c, `contents[${i}]`))
+        );
         out[2] = safety.length ? safety : null;
         out[3] = compact(generation);
         out[5] = pick(body, "systemInstruction")
@@ -359,6 +443,18 @@ class WireCodec {
         out[11] = pick(body, "cachedContent") || null;
         out[13] = [[null, null, "UTC"]];
         return out;
+    }
+    /**
+     * The 2.5/3.1 TTS pages always send `## Transcript:\n<text>`, AI Studio's own TTS prompt
+     * format, so the native signature covers that text. Prefix the request the same way (as
+     * the page itself does) instead of failing the content check. Other differences still fail it.
+     */
+    static alignTranscript(wire, native) {
+        const prefix = "## Transcript:\n";
+        const text = native?.[1]?.[0]?.[0]?.[0]?.[1];
+        const first = wire[1]?.[0]?.[0]?.[0];
+        if (typeof text !== "string" || !text.startsWith(prefix) || typeof first?.[1] !== "string") return;
+        if (this.hash(wire) !== this.hash(native)) first[1] = `${prefix}${first[1]}`;
     }
     static hash(wire) {
         const parts = wire[1].flatMap(c => c[0].map(p => p[1] ?? p[2]?.[1] ?? p[5]?.[0] ?? p[8] ?? p[9] ?? ""));
@@ -425,6 +521,41 @@ class WireCodec {
                 candidate.content.parts = candidate.content.parts.filter(part => part?.thought !== true);
         }
         return chunk;
+    }
+
+    /**
+     * Speech streams raw PCM in many short parts; join consecutive parts of one PCM format into a
+     * single part, as the public API returns, so clients get one playable clip.
+     */
+    static joinAudio(response) {
+        const pcm = part =>
+            /^audio\/(?:l16|pcm)\b/i.test(part?.inlineData?.mimeType || "") && typeof part.inlineData.data === "string";
+        for (const candidate of response.candidates || []) {
+            const parts = candidate.content?.parts;
+            if (!Array.isArray(parts) || parts.filter(pcm).length < 2) continue;
+            const joined = [];
+            const runs = [];
+            for (const part of parts) {
+                const run = runs.at(-1);
+                if (
+                    pcm(part) &&
+                    run &&
+                    joined.at(-1) === run.part &&
+                    run.part.inlineData.mimeType === part.inlineData.mimeType
+                ) {
+                    run.buffers.push(Buffer.from(part.inlineData.data, "base64"));
+                    continue;
+                }
+                if (pcm(part)) {
+                    const copy = { ...part, inlineData: { ...part.inlineData } };
+                    runs.push({ buffers: [Buffer.from(part.inlineData.data, "base64")], part: copy });
+                    joined.push(copy);
+                } else joined.push(part);
+            }
+            for (const run of runs) run.part.inlineData.data = Buffer.concat(run.buffers).toString("base64");
+            candidate.content.parts = joined;
+        }
+        return response;
     }
 
     static merge(target, chunk) {

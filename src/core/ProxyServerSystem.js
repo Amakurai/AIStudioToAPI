@@ -531,9 +531,9 @@ class ProxyServerSystem extends EventEmitter {
             this.requestHandler.processOpenAIEmbeddingsRequest(req, res);
         });
 
-        // OpenAI text-to-speech on Gemini TTS models (e.g. build-gemini-3.8-flash-tts)
+        // OpenAI text-to-speech on Gemini TTS models (e.g. build-gemini-3.8-flash-tts, pg-gemini-3.8-flash-tts)
         app.post("/v1/audio/speech", (req, res) => {
-            this.requestHandler.processOpenAISpeechRequest(req, res);
+            this.requestHandler.forRequest(req).processOpenAISpeechRequest(req, res);
         });
 
         // OpenAI Response API compatible endpoint

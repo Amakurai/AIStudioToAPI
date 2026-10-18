@@ -1,4 +1,5 @@
 /* global window */
+const PlaygroundCatalog = require("./Catalog");
 const { WireCodec } = require("./WireCodec");
 
 const RPC_ORIGIN = "https://alkalimakersuite-pa.clients6.google.com";
@@ -46,6 +47,7 @@ class PlaygroundSession {
     async _request(model, body, { signal, onData, timeoutMs, onStage }) {
         onStage("prepare_page");
         const wire = WireCodec.encode(model, body);
+        const speech = PlaygroundCatalog.isSpeech(model);
         if (!this.page || this.page.isClosed()) {
             this.page = await this.context.newPage();
             this.pageModel = null;
@@ -100,7 +102,15 @@ class PlaygroundSession {
                     await page.getByRole("button", { exact: true, name: "New chat" }).click({ timeout: 5000 });
                     const discard = page.getByRole("button", { exact: true, name: "Discard and continue" });
                     if (await discard.isVisible()) await discard.click({ timeout: 5000 });
-                    await page.getByRole("textbox", { exact: true, name: "Enter a prompt" }).waitFor({ timeout: 5000 });
+                    // The speech page's New chat returns to its landing page; the dialog is reopened below.
+                    if (!speech)
+                        await page
+                            .getByRole("textbox", { exact: true, name: "Enter a prompt" })
+                            .waitFor({ timeout: 5000 });
+                    else
+                        await page
+                            .getByRole("button", { exact: true, name: "Create new dialog" })
+                            .waitFor({ timeout: 5000 });
                     reused = true;
                 } catch {
                     /* Fall back to a clean navigation before signing. */
@@ -108,7 +118,9 @@ class PlaygroundSession {
             }
             if (!reused) {
                 await page.goto(
-                    `https://aistudio.google.com/prompts/new_chat?model=${encodeURIComponent(model)}&temporary=true&hl=en`,
+                    speech
+                        ? `https://aistudio.google.com/generate-speech?model=${encodeURIComponent(model)}&hl=en`
+                        : `https://aistudio.google.com/prompts/new_chat?model=${encodeURIComponent(model)}&temporary=true&hl=en`,
                     {
                         timeout: Math.min(timeoutMs, 60000),
                         waitUntil: "domcontentloaded",
@@ -125,9 +137,11 @@ class PlaygroundSession {
                     { status: 401 }
                 );
             }
-            const input = page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
-            await input.waitFor({ timeout: Math.min(timeoutMs, 30000) });
             const cookieNotice = page.getByRole("button", { exact: true, name: "OK, got it" });
+            const input = speech
+                ? await this._speechInput(page, cookieNotice, Math.min(timeoutMs, 30000))
+                : page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
+            await input.waitFor({ timeout: Math.min(timeoutMs, 30000) });
             if (await cookieNotice.isVisible()) await cookieNotice.click();
             const envelope = new Promise((resolve, reject) => {
                 this.capture = { reject, resolve };
@@ -158,6 +172,7 @@ class PlaygroundSession {
             clearTimeout(preparationTimer);
             onStage("request_dispatched");
             if (signal.aborted) throw cancelled();
+            if (speech) WireCodec.alignTranscript(wire, template.body);
             if (template.body[0] !== wire[0] || WireCodec.hash(template.body) !== WireCodec.hash(wire)) {
                 throw Object.assign(new Error("Playground could not sign this prompt without changing its content"), {
                     resetFailed: reused,
@@ -260,6 +275,25 @@ class PlaygroundSession {
             this.capture = null;
             signal.removeEventListener("abort", abort);
         }
+    }
+
+    /**
+     * Opens a text dialog on the generate-speech page. 2.5/3.1 TTS pages offer a plain "Text" view
+     * (one textarea); 3.8 pages have a single speech block. Both send the textarea text unchanged,
+     * except that 2.5/3.1 prefix it with `## Transcript:` (see WireCodec.alignTranscript).
+     */
+    async _speechInput(page, cookieNotice, timeout) {
+        const create = page.getByRole("button", { exact: true, name: "Create new dialog" });
+        await create.waitFor({ timeout });
+        if (await cookieNotice.isVisible()) await cookieNotice.click();
+        await create.click({ timeout });
+        const textView = page.getByRole("radio", { exact: true, name: "Text" });
+        const block = page.getByRole("textbox", { exact: true, name: "Speech block text" });
+        // Both page kinds open with a speech block; only 2.5/3.1 also render the view switch.
+        await block.first().waitFor({ timeout });
+        if (!(await textView.count())) return block;
+        await textView.click({ timeout });
+        return page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
     }
 }
 module.exports = PlaygroundSession;
