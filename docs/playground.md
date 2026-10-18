@@ -70,7 +70,7 @@ Build 抗截断模型的 OpenAI 输出使用独立配置 `ANTI_TRUNCATION_STREAM
 - `/v1/audio/speech` 的 `instructions` 在 `pg-` 3.8 模型上作为声音风格发送（实测前缀写法 `指示: 正文` 会被 3.8 读出：同一句话 3.84 秒对比 1.92 秒）；Build 与 2.5/3.1 仍按 `指示: 正文` 发送。非 TTS 的 `pg-` 模型请求该端点在本地返回 400。
 - 上游以多段 24kHz 16-bit 单声道 L16 PCM 流式返回音频，结束分块另带一个空 text part。Playground 会把连续的同格式 PCM 段拼接成一个 part 并去掉空 text part（与公开 API 一致）；TTS 的真流式请求同样等生成完成后以一个 SSE 事件发送整段音频，避免 OpenAI/Claude 格式中出现几十个无法单独播放的音频片段。`/v1/audio/speech` 再封装为 WAV 或按 `response_format=pcm` 返回原始 PCM。
 - OpenAI Chat Completions 与 Claude Messages 中的音频以 `![Generated Audio](data:audio/wav;base64,...)` 输出（原始 PCM 封装为 WAV，浏览器可直接播放；Build 链路同样适用）。假流式输出时整段媒体 data URI 作为一帧发送，不再按 128 字符切分（此前每片停顿 20 ms，3 秒音频约多等 30 秒，图片更久）。
-- 语音页面偶尔先显示上一次使用模型的视图切换，适配层点选 Text 视图后以实际出现的输入框为准，不会因等待不存在的输入框超时。
+- 部分账号的 3.8 页面也显示 “View mode” 切换，但 Text 选项被禁用（`aria-disabled`）。适配层只在 Text 可用且未选中时点选，否则直接使用语音块，并以实际出现的输入框为准；此前点击被禁用的选项会等满 30 秒超时。
 
 2026-10-18 实测（独立浏览器，未影响线上服务）：5 个 TTS 模型均返回 `STOP` 和音频；3.8 单说话人（`Fola`）、3.8 双说话人（`Rami`/`Fola`，含同页面复用，第二次约 2.4 秒）、2.5 双说话人、3.1 默认音色、3.8 lite 指定 `languageCode` 均成功；2.5 的 “Good morning.” 生成 1.05 秒音频，说明 `## Transcript:` 前缀没有被读出。官方多说话人示例（引导语 + 缩进的说话人行）在 3.8 上生成 3.3 秒双人音频，引导语未被读出。
 

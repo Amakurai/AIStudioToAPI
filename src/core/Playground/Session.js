@@ -289,11 +289,15 @@ class PlaygroundSession {
         await create.click({ timeout });
         const textView = page.getByRole("radio", { exact: true, name: "Text" });
         const block = page.getByRole("textbox", { exact: true, name: "Speech block text" });
-        // Both page kinds open with a speech block; only 2.5/3.1 also render the view switch. A page
-        // may briefly show the switch of the previously used model, so fall back to the block.
+        // Both page kinds open with a speech block; 2.5/3.1 also offer a Text view. Some 3.8 pages
+        // render the switch with Text disabled: clicking it would wait for the full timeout.
         await block.first().waitFor({ timeout });
-        if (!(await textView.isVisible())) return block.first();
-        await textView.click({ timeout }).catch(() => {});
+        const usable = await textView
+            .evaluate(el => el.getAttribute("aria-disabled") !== "true" && !el.disabled, null, { timeout: 1000 })
+            .catch(() => false);
+        if (!usable) return block.first();
+        if ((await textView.getAttribute("aria-checked").catch(() => null)) !== "true")
+            await textView.click({ timeout: 5000 }).catch(() => {});
         const prompt = page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
         await prompt.or(block).first().waitFor({ timeout });
         // 2.5/3.1 send the same `## Transcript:` text from either view.
