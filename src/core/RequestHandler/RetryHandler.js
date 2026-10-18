@@ -55,16 +55,107 @@ class RetryHandler extends ConnectionHandler {
         };
 
         this._initializeProxyRequestAttempt(proxyRequest);
-        res.__proxyResponseStreamMode = isStreaming ? streamMode : null;
+        const responseStreamMode = this._prepareAntiTruncationStream(proxyRequest, isStreaming) || streamMode;
+        res.__proxyResponseStreamMode = isStreaming ? responseStreamMode : null;
         this._updateTrackedRequest(requestId, {
             isStreaming,
             model,
             path: proxyRequest.path,
             requestCategory: "generation",
-            ...(isStreaming ? { streamMode } : {}),
+            ...(isStreaming ? { streamMode: responseStreamMode } : {}),
         });
 
         return { proxyRequest, useRealStream };
+    }
+
+    /**
+     * Streaming alias responses follow ANTI_TRUNCATION_STREAMING_MODE instead of STREAMING_MODE; their
+     * upstream rounds are always non-streaming. In real mode the forwarder publishes each accepted
+     * segment on the request queue. Returns the client stream mode, or null for other requests.
+     */
+    _prepareAntiTruncationStream(proxyRequest, isStreaming) {
+        if (!isStreaming || !proxyRequest.anti_truncation) return null;
+        const mode = this.config.antiTruncationStreamingMode === "fake" ? "fake" : "real";
+        proxyRequest.anti_truncation_segments = mode === "real";
+        return mode;
+    }
+
+    /**
+     * Writes a streaming alias response, starting with the first queue message returned by
+     * `_executeRequestWithRetries`. Real mode sends each accepted segment as it arrives; fake mode
+     * receives the finished answer and sends it in short paced chunks, reasoning first. `send(googleChunk)`
+     * writes one Gemini stream chunk in the client's format; the last one has no text and carries the
+     * finish reason and usage.
+     */
+    async _streamAntiTruncationResponse(proxyRequest, firstMessage, queue, res, send) {
+        const requestId = proxyRequest.request_id;
+        // A leading thinking block arrives as reasoning pieces and is sent as Gemini thought parts.
+        const textChunk = (text, thought) => ({
+            candidates: [
+                { content: { parts: [thought ? { text, thought: true } : { text }], role: "model" }, index: 0 },
+            ],
+        });
+        const streamed = { answer: "", reasoning: "" };
+        let message = firstMessage,
+            body = "",
+            seq = 0,
+            response;
+        try {
+            while (message.type !== "STREAM_END") {
+                if (message.event_type === "error")
+                    throw Object.assign(new Error(message.message), { status: message.status });
+                if (message.event_type === "tool_output") {
+                    if (message.seq !== seq + 1)
+                        throw AntiTruncation.protocolError("non-contiguous published sequence.");
+                    seq = message.seq;
+                    streamed[message.thought ? "reasoning" : "answer"] += message.text;
+                    if (!this._isResponseWritable(res)) return;
+                    send(textChunk(message.text, message.thought));
+                } else if (message.event_type === "chunk") body += message.data || "";
+                message = await queue.dequeue(AntiTruncation.maxWaitMs(this.timeouts.FAKE_STREAM));
+            }
+            response = JSON.parse(body);
+        } catch (error) {
+            // Until text reaches the client the usual stream error applies. Afterwards the delivered
+            // text stands and the answer ends as incomplete instead of being replayed.
+            if (!seq || !this._isResponseWritable(res)) {
+                this._handleRequestError(error, res, requestId);
+                return;
+            }
+            this.logger.warn(
+                `[AntiTruncation] ${requestId}: stream interrupted after ${seq} published piece(s) (${error.message}); ending it as incomplete.`
+            );
+            const parts = [{ text: streamed.reasoning, thought: true }, { text: streamed.answer }];
+            response = { candidates: [{ content: { parts }, finishReason: "MAX_TOKENS" }], usageMetadata: {} };
+        }
+        const candidate = response.candidates?.[0];
+        const parts = candidate?.content?.parts || [];
+        for (const thought of [true, false]) {
+            const sent = streamed[thought ? "reasoning" : "answer"];
+            const text = parts
+                .filter(part => (part.thought === true) === thought)
+                .map(part => part.text || "")
+                .join("");
+            // Published pieces always start the final text; only text that was never published is sent here.
+            if (!text.startsWith(sent)) {
+                this.logger.warn(`[AntiTruncation] ${requestId}: final text differs from the streamed segments.`);
+                continue;
+            }
+            const rest = Array.from(text.slice(sent.length));
+            for (let i = 0; i < rest.length; i += 128) {
+                if (i) await new Promise(resolve => setTimeout(resolve, 20));
+                if (!this._isResponseWritable(res)) return;
+                send(textChunk(rest.slice(i, i + 128).join(""), thought));
+            }
+        }
+        if (!this._isResponseWritable(res)) return;
+        send({
+            candidates: [{ content: { parts: [], role: "model" }, finishReason: candidate?.finishReason }],
+            usageMetadata: response.usageMetadata,
+        });
+        this.logger.info(
+            `✅ [Request] Anti-truncation stream completed: reason=${candidate?.finishReason}, pieces=${seq}, request ID: ${requestId}`
+        );
     }
 
     _dispatchProxyRequestForFirstMessage(proxyRequest, requestId, res) {

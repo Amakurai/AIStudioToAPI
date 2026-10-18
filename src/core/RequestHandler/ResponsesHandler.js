@@ -277,6 +277,31 @@ class ResponsesHandler extends RetryHandler {
                                     "Content-Type": "text/event-stream",
                                 });
                             }
+                            if (proxyRequest.anti_truncation) {
+                                // Keep-alives continue while later segments are generated.
+                                const streamState = {
+                                    responseDefaults,
+                                    responseFunctionNameMap,
+                                    sequenceNumber: res.__responseApiSeq,
+                                };
+                                await this._streamAntiTruncationResponse(
+                                    proxyRequest,
+                                    result.message,
+                                    activeQueue,
+                                    res,
+                                    chunk => {
+                                        const events = this.formatConverter.translateGoogleToResponseAPIStream(
+                                            JSON.stringify(chunk),
+                                            model,
+                                            streamState
+                                        );
+                                        // Later error events continue the same sequence numbers.
+                                        res.__responseApiSeq = streamState.sequenceNumber;
+                                        if (events) res.write(events);
+                                    }
+                                );
+                                return;
+                            }
                             // Clear keep-alive timer as we are about to send real data
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
 

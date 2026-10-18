@@ -48,6 +48,7 @@ class ConfigLoader {
     loadConfiguration() {
         const config = {
             aiStudioAppUrl: DEFAULT_AI_STUDIO_APP_URL,
+            antiTruncationSplitThinking: true,
             antiTruncationStreamingMode: "real",
             apiKeys: [],
             apiKeySource: "Not set",
@@ -136,6 +137,8 @@ class ConfigLoader {
         }
         if (["real", "fake"].includes(process.env.ANTI_TRUNCATION_STREAMING_MODE))
             config.antiTruncationStreamingMode = process.env.ANTI_TRUNCATION_STREAMING_MODE;
+        if (process.env.ANTI_TRUNCATION_SPLIT_THINKING)
+            config.antiTruncationSplitThinking = process.env.ANTI_TRUNCATION_SPLIT_THINKING.toLowerCase() !== "false";
         if (process.env.PLAYGROUND_ENABLED)
             config.playgroundEnabled = process.env.PLAYGROUND_ENABLED.toLowerCase() !== "false";
         if (process.env.MAX_CONTEXTS) {

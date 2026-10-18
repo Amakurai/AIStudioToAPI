@@ -2,8 +2,11 @@
 class AntiTruncation {
     // Same segment count for every budget, so a larger output budget never lowers total capacity.
     static MAX_SEGMENTS = 8;
+    // Consecutive repairs allowed for one step; the counter restarts after new text is accepted.
     static MAX_TOOL_REPAIRS = 2;
     static MAX_CHUNK_CHARACTERS = 12000;
+    // A resent prefix of acknowledged text is dropped from a new segment only from this length on.
+    static MIN_REPEATED_CHARACTERS = 32;
     static BLOCKED_FINISH_REASONS = [
         "SAFETY",
         "RECITATION",
@@ -196,6 +199,17 @@ class AntiTruncation {
         }
     }
 
+    /**
+     * Playground has no native forced-calling field: ANY only adds a "Respond using one of the provided
+     * functions." line to the system instruction. The transport tools already require every reply to
+     * use them, so send AUTO and leave the client's system instruction unchanged.
+     */
+    static playgroundBody(request) {
+        const config = request.toolConfig?.functionCallingConfig;
+        if (config?.mode !== "ANY") return request;
+        return { ...request, toolConfig: { functionCallingConfig: { ...config, mode: "AUTO" } } };
+    }
+
     static async forward(handler, spec, authIndex) {
         const registry = handler.connectionRegistry;
         const parent = registry.messageQueues.get(spec.request_id)?.queue;
@@ -237,6 +251,17 @@ class AntiTruncation {
             const body = JSON.parse(spec.body);
             const cancelledError = () =>
                 Object.assign(new Error("Anti-truncation request cancelled."), { cancelled: true });
+            // A leading <thinking> block goes to the client's reasoning field, except for the optional
+            // tool output, whose segments must rebuild the reply byte for byte.
+            const ReasoningSplitter = require("./ReasoningSplitter");
+            const splitThinking =
+                handler.config?.antiTruncationSplitThinking !== false && spec.anti_truncation_output !== "tools";
+            const splitter = splitThinking ? new ReasoningSplitter() : null;
+            let publishedSeq = 0;
+            const publish = pieces => {
+                for (const piece of pieces)
+                    parent.enqueue({ event_type: "tool_output", seq: ++publishedSeq, ...piece });
+            };
             const response = await require("./DuplexToolTransport").generate(
                 body,
                 async requestBody => {
@@ -260,7 +285,9 @@ class AntiTruncation {
                                 {
                                     ...spec,
                                     anti_truncation: false,
-                                    body: JSON.stringify(requestBody),
+                                    body: JSON.stringify(
+                                        spec.channel === "playground" ? this.playgroundBody(requestBody) : requestBody
+                                    ),
                                     path: spec.path.replace(":streamGenerateContent", ":generateContent"),
                                     query_params: { ...spec.query_params, alt: "json" },
                                     request_attempt_id: attempt,
@@ -364,18 +391,42 @@ class AntiTruncation {
                     );
                 },
                 segment => {
-                    if (spec.anti_truncation_segments) parent.enqueue({ event_type: "tool_output", ...segment });
+                    if (!spec.anti_truncation_segments) return;
+                    publish(splitter ? splitter.push(segment.text) : [{ text: segment.text }]);
                 },
                 diagnostic => {
+                    const prefix = `[AntiTruncation] ${spec.request_id}:`;
+                    if (diagnostic.type === "plain_text") {
+                        handler.logger.info(
+                            `${prefix} accepted a plain-text reply as segment ${diagnostic.segments} ` +
+                                `(${diagnostic.characters} characters, ${diagnostic.finishReason})`
+                        );
+                        return;
+                    }
                     const detail =
                         diagnostic.type === "interrupted"
                             ? `upstream round failed after ${diagnostic.segments} accepted segment(s) ` +
                               `(status ${diagnostic.status ?? "unknown"}: ${diagnostic.message}); returning them as incomplete`
-                            : `${diagnostic.type === "repair" ? "rejected" : "repair exhausted on"} transport call: ${diagnostic.issue}`;
-                    handler.logger.warn?.(`[AntiTruncation] ${spec.request_id}: ${detail}`);
+                            : diagnostic.type === "repeat_trimmed"
+                              ? `dropped ${diagnostic.characters} resent acknowledged character(s) from segment ${diagnostic.segments}`
+                              : `${diagnostic.type === "repair" ? "rejected" : "repair exhausted on"} transport call: ${diagnostic.issue}`;
+                    handler.logger.warn?.(`${prefix} ${detail}`);
                 }
             );
             if (cancelled || parent.closed) throw cancelledError();
+            if (splitter && spec.anti_truncation_segments) publish(splitter.push("", true));
+            const candidate = response.candidates[0];
+            const split = splitThinking ? ReasoningSplitter.split(candidate.content.parts[0].text) : null;
+            if (split) {
+                candidate.content.parts = [
+                    ...(split.reasoning ? [{ text: split.reasoning, thought: true }] : []),
+                    { text: split.answer },
+                ];
+                handler.logger.info(
+                    `[AntiTruncation] ${spec.request_id}: returned a ${split.reasoning.length}-character ` +
+                        "leading thinking block as reasoning"
+                );
+            }
             parent.enqueue({
                 event_type: "response_headers",
                 headers: { "content-type": "application/json" },

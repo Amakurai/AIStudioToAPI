@@ -27,6 +27,8 @@ const reply = (seq, text, done, finishReason = "STOP") => ({
     usageMetadata: { candidatesTokenCount: 5, promptTokenCount: 10, totalTokenCount: 15 },
 });
 const textOf = response => response.candidates[0].content.parts[0].text;
+// The transport protocol is carried by the append_output declaration, never by the system instruction.
+const protocolText = request => request.tools[0].functionDeclarations[0].description;
 
 test("only the supported exact opt-in aliases activate, including encoded native paths", () => {
     for (const base of ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"]) {
@@ -346,7 +348,7 @@ test("restored output converts to ordinary text in all non-streaming and SSE for
     }
 });
 
-test("native histories ending in a model turn gain an ordinary user turn; function turns are rejected", () => {
+test("native histories ending in a model turn gain an ordinary user turn; function turns become text", () => {
     const input = body();
     input.contents.push({ parts: [{ text: "previous reply" }], role: "model" });
     const { request } = Duplex.prepare(input);
@@ -354,9 +356,31 @@ test("native histories ending in a model turn gain an ordinary user turn; functi
     assert.equal(request.contents.at(-1).parts[0].text, "\n");
     assert.equal(input.contents.length, 2);
     const withFunction = body();
-    withFunction.contents.push({ parts: [{ functionResponse: { name: "previous", response: {} } }], role: "user" });
+    withFunction.contents.push(
+        {
+            parts: [
+                {
+                    functionCall: { args: { display_stream: "earlier answer" }, name: "dispatch" },
+                    thoughtSignature: "sig",
+                },
+            ],
+            role: "model",
+        },
+        { parts: [{ functionResponse: { name: "dispatch", response: { ok: true } } }], role: "function" },
+        { parts: [{ functionCall: { args: { n: 1 }, name: "count" } }], role: "model" }
+    );
+    const converted = Duplex.prepare(withFunction).request.contents;
+    assert.deepEqual(
+        converted.slice(1).map(turn => [turn.role, turn.parts]),
+        [
+            ["model", [{ text: "earlier answer" }]],
+            ["user", [{ text: '{"ok":true}' }]],
+            ["model", [{ text: '{"n":1}' }]],
+            ["user", [{ text: "\n" }]],
+        ]
+    );
     assert.throws(
-        () => Duplex.prepare(withFunction),
+        () => Duplex.prepare({ contents: [{ parts: [{ inlineData: { data: "x", mimeType: "image/png" } }] }] }),
         error => error.status === 400
     );
 });
@@ -422,6 +446,49 @@ test("native protobuf spellings preserve system instructions and stop sequences"
         () => Duplex.prepare({ ...body(), tool_config: { functionCallingConfig: { mode: "NONE" } } }),
         error => error.status === 400
     );
+});
+
+test("the client's system instruction and conversation carry no transport text", async () => {
+    const withSystem = { ...body(), systemInstruction: { parts: [{ text: "原样保留的系统提示" }] } };
+    const noSystem = body();
+    for (const input of [withSystem, noSystem]) {
+        const { requests } = await runDuplex(
+            [
+                duplexReply("append_output", { seq: 1, text: "A" }),
+                duplexReply("append_output", { seq: 2, text: "B" }),
+                duplexReply("finish_output", { last_seq: 2 }),
+            ],
+            input
+        );
+        for (const request of requests) {
+            assert.deepEqual(request.systemInstruction, input.systemInstruction);
+            const texts = request.contents.flatMap(turn => turn.parts.map(part => part.text).filter(Boolean));
+            assert.ok(
+                texts.every(text => text === "\n" || input.contents.some(turn => turn.parts[0].text === text)),
+                JSON.stringify(texts)
+            );
+        }
+    }
+    const repaired = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: "A" }),
+        duplexReply("append_output", { seq: 3, text: "skipped" }),
+        duplexReply("append_output", { done: true, seq: 2, text: "B" }),
+    ]);
+    assert.equal(repaired.requests[2].systemInstruction, undefined);
+    assert.match(protocolText(repaired.requests[2]), /previous call was rejected/);
+    assert.equal(repaired.requests.length, 3);
+    assert.equal(textOf(repaired.result), "AB");
+});
+
+test("Playground rounds send AUTO instead of ANY so no forced-calling line reaches the system prompt", () => {
+    const { request } = Duplex.prepare(body());
+    const pg = AntiTruncation.playgroundBody(request);
+    assert.equal(pg.toolConfig.functionCallingConfig.mode, "AUTO");
+    assert.deepEqual(pg.toolConfig.functionCallingConfig.allowedFunctionNames, ["append_output", "finish_output"]);
+    assert.equal(request.toolConfig.functionCallingConfig.mode, "ANY", "Build keeps native forced calling");
+    const { WireCodec } = require("../src/core/Playground/WireCodec");
+    assert.equal(WireCodec.encode("gemini-4-argon", pg)[5], null);
+    assert.ok(WireCodec.encode("gemini-4-argon", request)[5], "ANY would have added a system line");
 });
 
 test("malformed upstream envelopes and function statuses fail rather than return a blank success", async () => {
@@ -787,20 +854,23 @@ const incompleteMarkers = {
 
 test("all rate-limited accounts keep accepted text as incomplete and never restart buffered generation", async t => {
     for (const [api, method] of Object.entries(processors)) {
-        await t.test(api, async () => {
-            const h = requestHarness([
-                duplexReply("append_output", { seq: 1, text: "accepted" }),
-                { event_type: "error", message: "upstream rate limit", status: 429 },
-            ]);
-            const res = new FakeResponse();
-            await h.handler[method](apiRequest(api, "gemini-3.7-flash-抗截断", false), res);
-            assert.equal(res.statusCode, 200, res.output);
-            assert.deepEqual(h.sentAccounts, [0, 0, 1, 2]);
-            for (const spec of h.sent.slice(2)) assert.equal(spec.body, h.sent[1].body);
-            assert.equal(visibleText(res, api, false), "accepted");
-            assert.match(res.output, incompleteMarkers[api]);
-            assert.equal(h.registry.messageQueues.size, 0);
-        });
+        for (const stream of [false, true]) {
+            await t.test(`${api} stream=${stream}`, async () => {
+                const h = requestHarness([
+                    duplexReply("append_output", { seq: 1, text: "accepted" }),
+                    { event_type: "error", message: "upstream rate limit", status: 429 },
+                ]);
+                const res = new FakeResponse();
+                await h.handler[method](apiRequest(api, "gemini-3.7-flash-抗截断", stream), res);
+                assert.equal(res.statusCode, 200, res.output);
+                assert.deepEqual(h.sentAccounts, [0, 0, 1, 2]);
+                for (const spec of h.sent.slice(2)) assert.equal(spec.body, h.sent[1].body);
+                assert.equal(visibleText(res, api, stream), "accepted");
+                assert.match(res.output, incompleteMarkers[api]);
+                assert.doesNotMatch(res.output, /upstream rate limit/);
+                assert.equal(h.registry.messageQueues.size, 0);
+            });
+        }
     }
 });
 
@@ -1180,25 +1250,37 @@ function visibleText(res, api, stream) {
         if (api === "claude") return response.content.map(part => part.text || "").join("");
         return response.candidates[0].content.parts.map(part => part.text || "").join("");
     }
-    const events = res.output
+    return textDeltas(res, api).join("");
+}
+
+const sseEvents = res =>
+    res.output
         .split("\n")
         .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
         .map(line => JSON.parse(line.slice(6)));
-    if (api === "openai") return events.map(event => event.choices?.[0]?.delta?.content || "").join("");
-    if (api === "responses")
-        return events
-            .filter(event => event.type === "response.output_text.delta")
-            .map(event => event.delta)
-            .join("");
-    if (api === "claude")
-        return events
-            .filter(event => event.type === "content_block_delta" && event.delta?.type === "text_delta")
-            .map(event => event.delta.text)
-            .join("");
-    return events
-        .flatMap(event => event.candidates?.[0]?.content?.parts || [])
-        .map(part => part.text || "")
-        .join("");
+
+// Non-empty visible text (or with `reasoning`, reasoning text) of each SSE event, in order.
+function textDeltas(res, api, reasoning = false) {
+    const events = sseEvents(res);
+    let deltas;
+    if (api === "openai")
+        deltas = events.map(event => event.choices?.[0]?.delta?.[reasoning ? "reasoning_content" : "content"] || "");
+    else if (api === "responses") {
+        const type = reasoning ? "response.reasoning_summary_text.delta" : "response.output_text.delta";
+        deltas = events.filter(event => event.type === type).map(event => event.delta);
+    } else if (api === "claude") {
+        const type = reasoning ? "thinking_delta" : "text_delta";
+        deltas = events
+            .filter(event => event.type === "content_block_delta" && event.delta?.type === type)
+            .map(event => event.delta[reasoning ? "thinking" : "text"]);
+    } else
+        deltas = events.map(event =>
+            (event.candidates?.[0]?.content?.parts || [])
+                .filter(part => (part.thought === true) === reasoning)
+                .map(part => part.text || "")
+                .join("")
+        );
+    return deltas.filter(Boolean);
 }
 
 test("large Unicode text survives three continuations and all public response formats byte-for-byte", async t => {
@@ -1245,7 +1327,7 @@ test("chunk limits leave headroom for JSON and explicit thinking budgets", async
         let sent = 0;
         const result = await Duplex.generate({ ...body(), generationConfig }, async request => {
             sent++;
-            assert.match(request.systemInstruction.parts.at(-1).text, new RegExp(`within ${limit} characters`));
+            assert.match(protocolText(request), new RegExp(`within ${limit} characters`));
             return reply(sent, `part${sent}`, sent === 4);
         });
         assert.equal(sent, 4);
@@ -1287,7 +1369,7 @@ test("malformed tool repair reduces chunk size without replaying diagnostics or 
                     usageMetadata: { totalTokenCount: 10 },
                 };
             assert.ok(request.contents.at(-3).parts[0].functionCall.args.text.includes("accepted prefix"));
-            assert.match(request.systemInstruction.parts.at(-1).text, /at most 6000 text characters/);
+            assert.match(protocolText(request), /at most 6000 text characters/);
             assert.doesNotMatch(JSON.stringify(request), /PRIVATE_DIAGNOSTIC|NOT_AN_ANSWER/);
             return reply(2, "recovered tail", true);
         },
@@ -1347,7 +1429,8 @@ const duplexTextReplies = texts => [
 
 async function runDuplex(replies, input = body()) {
     const requests = [],
-        published = [];
+        published = [],
+        diagnostics = [];
     const result = await Duplex.generate(
         input,
         async request => {
@@ -1357,9 +1440,10 @@ async function runDuplex(replies, input = body()) {
             return response;
         },
         () => {},
-        segment => published.push(segment)
+        segment => published.push(segment),
+        diagnostic => diagnostics.push(diagnostic)
     );
-    return { published, requests, result };
+    return { diagnostics, published, requests, result };
 }
 
 test("duplex preserves original conversation and signed output acknowledgements without an input round", async () => {
@@ -1376,9 +1460,14 @@ test("duplex preserves original conversation and signed output acknowledgements 
     );
     assert.deepEqual(requests[0].contents, input.contents);
     assert.ok(!JSON.stringify(requests[0]).includes("read_input"));
-    assert.equal(requests[0].systemInstruction.parts[0].text, input.systemInstruction.parts[0].text);
+    // The client's system instruction and conversation are sent unchanged; the protocol lives in the tools.
+    for (const request of requests) assert.deepEqual(request.systemInstruction, input.systemInstruction);
     const acknowledgement = requests[1].contents.find(turn => turn.parts[0].functionResponse).parts[0].functionResponse;
-    assert.deepEqual(acknowledgement.response, { next_seq: 2, received: 1 });
+    assert.equal(acknowledgement.response.next_seq, 2);
+    assert.equal(acknowledgement.response.received, 1);
+    assert.equal(acknowledgement.response.status, "accepted");
+    assert.match(acknowledgement.response.instruction, /append_output seq 2/);
+    assert.deepEqual(requests[1].contents.at(-1), { parts: [{ text: "\n" }], role: "user" });
     assert.equal(acknowledgement.id, "call-1");
     assert.equal(requests[1].contents[1].parts[0].thoughtSignature, "opaque-signature");
     assert.deepEqual(published, [
@@ -1491,7 +1580,7 @@ test("duplex completion flags cannot hide token limits or conflicting duplicate 
         ]);
         assert.equal(result.candidates[0].content.parts[0].text, "AB");
         assert.equal(published.map(segment => segment.text).join(""), "AB");
-        assert.ok(requests[2].systemInstruction.parts.at(-1).text.includes("Transport validation failed"));
+        assert.ok(protocolText(requests[2]).includes("The previous call was rejected"));
     }
 });
 
@@ -2291,7 +2380,7 @@ test("done=true on an empty next segment or a repeated last segment confirms com
         duplexReply("finish_output", { last_seq: 2 }),
     ]);
     assert.equal(early.result.candidates[0].finishReason, "STOP");
-    assert.match(early.requests[3].systemInstruction.parts.at(-1).text, /completion may only follow/);
+    assert.match(protocolText(early.requests[3]), /completion may only follow/);
 });
 
 test("model reasoning in history is dropped and text signatures are kept instead of rejecting the request", async () => {
@@ -2413,4 +2502,415 @@ test("fallback detection covers tools, toolConfig, cachedContent and forced buil
     assert.equal(AntiTruncation.openAIRequiresOriginalModel({ tools: [] }), false);
     assert.equal(AntiTruncation.openAIRequiresOriginalModel({ functions: [{ name: "f" }] }), true);
     assert.equal(AntiTruncation.openAIRequiresOriginalModel({}, { forceWebSearch: true }), true);
+});
+const textReply = (text, finishReason = "STOP", extraParts = []) => ({
+    candidates: [
+        {
+            content: { parts: [...extraParts, { text, thoughtSignature: "text-signature" }], role: "model" },
+            finishReason,
+        },
+    ],
+    usageMetadata: { candidatesTokenCount: 4, promptTokenCount: 6, totalTokenCount: 10 },
+});
+
+test("a plain-text first reply is the answer itself instead of a protocol failure", async () => {
+    const answer = "直接回答🙂\n第二行";
+    const { diagnostics, published, requests, result } = await runDuplex([
+        textReply(answer, "STOP", [{ text: "private reasoning", thought: true }]),
+    ]);
+    assert.equal(requests.length, 1);
+    assert.equal(textOf(result), answer);
+    assert.equal(result.candidates[0].finishReason, "STOP");
+    assert.deepEqual(published, [{ seq: 1, text: answer }]);
+    assert.equal(result.usageMetadata.totalTokenCount, 10);
+    assert.deepEqual(diagnostics, [
+        { characters: answer.length, finishReason: "STOP", segments: 1, type: "plain_text" },
+    ]);
+    const stopped = await runDuplex([textReply("answer<END>hidden")], {
+        ...body(),
+        generationConfig: { stopSequences: ["<END>"] },
+    });
+    assert.equal(textOf(stopped.result), "answer");
+    assert.equal(stopped.result.candidates[0].finishReason, "STOP");
+});
+
+test("a plain-text reply cut off by the output limit continues from where it stopped", async () => {
+    const { published, requests, result } = await runDuplex([
+        textReply("前半段，被截", "MAX_TOKENS"),
+        duplexReply("append_output", { done: true, seq: 2, text: "断的后半段。" }),
+    ]);
+    assert.equal(requests.length, 2);
+    assert.equal(textOf(result), "前半段，被截断的后半段。");
+    assert.equal(result.candidates[0].finishReason, "STOP");
+    assert.deepEqual(
+        published.map(segment => segment.text),
+        ["前半段，被截", "断的后半段。"]
+    );
+    // The cut-off model turn stays verbatim with its signature and is followed only by an empty user
+    // turn; the continuation hint lives in the tool declaration, not in the conversation.
+    assert.deepEqual(requests[1].contents.slice(1), [
+        { parts: [{ text: "前半段，被截", thoughtSignature: "text-signature" }], role: "model" },
+        { parts: [{ text: "\n" }], role: "user" },
+    ]);
+    assert.match(protocolText(requests[1]), /cut off by the output limit.*append_output seq 2/);
+    assert.doesNotMatch(protocolText(requests[1]), /rejected/);
+    assert.equal(requests[1].systemInstruction, undefined);
+    // The reply may keep arriving as plain text until it stops on its own.
+    const continued = await runDuplex([textReply("Part one, ", "MAX_TOKENS"), textReply("part two.")]);
+    assert.equal(continued.requests.length, 2);
+    assert.equal(textOf(continued.result), "Part one, part two.");
+    assert.equal(continued.result.candidates[0].finishReason, "STOP");
+});
+
+test("plain text after a tool acknowledgement is repaired instead of appended", async () => {
+    const { requests, result } = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: "正文。" }),
+        textReply("（以上即全部内容）"),
+        duplexReply("finish_output", { last_seq: 1 }),
+    ]);
+    assert.equal(requests.length, 3);
+    assert.equal(textOf(result), "正文。");
+    assert.equal(result.candidates[0].finishReason, "STOP");
+    assert.match(protocolText(requests[2]), /reply text was sent outside append_output/);
+    assert.match(protocolText(requests[2]), /within 12000 characters/);
+    await assert.rejects(
+        Duplex.generate(body(), async () => textReply(" \n")),
+        /repair exhausted: expected one valid transport tool call/
+    );
+});
+
+test("the repair budget restarts after each accepted segment while total rounds stay bounded", async () => {
+    const malformed = { candidates: [{ finishReason: "MALFORMED_FUNCTION_CALL" }] };
+    const { requests, result } = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: "A" }),
+        malformed,
+        malformed,
+        duplexReply("append_output", { seq: 2, text: "B" }),
+        malformed,
+        malformed,
+        duplexReply("append_output", { done: true, seq: 3, text: "C" }),
+    ]);
+    assert.equal(requests.length, 7);
+    assert.equal(textOf(result), "ABC");
+    assert.equal(result.candidates[0].finishReason, "STOP");
+    let calls = 0;
+    const capped = await Duplex.generate(body(), async () => {
+        calls++;
+        return calls % 2 ? reply((calls + 1) / 2, String(calls), false) : malformed;
+    });
+    assert.equal(calls, AntiTruncation.MAX_SEGMENTS + 1 + AntiTruncation.MAX_TOOL_REPAIRS);
+    assert.equal(textOf(capped), "1357911");
+    assert.equal(capped.candidates[0].finishReason, "MAX_TOKENS");
+});
+
+test("only rounds that ran out of budget or broke their arguments shrink the segment limit", async () => {
+    const ordering = await runDuplex([
+        duplexReply("append_output", { seq: 2, text: "gap" }),
+        duplexReply("append_output", { done: true, seq: 1, text: "A" }),
+    ]);
+    assert.equal(textOf(ordering.result), "A");
+    assert.match(protocolText(ordering.requests[1]), /within 12000 characters/);
+    assert.match(protocolText(ordering.requests[1]), /at most 12000 text characters/);
+    const cutOff = await runDuplex([
+        {
+            candidates: [
+                {
+                    content: { parts: [{ text: "reasoning", thought: true }], role: "model" },
+                    finishReason: "MAX_TOKENS",
+                },
+            ],
+        },
+        duplexReply("append_output", { done: true, seq: 1, text: "A" }),
+    ]);
+    assert.equal(textOf(cutOff.result), "A");
+    assert.match(protocolText(cutOff.requests[1]), /within 6000 characters/);
+});
+
+test("acknowledged text resent at the start of a new segment is dropped; short repeats are kept", async () => {
+    const first = "第一段的完整正文，长度超过三十二个字符，用来确认只有足够长的重发才会被识别并去掉。\n";
+    assert.ok(first.length >= AntiTruncation.MIN_REPEATED_CHARACTERS);
+    const { diagnostics, published, requests, result } = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: first }),
+        duplexReply("append_output", { seq: 2, text: first + "第二段。" }),
+        // An exact resend of what the model sent for seq 2 stays an idempotent acknowledgement.
+        duplexReply("append_output", { seq: 2, text: first + "第二段。" }),
+        duplexReply("append_output", { done: true, seq: 3, text: first + "第二段。第三段。" }),
+    ]);
+    assert.equal(requests.length, 4);
+    assert.equal(textOf(result), first + "第二段。第三段。");
+    assert.equal(result.candidates[0].finishReason, "STOP");
+    assert.deepEqual(
+        published.map(segment => segment.text),
+        [first, "第二段。", "第三段。"]
+    );
+    assert.deepEqual(diagnostics, [
+        { characters: first.length, segments: 2, type: "repeat_trimmed" },
+        { characters: first.length + 4, segments: 3, type: "repeat_trimmed" },
+    ]);
+    // A new seq that only repeats acknowledged text completes with done=true and is repaired otherwise.
+    const repeatDone = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: first }),
+        duplexReply("append_output", { done: true, seq: 2, text: first }),
+    ]);
+    assert.equal(textOf(repeatDone.result), first);
+    assert.equal(repeatDone.result.candidates[0].finishReason, "STOP");
+    const repeatOnly = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: first }),
+        duplexReply("append_output", { seq: 2, text: first }),
+        duplexReply("append_output", { done: true, seq: 2, text: "结尾" }),
+    ]);
+    assert.equal(textOf(repeatOnly.result), first + "结尾");
+    assert.match(protocolText(repeatOnly.requests[2]), /only repeats acknowledged text/);
+    assert.match(protocolText(repeatOnly.requests[2]), /within 12000 characters/);
+    // Short repeats can be real content.
+    const short = await runDuplex([
+        duplexReply("append_output", { seq: 1, text: "重复" }),
+        duplexReply("append_output", { done: true, seq: 2, text: "重复重复" }),
+    ]);
+    assert.equal(textOf(short.result), "重复重复重复");
+});
+
+test("forwarding logs plain-text replies and dropped repeats", async () => {
+    const first = "x".repeat(40);
+    const responses = [
+        textReply(first, "MAX_TOKENS"),
+        duplexReply("append_output", { done: true, seq: 2, text: first + "tail" }),
+    ];
+    let round = 0;
+    const h = harness(queue => {
+        queue.enqueue({ data: JSON.stringify(responses[round++]), event_type: "chunk" });
+        queue.enqueue({ type: "STREAM_END" });
+    });
+    const infos = [];
+    const warnings = [];
+    h.handler.logger = { info: message => infos.push(message), warn: message => warnings.push(message) };
+    await AntiTruncation.forward(h.handler, h.spec, 0);
+    assert.equal((await h.parent.dequeue()).status, 200);
+    assert.equal(textOf(JSON.parse((await h.parent.dequeue()).data)), first + "tail");
+    assert.deepEqual(infos, [
+        "[AntiTruncation] parent: accepted a plain-text reply as segment 1 (40 characters, MAX_TOKENS)",
+        "[AntiTruncation] Requesting next segment for parent",
+    ]);
+    assert.deepEqual(warnings, ["[AntiTruncation] parent: dropped 40 resent acknowledged character(s) from segment 2"]);
+});
+
+test("plain-text upstream replies reach every public API as ordinary text", async t => {
+    for (const [api, method] of Object.entries(processors)) {
+        for (const stream of [false, true]) {
+            await t.test(`${api} stream=${stream}`, async () => {
+                const h = requestHarness([textReply("先输出一半，", "MAX_TOKENS"), textReply("再输出另一半。")]);
+                const res = new FakeResponse();
+                await h.handler[method](apiRequest(api, "gemini-3.8-flash-抗截断", stream), res);
+                assert.equal(res.statusCode, 200, res.output);
+                assert.equal(visibleText(res, api, stream), "先输出一半，再输出另一半。");
+                assert.equal(h.sent.length, 2);
+                assert.ok(!res.output.includes("append_output"), res.output);
+            });
+        }
+    }
+});
+
+test("a plain-text continuation that restarts with the cut-off text keeps it only once", async () => {
+    const first = "被截断的纯文本回复开头，足够长以便识别模型从头重发的情况，而不是正文本身的重复。";
+    assert.ok(first.length >= AntiTruncation.MIN_REPEATED_CHARACTERS);
+    const restarted = await runDuplex([textReply(first, "MAX_TOKENS"), textReply(first + "续写的结尾。")]);
+    assert.equal(textOf(restarted.result), first + "续写的结尾。");
+    assert.equal(restarted.result.candidates[0].finishReason, "STOP");
+    assert.deepEqual(
+        restarted.published.map(segment => segment.text),
+        [first, "续写的结尾。"]
+    );
+    assert.deepEqual(
+        restarted.diagnostics.map(diagnostic => diagnostic.type),
+        ["plain_text", "plain_text", "repeat_trimmed"]
+    );
+    // Repeating the cut-off text and stopping adds nothing and completes it.
+    const repeatedStop = await runDuplex([textReply(first, "MAX_TOKENS"), textReply(first)]);
+    assert.equal(textOf(repeatedStop.result), first);
+    assert.equal(repeatedStop.result.candidates[0].finishReason, "STOP");
+    // Repeating it and being cut off again is repaired instead of looping on the same text.
+    const repeatedCut = await runDuplex([
+        textReply(first, "MAX_TOKENS"),
+        textReply(first, "MAX_TOKENS"),
+        textReply("结尾。"),
+    ]);
+    assert.equal(textOf(repeatedCut.result), first + "结尾。");
+    assert.match(protocolText(repeatedCut.requests[2]), /only repeats acknowledged text/);
+});
+
+// Streaming alias rounds after the first can be held, so tests observe what a client has received meanwhile.
+const holdRounds = () => {
+    const held = [];
+    return { held, hold: spec => (held.push(spec), null) };
+};
+const answerRound = (h, spec, response) => {
+    const queue = h.registry.messageQueues.get(spec.request_id).queue;
+    queue.enqueue({ event_type: "response_headers", status: 200 });
+    queue.enqueue({ data: JSON.stringify(response), event_type: "chunk" });
+    queue.enqueue({ type: "STREAM_END" });
+};
+const until = async (condition, message = "condition not reached") => {
+    for (let i = 0; i < 1000 && !condition(); i++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(condition(), message);
+};
+const streamFinishMarkers = {
+    claude: /event: message_stop/,
+    gemini: /"finishReason"/,
+    openai: /"finish_reason":"/,
+    responses: /event: response\.(?:completed|incomplete)/,
+};
+// Finish reason and total token count of a finished stream.
+const streamEnd = {
+    claude: events => {
+        const delta = events.find(event => event.type === "message_delta");
+        return [delta.delta.stop_reason, delta.usage.input_tokens + delta.usage.output_tokens];
+    },
+    gemini: events => [events.at(-1).candidates[0].finishReason, events.at(-1).usageMetadata.totalTokenCount],
+    openai: events => [events.at(-1).choices[0].finish_reason, events.at(-1).usage.total_tokens],
+    responses: events => [events.at(-1).response.status, events.at(-1).response.usage.total_tokens],
+};
+const completedReasons = { claude: "end_turn", gemini: "STOP", openai: "stop", responses: "completed" };
+
+test("streaming aliases write each accepted segment on every public API before later rounds finish", async t => {
+    const segments = ["第一段：中文🙂\n", '第二段 "quoted" <xml>\\n</xml>\r\n'];
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const { held, hold } = holdRounds();
+            const h = requestHarness([duplexReply("append_output", { seq: 1, text: segments[0] }), hold, hold]);
+            const res = new FakeResponse();
+            const pending = h.handler[method](apiRequest(api, "gemini-3.8-flash-抗截断", true), res);
+            await until(() => held.length === 1 && visibleText(res, api, true) === segments[0], res.output);
+            assert.equal(res.statusCode, 200);
+            assert.equal(res.get("Content-Type"), "text/event-stream");
+            assert.doesNotMatch(res.output, streamFinishMarkers[api]);
+            answerRound(h, held[0], duplexReply("append_output", { seq: 2, text: segments[1] }));
+            await until(() => held.length === 2 && visibleText(res, api, true) === segments.join(""), res.output);
+            assert.deepEqual(textDeltas(res, api), segments);
+            assert.doesNotMatch(res.output, streamFinishMarkers[api]);
+            answerRound(h, held[1], duplexReply("finish_output", { last_seq: 2 }));
+            await pending;
+            assert.equal(visibleText(res, api, true), segments.join(""));
+            // Three rounds of 10 tokens each.
+            assert.deepEqual(streamEnd[api](sseEvents(res)), [completedReasons[api], 30]);
+            assert.doesNotMatch(res.output, /append_output|finish_output|"tool_calls"|functionCall/);
+            assert.equal(h.sent.length, 3);
+            assert.equal(h.registry.messageQueues.size, 0);
+            assert.equal(res.writableEnded, true);
+        });
+    }
+});
+
+test("streaming aliases keep sending heartbeats while a later segment is generated", async t => {
+    const heartbeats = {
+        claude: /^event: ping\ndata: \{\}\n\n/m,
+        gemini: /^: keep-alive\n\n/m,
+        openai: /^: keep-alive\n\n/m,
+        responses: /^: keep-alive\n\n/m,
+    };
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async t => {
+            t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+            const { held, hold } = holdRounds();
+            const h = requestHarness([duplexReply("append_output", { seq: 1, text: "先到的分段" }), hold]);
+            // Keep the held round inside its own deadline while mocked time advances.
+            h.handler.timeouts.FAKE_STREAM = 60000;
+            const res = new FakeResponse();
+            const pending = h.handler[method](apiRequest(api, "gemini-3.7-flash-抗截断", true), res);
+            await until(() => held.length === 1 && visibleText(res, api, true) === "先到的分段", res.output);
+            const delivered = res.output.length;
+            t.mock.timers.tick(18000);
+            assert.match(res.output.slice(delivered), heartbeats[api]);
+            answerRound(h, held[0], duplexReply("finish_output", { last_seq: 1 }));
+            await pending;
+            assert.equal(visibleText(res, api, true), "先到的分段");
+            assert.equal(streamEnd[api](sseEvents(res))[0], completedReasons[api]);
+            assert.equal(h.registry.messageQueues.size, 0);
+        });
+    }
+});
+
+test("a client that disconnects after a streamed segment cancels the active round", async t => {
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const { held, hold } = holdRounds();
+            const h = requestHarness([duplexReply("append_output", { seq: 1, text: "已发送" }), hold]);
+            const res = new FakeResponse();
+            const pending = h.handler[method](apiRequest(api, "gemini-3.8-flash-抗截断", true), res);
+            await until(() => held.length === 1 && visibleText(res, api, true) === "已发送", res.output);
+            res.destroyed = true;
+            res.emit("close");
+            await pending;
+            assert.ok(h.cancelled.some(cancel => cancel.request_id === held[0].request_id));
+            assert.equal(h.sent.length, 2);
+            assert.equal(h.registry.messageQueues.size, 0);
+            assert.doesNotMatch(res.output, streamFinishMarkers[api]);
+        });
+    }
+});
+
+test("streaming aliases return the original error when the first round fails before any segment", async t => {
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const h = requestHarness([{ event_type: "error", message: "upstream rate limit", status: 429 }]);
+            const res = new FakeResponse();
+            await h.handler[method](apiRequest(api, "gemini-3.7-flash-抗截断", true), res);
+            // OpenAI opens its SSE stream before generation and reports the error inside it.
+            assert.equal(res.statusCode, api === "openai" ? 200 : 429, res.output);
+            assert.match(res.output, /upstream rate limit/);
+            if (api === "openai") assert.match(res.output, /"code":429/);
+            assert.deepEqual(h.sentAccounts, [0, 1, 2]);
+            assert.equal(textDeltas(res, api).length, 0);
+            assert.equal(h.registry.messageQueues.size, 0);
+        });
+    }
+});
+
+test("ANTI_TRUNCATION_STREAMING_MODE=fake buffers every API, then sends the same text in paced chunks", async t => {
+    const segments = ["前".repeat(150) + "🙂", "后".repeat(140) + "\n结尾"];
+    const expected = segments.join("");
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const { held, hold } = holdRounds();
+            const h = requestHarness([duplexReply("append_output", { seq: 1, text: segments[0] }), hold]);
+            h.handler.config.antiTruncationStreamingMode = "fake";
+            const res = new FakeResponse();
+            const pending = h.handler[method](apiRequest(api, "gemini-3.8-flash-抗截断", true), res);
+            await until(() => held.length === 1);
+            assert.equal(visibleText(res, api, true), "");
+            answerRound(h, held[0], duplexReply("append_output", { done: true, seq: 2, text: segments[1] }));
+            await pending;
+            const deltas = textDeltas(res, api);
+            assert.equal(deltas.join(""), expected);
+            assert.deepEqual(
+                deltas.map(delta => Array.from(delta).length),
+                [128, 128, Array.from(expected).length - 256]
+            );
+            assert.deepEqual(streamEnd[api](sseEvents(res)), [completedReasons[api], 20]);
+            assert.equal(h.registry.messageQueues.size, 0);
+        });
+    }
+});
+
+test("a leading thinking block streams as each API's reasoning before the answer", async t => {
+    const segments = ["<thinking>先想", "一想</thinking>\n正文开始，", "正文结束。"];
+    for (const [api, method] of Object.entries(processors)) {
+        await t.test(api, async () => {
+            const { held, hold } = holdRounds();
+            const h = requestHarness([
+                duplexReply("append_output", { seq: 1, text: segments[0] }),
+                duplexReply("append_output", { seq: 2, text: segments[1] }),
+                hold,
+            ]);
+            const res = new FakeResponse();
+            const pending = h.handler[method](apiRequest(api, "gemini-3.8-flash-抗截断", true), res);
+            await until(() => held.length === 1 && visibleText(res, api, true) === "正文开始，", res.output);
+            assert.deepEqual(textDeltas(res, api, true), ["先想", "一想"]);
+            answerRound(h, held[0], duplexReply("append_output", { done: true, seq: 3, text: segments[2] }));
+            await pending;
+            assert.equal(textDeltas(res, api, true).join(""), "先想一想");
+            assert.equal(visibleText(res, api, true), "正文开始，正文结束。");
+            assert.doesNotMatch(res.output, /<\/?thinking>/);
+            assert.equal(streamEnd[api](sseEvents(res))[0], completedReasons[api]);
+        });
+    }
 });

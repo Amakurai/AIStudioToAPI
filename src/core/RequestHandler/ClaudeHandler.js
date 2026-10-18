@@ -205,6 +205,25 @@ class ClaudeHandler extends RetryHandler {
                                     "Content-Type": "text/event-stream",
                                 });
                             }
+                            if (proxyRequest.anti_truncation) {
+                                // Keep-alives continue while later segments are generated.
+                                const streamState = {};
+                                await this._streamAntiTruncationResponse(
+                                    proxyRequest,
+                                    result.message,
+                                    activeQueue,
+                                    res,
+                                    chunk => {
+                                        const events = this.formatConverter.translateGoogleToClaudeStream(
+                                            JSON.stringify(chunk),
+                                            model,
+                                            streamState
+                                        );
+                                        if (events) res.write(events);
+                                    }
+                                );
+                                return;
+                            }
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
 
                             this.logger.info(`[Request] Claude streaming response (Fake Mode) started...`);

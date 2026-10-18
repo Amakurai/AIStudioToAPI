@@ -59,7 +59,10 @@ class GeminiHandler extends RetryHandler {
             }
 
             const wantsStream = req.path.includes(":streamGenerateContent");
-            res.__proxyResponseStreamMode = wantsStream ? proxyRequest.streaming_mode : null;
+            const streamMode = wantsStream
+                ? this._prepareAntiTruncationStream(proxyRequest, true) || proxyRequest.streaming_mode
+                : null;
+            res.__proxyResponseStreamMode = streamMode;
 
             this._updateTrackedRequest(requestId, {
                 isStreaming: wantsStream,
@@ -70,7 +73,7 @@ class GeminiHandler extends RetryHandler {
                     proxyRequest.path,
                     isGenerativeRequest ? "generation" : "request"
                 ),
-                streamMode: wantsStream ? proxyRequest.streaming_mode : null,
+                streamMode,
             });
 
             try {
@@ -169,6 +172,13 @@ class GeminiHandler extends RetryHandler {
                 res.setHeader("Content-Type", "text/event-stream");
                 res.setHeader("Cache-Control", "no-cache");
                 res.setHeader("Connection", "keep-alive");
+            }
+            if (proxyRequest.anti_truncation) {
+                // Keep-alives continue while later segments are generated.
+                await this._streamAntiTruncationResponse(proxyRequest, result.message, activeQueue, res, chunk =>
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+                );
+                return;
             }
             // Clear the keep-alive timer as we are about to send real data
             clearTimeout(connectionMaintainer);

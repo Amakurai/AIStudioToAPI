@@ -30,14 +30,29 @@ Argon 的模型 ID 来自 AI Studio 界面；模型列表暂不填未经确认�
 
 ## 工作方式
 
-1. 原始文本对话直接作为上游对话发送，保留 user/model 角色和 system 指令优先级。不再调用 `read_input`，也不生成任务 ID。
-2. 模型通过 `append_output(seq, text, done)` 按顺序交付正文。序号从 1 开始；未完成时，网关确认收到后才继续。相同序号和相同内容不会重复拼接；缺号、同号不同内容等进入有限修复。
-3. 最后一个新分段可通过 `done: true` 同时确认全文完成，且该轮上游必须正常 `STOP`。能在一段内完成的回答只需一次上游调用。以下写法与 `finish_output(last_seq)` 等价，也视为完成：下一序号的空文本加 `done: true`，或原样重发最后一个已确认分段并加 `done: true`。空回答可用 `finish_output(0)` 或 `append_output(1, "", true)`。没有有效完成确认时保留已收到的正文，并标记未完成，不伪装成完整回答。`MAX_TOKENS` 不会因为 `done: true` 被当成正常完成。
-4. 已确认至少一段后，若后续某轮上游出错（HTTP 错误、单轮超时、返回无效 JSON 等），不再丢弃前文，也不整单重放：直接返回已确认的正文并标记未完成（OpenAI `length`、Claude `max_tokens`、Responses `incomplete`、Gemini `MAX_TOKENS`），错误原因写入日志。第一段尚未确认时出错，仍按原有策略返回错误或重试。
+1. 原始文本对话直接作为上游对话发送，保留 user/model 角色和 system 指令优先级。不再调用 `read_input`，也不生成任务 ID。系统提示和对话内容不追加任何协议文字：分段规则只写在 `append_output`/`finish_output` 的工具描述里，续写提示放在每次确认的工具返回值中，修复提示写进下一轮的工具描述；确认之后只补一个空的 user 轮次（与普通链路在函数轮次后补的相同）。Playground 原生协议没有强制调用字段，抗截断的 Playground 轮次使用 `AUTO`，不再往系统提示追加 “Respond using one of the provided functions.”；模型因此可能不调用工具、直接回复纯文本，处理方式见第 4 条。
+2. 模型通过 `append_output(seq, text, done)` 按顺序交付正文。序号从 1 开始；未完成时，网关确认收到后才继续。相同序号和相同内容不会重复拼接；缺号、同号不同内容等进入有限修复。新分段开头若原样重发了已确认的正文（至少 32 个字符），只去掉重复部分再拼接，并记录警告；只重发已确认正文的新序号不算新内容（带 `done: true` 时视为完成确认，否则进入修复）。短于 32 个字符的重复可能就是正文本身，原样保留。
+3. 最后一个新分段可通过 `done: true` 同时确认全文完成，且该轮上游必须正常 `STOP`。能在一段内完成的回答只需一次上游调用。以下写法与 `finish_output(last_seq)` 等价，也视为完成：下一序号的空文本加 `done: true`，或原样重发已确认的末尾正文并加 `done: true`。空回答可用 `finish_output(0)` 或 `append_output(1, "", true)`。没有有效完成确认时保留已收到的正文，并标记未完成，不伪装成完整回答。`MAX_TOKENS` 不会因为 `done: true` 被当成正常完成。
+4. 模型没有调用工具、直接回复纯文本时（思考内容不计入）：若尚未确认任何分段，这段文本就是回答本身，与原模型直接返回的相同。上游正常 `STOP` 即视为完成，单轮结束；被 `MAX_TOKENS` 截断时保留这段文本，原样放入历史，并在下一轮的工具描述中提示从断点用 `append_output` 续写，续写仍以纯文本到达时同样接收，直到上游正常结束。已经通过工具确认过分段后再出现的纯文本可能只是附言，不拼接，按协议错误修复。只含空白的纯文本同样进入修复。
+5. 已确认至少一段后，若后续某轮上游出错（HTTP 错误、单轮超时、返回无效 JSON 等），不再丢弃前文，也不整单重放：直接返回已确认的正文并标记未完成（OpenAI `length`、Claude `max_tokens`、Responses `incomplete`、Gemini `MAX_TOKENS`），错误原因写入日志。第一段尚未确认时出错，仍按原有策略返回错误或重试。
 
 历史中的模型思考内容（如 Claude 回传的 thinking 块，转换后为 `thought: true` 的部分）会在发送前移除，不再导致多轮请求被拒；文本部分上的 `thoughtSignature` 原样保留。只含思考内容的模型轮次整轮移除。
 
 工具历史保留真实调用 ID、完整模型回复和 thought signature，参见 [Gemini 官方说明](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)。不建立全局任务读取接口，不支持跨请求或断线后的会话恢复。
+
+## 开头的思考块
+
+很多预设要求模型先在 `<thinking>…</thinking>`（或 `<think>…</think>`）里写思考，再写正文。SillyTavern 等客户端会在**第一个**结束标签处截断思考块；模型在思考里引用格式（例如 `` `<thinking>…</thinking>` 工作日志 ``）时，后半段思考连同真正的 `</thinking>` 就会露进正文。
+
+因此，抗截断别名的回答若以这类标签开头（允许前导空白），网关会自己找到真正的结束标签，把思考块放进各接口原生的推理字段，正文从结束标签之后开始：
+
+- 结束标签前紧挨反引号，或同一行更早处写过对应的开始标签，视为思考中的引用，不算结束。
+- OpenAI 返回 `reasoning_content`（真流式时随分段即时发送，假流式先发推理再发正文），Claude 返回 `thinking` 块，Responses 返回 reasoning 摘要，Gemini 原生返回 `thought: true` 的部分。思考块和正文开头的空白会去掉；只有开头的思考块会被拆出，正文里再出现的标签原样保留。不以这类标签开头的回答一字不改。
+- 回答在思考块内结束（例如未完成）时，全部内容都作为推理返回。
+- SillyTavern 只在启用“请求模型推理”（Request model reasoning）时显示接口返回的推理；未启用时思考块不显示，正文不受影响。
+- 可选工具输出格式（`X-Anti-Truncation-Output: tools`）不拆分，以便按字节还原。需要保留原样正文时，设置 `ANTI_TRUNCATION_SPLIT_THINKING=false`。
+
+拆分时记录 `[AntiTruncation] <请求 ID>: returned a N-character leading thinking block as reasoning`。
 
 ## Playground 链路
 
@@ -50,20 +65,27 @@ Argon 的模型 ID 来自 AI Studio 界面；模型列表暂不填未经确认�
 
 ## 流式输出与限制
 
-- **OpenAI Chat Completions**：使用独立的 `ANTI_TRUNCATION_STREAMING_MODE`（默认 `real`），不受普通模型 `STREAMING_MODE` 影响。`real` 模式在收到完整、有效的正文分段时立即返回；粒度是已确认分段，不是半截工具参数的字符流。单段回答可能一次返回，看起来没有逐字输出。`fake` 模式先收齐所有分段，再以短间隔分块发送 SSE 正文，呈现逐步显示效果。两种模式均在参数验证通过后立即发送 SSE 响应头和助手起始帧，再等待后端就绪与生成；内部上游请求均为非流式，等待期间每 10 秒发送 SSE 心跳。
-- **Responses、Claude、Gemini 原生接口**：使用同样的内部工具协议，当前仍先缓冲整次结果，再转换成对应的流式或普通响应格式。
+- **流式模式**：OpenAI Chat Completions、Responses、Claude Messages 和 Gemini 原生 `streamGenerateContent` 的抗截断别名都使用独立的 `ANTI_TRUNCATION_STREAMING_MODE`（默认 `real`），不受普通模型 `STREAMING_MODE` 影响。`real` 模式在收到完整、有效的正文分段时立即以各接口自己的 SSE 增量格式发出（OpenAI `delta.content`、Responses `response.output_text.delta`、Claude `text_delta`、Gemini 数据块的 `parts`）；粒度是已确认分段，不是半截工具参数的字符流。单段回答可能一次返回，看起来没有逐字输出。`fake` 模式先收齐所有分段，再以短间隔按最多 128 个字符分块发送，呈现逐步显示效果。拆出的思考块先于正文，以各接口的推理增量发送。两种模式拼接后的正文与非流式结果逐字节一致；内部上游请求均为非流式。
+- 最后一帧不含正文，携带结束原因和整次回答累计的用量：完成为 OpenAI `stop`、Claude `end_turn`、Responses `completed`、Gemini `STOP`；未完成为 `length`、`max_tokens`、`incomplete`、`MAX_TOKENS`；审核拦截与非流式结果相同。Claude 的 `message_start` 随首段发出，此时用量尚未汇总，输入/输出 token 以最后的 `message_delta` 为准。
+- **OpenAI Chat Completions**：参数验证通过后立即发送 SSE 响应头和助手起始帧，再等待后端就绪与生成；等待期间每 10 秒发送 SSE 心跳。
+- **Responses、Claude、Gemini 原生接口**：SSE 响应头随首个心跳或首段发出。等待首段、等待后续分段以及 `fake` 模式收齐期间，每 12–18 秒发送一次心跳（Claude 为 `event: ping`，Responses 和 Gemini 为 SSE 注释），心跳不含正文。
 - OpenAI 起始时连续发送助手角色帧和空内容帧，兼容 `new-api` 等暂存最后一帧的中转，避免起始帧被扣到后续心跳或正文到达。两帧均不包含正文；假流仍在生成完成后才发送正文。
 - 多层 Nginx/OpenResty 代理还需透传 `X-Accel-Buffering` 响应头，否则公网层可能重新缓冲起始帧和心跳。配置与公网验证方法见 [Nginx 多层代理配置](zh/nginx-setup.md#-多层代理配置)。
-- 无论输出预算多少，最多接受 8 段；使用独立完成确认时额外占一轮，另有最多 2 次协议修复。每段字符上限为单次输出预算（`max_tokens` / `maxOutputTokens`）的 75%，并先扣除显式的 `thinkingBudget`，范围 64–12000；未设置预算时为 12000。总容量随预算单调增加，调大预算不会减少可输出长度。格式错误或被截断的工具调用会在修复时把上限减半。
+- 无论输出预算多少，最多接受 8 段；整次回答最多 11 次上游调用（8 段、独立完成确认 1 轮、修复余量 2 轮）。协议修复按步计算：同一步最多连续修复 2 次，收到新正文后重新计数，所有轮次共用 11 次的总上限，因此分散在多段中的偶发错误不会提前耗尽修复次数。每段字符上限为单次输出预算（`max_tokens` / `maxOutputTokens`）的 75%，并先扣除显式的 `thinkingBudget`，范围 64–12000；未设置预算时为 12000。总容量随预算单调增加，调大预算不会减少可输出长度。只有输出预算耗尽（`MAX_TOKENS`）或参数损坏（`MALFORMED_FUNCTION_CALL`）的轮次会在修复时把上限减半；缺号、同号不同内容、重复正文等顺序错误重试时保持原上限，不会让后续分段无谓变短。
 - 每次内部上游调用分别受 `FAKE_STREAM_TIMEOUT_MS` 限制。单轮超时只结束该轮，已确认正文按未完成返回，整次回答可能超过该时长；重复确认仍受总轮次限制。客户端或中间代理自身的绝对超时仍可能提前结束请求。
-- 每次被拒的工具调用都会以 `[AntiTruncation] <请求 ID>: rejected transport call: <原因>` 记录警告；修复轮与正常续写分别记录为 `Retrying rejected transport call` 和 `Requesting next segment`。
+- 每次被拒的工具调用都会以 `[AntiTruncation] <请求 ID>: rejected transport call: <原因>` 记录警告；修复轮与正常续写分别记录为 `Retrying rejected transport call` 和 `Requesting next segment`。直接接收的纯文本回复记录为 `accepted a plain-text reply as segment <序号>`（INFO），去掉的重发正文记录为 `dropped <N> resent acknowledged character(s)`（警告）。
 - 所有内部调用计入配额和用量；父请求与内部子请求不重复计算为用户并发。客户端断开会取消内部请求并清理队列。
 - 停止字符串支持字符串或数组，在正文上处理，支持跨段匹配。中文、emoji、换行、Markdown、XML 和转义字符原样保留。
 - 停止词检查只扫描新增正文及可能跨段匹配的前缀重叠区域，避免每轮重复扫描整篇文章。完成时会交付暂存但未构成停止词的尾部文本。
 - 未完成时返回相应的长度限制状态；Responses 使用 `incomplete`。明确审核拦截保留此前已确认的正文，同时返回拦截状态，不重试审核拦截。
-- OpenAI 流式连接建立后，后端就绪失败或首段确认前的上游 HTTP 错误通过 SSE error 返回，并保留错误码；首段确认后的错误按上文返回未完成结果。均不换账号重放已产生的内容。参数验证失败仍返回普通 HTTP 错误。其他缓冲接口仅在首段确认前保留原有 HTTP 错误重试策略；协议校验错误不换账号重试。
+- OpenAI 流式连接建立后，后端就绪失败或首段确认前的上游 HTTP 错误通过 SSE error 返回，并保留错误码；首段确认后的错误按上文返回未完成结果。均不换账号重放已产生的内容。参数验证失败仍返回普通 HTTP 错误。Responses、Claude、Gemini 原生接口在首段发出前保留原有错误处理和重试策略：响应头尚未发出时返回普通 HTTP 错误（保留状态码），心跳已发出时以该接口的 SSE error 返回；协议校验错误不换账号重试。首段发出后，后续轮次出错或连接中断都以已发出的正文结束为未完成，不再整单重试。
+- 客户端在分段之间断开时，网关立即取消正在进行的内部上游轮次并清理队列，不再发起后续轮次。
 
-仅接受文本对话与单候选文本输出。图片、音频、已有工具调用、客户端工具、强制内置工具、缓存上下文或结构化输出等不兼容组合会明确报错，请改用原模型。原生请求兼容常见蛇形和驼峰参数写法；计数接口只映射模型别名，不包含内部工具和多轮调用开销。
+请求带有工具时不走抗截断，直接按原模型转发（与不带后缀的原模型完全相同）：客户端声明的工具（OpenAI `tools`/`functions`、Claude `tools`、Gemini `tools`）、`toolConfig`、缓存上下文（`cachedContent`），以及管理设置中开启的强制联网搜索、URL 上下文、代码执行，任一存在即回退，日志记录为 `[AntiTruncation] Request #<请求 ID> carries tools or cachedContent; forwarding to the base model without anti-truncation.`。预设自带工具时同样回退，由客户端自行处理工具调用。
+
+不带工具的请求走分段协议：历史中已有的工具调用转为普通文本（调用参数全是字符串时拼接其内容，否则写成 JSON；工具结果写成 JSON 并作为 user 轮次）。图片、音频等非文本输入，以及多候选、结构化或多模态输出会明确报错，请改用原模型。
+
+原生请求兼容常见蛇形和驼峰参数写法；计数接口只映射模型别名，不包含内部工具和多轮调用开销。
 
 抗截断改变的是输出传输方式和有限续写行为。上游仍能检查原始对话和工具参数；不能保证无限长度输出，也不能保证减少审核拦截。此前的非露骨成人主题对照中，原模型和两种工具模式都正常返回，因此不能据此证明审核绕过效果。
 
@@ -99,4 +121,4 @@ node tests/duplex-live.js --run --upstream --model=gemini-3.8-flash
 结果保存在 `artifacts/anti-truncation/duplex/`。旧结果可能包含此前的输入读取轮次，不能用来证明当前版本的延迟和调用次数；当前改动已通过本地模拟回归，真实模型效果需重新运行上述测试。旧的单向 `deliver_response` 引擎及其对照脚本已移除，所有别名请求均使用上述分段协议。
 
 修改后需重启服务；容器部署需重建镜像。无需新增环境变量或管理界面设置。
-抗截断别名的 OpenAI 流式模式只由 `ANTI_TRUNCATION_STREAMING_MODE` 决定；需要先收齐再分块发送时，在部署环境中设置 `ANTI_TRUNCATION_STREAMING_MODE=fake`。管理页面切换的 `STREAMING_MODE` 只影响普通模型。
+抗截断别名在全部四种接口上的流式模式只由 `ANTI_TRUNCATION_STREAMING_MODE` 决定；需要先收齐再分块发送时，在部署环境中设置 `ANTI_TRUNCATION_STREAMING_MODE=fake`。管理页面切换的 `STREAMING_MODE` 只影响普通模型。

@@ -130,6 +130,7 @@ class DuplexOpenAI {
             const authIndex = handler._selectDispatchAuthIndex();
             const spec = {
                 anti_truncation_mode: "duplex",
+                anti_truncation_output: output,
                 anti_truncation_segments: true,
                 body: JSON.stringify(googleRequest),
                 headers: { "Content-Type": "application/json" },
@@ -174,7 +175,9 @@ class DuplexOpenAI {
                             frame(
                                 output === "tools"
                                     ? { tool_calls: [{ index: calls.length - 1, ...call }] }
-                                    : { content: message.text }
+                                    : message.thought
+                                      ? { reasoning_content: message.text }
+                                      : { content: message.text }
                             )
                         );
                     }
@@ -201,11 +204,17 @@ class DuplexOpenAI {
                         }
                     } else {
                         // The upstream answer is complete. Pace Unicode-safe SSE chunks so
-                        // clients still display a visible stream in fake mode.
-                        const characters = Array.from(converted.choices[0].message.content || "");
-                        for (let i = 0; i < characters.length; i += 128) {
-                            await write(frame({ content: characters.slice(i, i + 128).join("") }));
-                            if (i + 128 < characters.length) await new Promise(resolve => setTimeout(resolve, 20));
+                        // clients still display a visible stream in fake mode; reasoning comes first.
+                        const { content, reasoning_content: reasoning } = converted.choices[0].message;
+                        for (const [field, text] of [
+                            ["reasoning_content", reasoning],
+                            ["content", content],
+                        ]) {
+                            const characters = Array.from(text || "");
+                            for (let i = 0; i < characters.length; i += 128) {
+                                await write(frame({ [field]: characters.slice(i, i + 128).join("") }));
+                                if (i + 128 < characters.length) await new Promise(resolve => setTimeout(resolve, 20));
+                            }
                         }
                     }
                 }
