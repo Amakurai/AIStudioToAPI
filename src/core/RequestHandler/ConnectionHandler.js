@@ -405,7 +405,7 @@ class ConnectionHandler extends ErrorHandler {
 
         // Keep the ascending order from _getReadyAuthIndices so the round-robin
         // cursor walks accounts deterministically
-        // Build, Playground and Build Chat use separate pages per account, so each balances only its own load.
+        // Build and Playground use separate pages per account, so each balances only its own load.
         const channel = this.dispatchChannel || "build";
         const load = authIndex => this.connectionRegistry.getQueueCountForAuth(authIndex, channel);
         let minQueueCount = Infinity;

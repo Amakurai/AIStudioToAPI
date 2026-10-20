@@ -17,8 +17,6 @@
 
 Build 和 Playground 是两条独立链路，由模型名前缀决定：`build-` 前缀（如 `build-gemini-4-argon`、`build-gemini-4-argon-抗截断`）走 Build，模型列表来自 `configs/models.json`；`pg-` 前缀（如 `pg-gemini-4-argon`、`pg-gemini-4-argon-抗截断`）走 Playground，模型列表来自 `configs/playground-models.json` 及 Playground 页面的原生目录。两条链路互不回退，均支持抗截断。不带前缀的旧模型名仍按 Build 处理。共用已登录账号池，无需额外抓取 Cookie。详见 [Playground 说明](docs/playground.md)。
 
-`bdc-` 前缀（如 `bdc-gemini-4-argon`）走 Build 编辑器左侧的对话助手（Build Chat），按 AI Studio 订阅档位使用额度；Build App 运行时的 Argon 免费额度为 0 时，可用它调用 Argon。它是写代码的 Agent：只支持文本，每次请求使用一个用完即删的临时 App，简单问答约 20～30 秒。详见 [Build Chat 说明](docs/build-chat.md)。
-
 ## 🚀 快速开始
 
 ### 💻 直接运行（Windows / macOS / Linux）

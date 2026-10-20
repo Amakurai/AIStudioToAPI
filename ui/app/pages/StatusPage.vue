@@ -643,17 +643,17 @@
                         <h3 class="card-title">{{ t("modelChannels") }}</h3>
                         <p>{{ t("modelChannelsHelp") }}</p>
                         <details
-                            v-for="channel in ['build', 'playground', 'buildchat']"
+                            v-for="channel in ['build', 'playground']"
                             :key="channel"
                             :open="channel === 'playground'"
                         >
                             <summary>
-                                {{ { build: "Build", buildchat: "Build Chat", playground: "Playground" }[channel] }} ({{
-                                    (state.modelChannels[channel] || []).length
+                                {{ channel === "build" ? "Build" : "Playground" }} ({{
+                                    state.modelChannels[channel].length
                                 }})
                             </summary>
                             <ul style="overflow-wrap: anywhere">
-                                <li v-for="model in state.modelChannels[channel] || []" :key="model">{{ model }}</li>
+                                <li v-for="model in state.modelChannels[channel]" :key="model">{{ model }}</li>
                             </ul>
                         </details>
                     </div>
@@ -3946,7 +3946,7 @@ const state = reactive({
     logScrollTop: 0,
     maxContexts: 1,
     maxRetries: 3,
-    modelChannels: { build: [], buildchat: [], playground: [] },
+    modelChannels: { build: [], playground: [] },
     releaseUrl: null,
     safetySettingsThreshold: "OFF",
     selectedAccounts: new Set(), // Selected account indices
@@ -4758,7 +4758,7 @@ const updateStatus = data => {
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.maxContexts = data.status.maxContexts ?? 1;
     state.maxRetries = data.status.maxRetries ?? 3;
-    state.modelChannels = data.status.modelChannels || { build: [], buildchat: [], playground: [] };
+    state.modelChannels = data.status.modelChannels || { build: [], playground: [] };
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
 
     const validIndices = new Set(state.accountDetails.map(acc => acc.index));

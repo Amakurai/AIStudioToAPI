@@ -53,7 +53,6 @@ class ConfigLoader {
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
-            buildChatEnabled: true,
             checkUpdate: true,
             enableAuthUpdate: true,
             enableUsageStats: true,
@@ -146,8 +145,6 @@ class ConfigLoader {
             config.antiTruncationSplitThinking = process.env.ANTI_TRUNCATION_SPLIT_THINKING.toLowerCase() !== "false";
         if (process.env.PLAYGROUND_ENABLED)
             config.playgroundEnabled = process.env.PLAYGROUND_ENABLED.toLowerCase() !== "false";
-        if (process.env.BUILD_CHAT_ENABLED)
-            config.buildChatEnabled = process.env.BUILD_CHAT_ENABLED.toLowerCase() !== "false";
         if (process.env.MAX_CONTEXTS) {
             const parsed = parseInt(process.env.MAX_CONTEXTS, 10);
             config.maxContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.maxContexts;
@@ -258,17 +255,6 @@ class ConfigLoader {
             config.playgroundModelList = [];
             if (error.code !== "ENOENT")
                 this.logger.error(`[System] Failed to read or parse playground-models.json: ${error.message}`);
-        }
-
-        // Build Chat lists the models of the Build editor's chat model menu.
-        const buildChatModelsPath = path.join(process.cwd(), "configs", "buildchat-models.json");
-        try {
-            const buildChatModels = JSON.parse(fs.readFileSync(buildChatModelsPath, "utf-8"))?.models;
-            config.buildChatModelList = Array.isArray(buildChatModels) ? buildChatModels : [];
-        } catch (error) {
-            config.buildChatModelList = [];
-            if (error.code !== "ENOENT")
-                this.logger.error(`[System] Failed to read or parse buildchat-models.json: ${error.message}`);
         }
 
         this._printConfiguration(config);
