@@ -477,7 +477,8 @@ class ProxyServerSystem extends EventEmitter {
         app.use(this._createAuthMiddleware());
 
         // API routes
-        // Each channel lists its own models: build-* from configs/models.json, pg-* from Playground.
+        // Each channel lists its own models: build-* from configs/models.json, pg-* from Playground,
+        // bdc-* from configs/buildchat-models.json.
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
             const channels = this.requestHandler.channelModels();
@@ -511,7 +512,7 @@ class ProxyServerSystem extends EventEmitter {
         app.use((req, res, next) => {
             const reason = this.requestHandler._unsupportedPlaygroundRequest(req);
             if (!reason) return next();
-            this.logger.warn(`[Request] Rejected Playground request ${req.method} ${req.path}: ${reason}`);
+            this.logger.warn(`[Request] Rejected Playground/Build Chat request ${req.method} ${req.path}: ${reason}`);
             const apiFormat = req.path.startsWith("/v1/messages")
                 ? "claude"
                 : req.path.startsWith("/v1/responses")

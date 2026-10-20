@@ -7,6 +7,7 @@
 
 const AntiTruncation = require("../AntiTruncation");
 const AuthSwitcher = require("../../auth/AuthSwitcher");
+const BuildChatTransport = require("../BuildChat/Transport");
 const FormatConverter = require("../FormatConverter");
 const ModelChannel = require("../ModelChannel");
 const PlaygroundCatalog = require("../Playground/Catalog");
@@ -38,6 +39,7 @@ class RequestHandler {
              */ (new FormatConverter(logger, serverSystem));
 
         this.playground = new PlaygroundTransport(this);
+        this.buildChat = new BuildChatTransport(this);
         this.needsSwitchingAfterRequest = false;
 
         // Round-robin cursor for multi-account dispatch: rotates among equally
@@ -72,23 +74,25 @@ class RequestHandler {
         this.authSwitcher.isSystemBusy = value === true;
     }
 
-    /** Public model metadata per channel; names carry the channel prefix (`models/build-…`, `models/pg-…`). */
+    /** Public model metadata per channel; names carry the channel prefix (`models/build-…`, `models/pg-…`, `models/bdc-…`). */
     channelModels() {
         const publish = (channel, models) =>
             models.map(model => ({ ...model, name: `models/${ModelChannel.publicName(channel, model.name)}` }));
         return {
             build: publish("build", this.config.modelList || []),
+            buildchat: publish("buildchat", this.buildChat.models()),
             playground: publish("playground", this.playground.models()),
         };
     }
 
     /**
-     * Requests for a `pg-` model are rejected up front unless they generate content: Playground has
-     * no token counting, embeddings, uploads or model lookup.
+     * Requests for a `pg-` or `bdc-` model are rejected up front unless they generate content:
+     * neither channel has token counting, embeddings, uploads or model lookup.
      * @returns {string|null} Reason for rejecting the request, or null when it may proceed.
      */
     _unsupportedPlaygroundRequest(req) {
         const { channel, method, model } = this._requestModel(req);
+        if (channel === "buildchat") return this._unsupportedBuildChatRequest(req, method, model);
         if (channel !== "playground") return null;
         if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
         const upstream = AntiTruncation.baseModel(model) || FormatConverter.stripModelSuffixes(model);
@@ -101,6 +105,17 @@ class RequestHandler {
                 ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(method)
                 : ["/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/audio/speech"].includes(req.path);
         return generates ? null : "Playground models only support content generation.";
+    }
+
+    _unsupportedBuildChatRequest(req, method, model) {
+        if (!this.buildChat.enabled) return "The Build Chat channel is disabled (BUILD_CHAT_ENABLED=false).";
+        const unsupported = BuildChatTransport.unsupportedReason(model);
+        if (unsupported) return unsupported;
+        const generates =
+            method !== undefined
+                ? req.method === "POST" && ["generateContent", "streamGenerateContent"].includes(method)
+                : ["/v1/chat/completions", "/v1/responses", "/v1/messages"].includes(req.path);
+        return generates ? null : "Build Chat models only support text generation.";
     }
 
     /** The model named by a public request (Gemini path or body `model`) and its channel. */
@@ -116,9 +131,11 @@ class RequestHandler {
         return { channel, method: pathMatch ? (pathMatch[2] ?? null) : undefined, model };
     }
 
-    /** Handler for a public request: `pg-` requests get a scope that leaves Build's account state alone. */
+    /** Handler for a public request: `pg-` and `bdc-` requests get a scope that leaves Build's account state alone. */
     forRequest(req) {
         const { channel, model } = this._requestModel(req);
+        if (channel === "buildchat")
+            return playgroundRequestScope(this, FormatConverter.stripModelSuffixes(model), "buildchat");
         if (channel !== "playground") return this;
         // Cooldowns are kept per upstream model, so an anti-truncation alias uses its base model.
         return playgroundRequestScope(

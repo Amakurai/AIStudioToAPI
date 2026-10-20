@@ -174,7 +174,7 @@
     "maxContextsHint": "0 means unlimited; applies at runtime, resets to the env value after restart",
     "maxRetries": "Error Retries",
     "modelChannels": "Model Channels",
-    "modelChannelsHelp": "Two independent channels: build- models use Build, pg- models use Playground. Neither falls back to the other.",
+    "modelChannelsHelp": "Three independent channels: build- models use the Build App, pg- models use Playground, bdc- models use the Build editor chat (Build Chat). None falls back to another.",
     "modelUsage": "Model Usage",
     "modelUsageBreakdown": "Model Usage Breakdown",
     "networkError": "Network connection failed. Please check your network settings.",

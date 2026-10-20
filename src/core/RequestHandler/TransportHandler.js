@@ -78,8 +78,10 @@ class TransportHandler extends RequestHandler {
 
     _cancelBrowserRequest(requestId, authIndex, requestAttemptId = null) {
         if (this.playground?.cancel(requestId, requestAttemptId)) return;
-        // A Playground request never runs on the Build page; do not send it a cancel instruction.
-        if (this.connectionRegistry.messageQueues.get(requestId)?.channel === "playground") return;
+        if (this.buildChat?.cancel(requestId, requestAttemptId)) return;
+        // Playground and Build Chat requests never run on the Build page; do not send them a cancel instruction.
+        const channel = this.connectionRegistry.messageQueues.get(requestId)?.channel;
+        if (channel === "playground" || channel === "buildchat") return;
         const targetAuthIndex = authIndex !== undefined ? authIndex : this.currentAuthIndex;
         const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
@@ -124,7 +126,7 @@ class TransportHandler extends RequestHandler {
         if (proxyRequest.channel) return;
         const match = proxyRequest.path?.match(/^(.*\/models\/)([^/:?]+)(.*)$/);
         let body;
-        if (typeof proxyRequest.body === "string" && /"(?:models\/)?(?:build|pg)-/.test(proxyRequest.body)) {
+        if (typeof proxyRequest.body === "string" && /"(?:models\/)?(?:build|pg|bdc)-/.test(proxyRequest.body)) {
             try {
                 body = JSON.parse(proxyRequest.body);
             } catch {
@@ -149,7 +151,8 @@ class TransportHandler extends RequestHandler {
     _initializeProxyRequestAttempt(proxyRequest) {
         this._resolveProxyRequestChannel(proxyRequest);
         const match = proxyRequest.path?.match(/^(.*\/models\/)([^/:]+)(:[^?]+.*)$/);
-        const baseModel = match && AntiTruncation.baseModel(match[2]);
+        // Build Chat has no anti-truncation aliases (rejected up front); never start the duplex transport for it.
+        const baseModel = proxyRequest.channel !== "buildchat" && match && AntiTruncation.baseModel(match[2]);
         if (baseModel) {
             proxyRequest.path = `${match[1]}${baseModel}${match[3]}`;
             if (proxyRequest.body && match[3] === ":countTokens") {
@@ -206,6 +209,10 @@ class TransportHandler extends RequestHandler {
         }
         if (proxyRequest.channel === "playground") {
             this.playground.forward(proxyRequest, authIndex);
+            return;
+        }
+        if (proxyRequest.channel === "buildchat") {
+            this.buildChat.forward(proxyRequest, authIndex);
             return;
         }
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);

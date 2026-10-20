@@ -1,0 +1,68 @@
+{
+    "models": [
+        {
+            "name": "models/gemini-4-argon",
+            "displayName": "Gemini 4 Argon (Build Chat)",
+            "description": "Gemini 4 Argon through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 32768,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-3.8-flash",
+            "displayName": "Gemini 3.8 Flash (Build Chat)",
+            "description": "Gemini 3.8 Flash through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-3.6-flash",
+            "displayName": "Gemini 3.6 Flash (Build Chat)",
+            "description": "Gemini 3.6 Flash through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-3.5-flash-lite",
+            "displayName": "Gemini 3.5 Flash Lite (Build Chat)",
+            "description": "Gemini 3.5 Flash Lite through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-3.1-flash-lite",
+            "displayName": "Gemini 3.1 Flash Lite (Build Chat)",
+            "description": "Gemini 3.1 Flash Lite through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-3-flash-preview",
+            "displayName": "Gemini 3 Flash Preview (Build Chat)",
+            "description": "Gemini 3 Flash Preview through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-flash-latest",
+            "displayName": "Gemini Flash Latest (Build Chat)",
+            "description": "Gemini Flash Latest through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-flash-lite-latest",
+            "displayName": "Gemini Flash-Lite Latest (Build Chat)",
+            "description": "Gemini Flash-Lite Latest through the AI Studio Build editor chat. Text only; the Build assistant's own system prompt applies.",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536,
+            "supportedGenerationMethods": ["generateContent"]
+        }
+    ]
+}

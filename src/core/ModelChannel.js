@@ -1,13 +1,14 @@
 /**
- * Public model IDs name their upstream channel: `build-<model>` uses the Build App proxy and
- * `pg-<model>` uses Playground. Unprefixed names keep working and use Build.
+ * Public model IDs name their upstream channel: `build-<model>` uses the Build App proxy,
+ * `pg-<model>` uses Playground and `bdc-<model>` uses the Build editor's chat assistant.
+ * Unprefixed names keep working and use Build.
  */
 class ModelChannel {
-    static PREFIXES = { build: "build-", playground: "pg-" };
+    static PREFIXES = { build: "build-", buildchat: "bdc-", playground: "pg-" };
 
     /**
      * @param {string} name - Model ID, optionally with a `models/` prefix (raw or URL-encoded).
-     * @returns {{ channel: "build"|"playground", model: string, prefixed: boolean }}
+     * @returns {{ channel: "build"|"buildchat"|"playground", model: string, prefixed: boolean }}
      */
     static parse(name) {
         const value = String(name ?? "").replace(/^models\//, "");
@@ -18,7 +19,7 @@ class ModelChannel {
         return { channel: "build", model: value, prefixed: false };
     }
 
-    /** @param {"build"|"playground"} channel @param {string} model - Upstream name, with or without `models/`. */
+    /** @param {"build"|"buildchat"|"playground"} channel @param {string} model - Upstream name, with or without `models/`. */
     static publicName(channel, model) {
         return `${this.PREFIXES[channel]}${String(model).replace(/^models\//, "")}`;
     }
