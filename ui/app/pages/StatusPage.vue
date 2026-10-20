@@ -1651,6 +1651,141 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- Playground Run Settings Card -->
+                    <div class="status-card">
+                        <h3 class="card-title">
+                            <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="18"
+                                height="18"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                style="margin-right: 8px; vertical-align: text-bottom"
+                            >
+                                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                            </svg>
+                            {{ t("pgRunSettings") }}
+                        </h3>
+                        <p class="pg-settings-hint">{{ t("pgRunSettingsHint") }}</p>
+                        <div class="settings-switches">
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgThinkingLevel") }}</span>
+                                <el-select
+                                    v-model="pgSettings.thinkingLevel"
+                                    style="width: 150px"
+                                    @change="val => savePgSetting('thinkingLevel', val)"
+                                >
+                                    <el-option
+                                        v-for="option in pgThinkingLevelOptions"
+                                        :key="option.value"
+                                        :label="t(option.label)"
+                                        :value="option.value"
+                                    />
+                                </el-select>
+                            </div>
+                            <div class="pg-settings-group">{{ t("pgTools") }}</div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgCodeExecution") }}</span>
+                                <el-switch
+                                    v-model="pgSettings.codeExecution"
+                                    :width="50"
+                                    @change="val => savePgSetting('codeExecution', val)"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgGoogleSearch") }}</span>
+                                <el-switch
+                                    v-model="pgSettings.googleSearch"
+                                    :width="50"
+                                    @change="val => savePgSetting('googleSearch', val)"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgUrlContext") }}</span>
+                                <el-switch
+                                    v-model="pgSettings.urlContext"
+                                    :width="50"
+                                    @change="val => savePgSetting('urlContext', val)"
+                                />
+                            </div>
+                            <div class="pg-settings-group">{{ t("pgAdvanced") }}</div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgMediaResolution") }}</span>
+                                <el-select
+                                    v-model="pgSettings.mediaResolution"
+                                    style="width: 150px"
+                                    @change="val => savePgSetting('mediaResolution', val)"
+                                >
+                                    <el-option
+                                        v-for="option in pgMediaResolutionOptions"
+                                        :key="option.value"
+                                        :label="t(option.label)"
+                                        :value="option.value"
+                                    />
+                                </el-select>
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgSafetyThreshold") }}</span>
+                                <el-select
+                                    v-model="pgSettings.safetyThreshold"
+                                    style="width: 150px"
+                                    @change="val => savePgSetting('safetyThreshold', val)"
+                                >
+                                    <el-option :label="t('pgFollowGlobal')" value="" />
+                                    <el-option
+                                        v-for="option in safetySettingsThresholdOptions"
+                                        :key="option.value"
+                                        :label="t(option.label)"
+                                        :value="option.value"
+                                    />
+                                </el-select>
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgStopSequences") }}</span>
+                                <el-select
+                                    v-model="pgSettings.stopSequences"
+                                    multiple
+                                    filterable
+                                    allow-create
+                                    default-first-option
+                                    :multiple-limit="5"
+                                    :reserve-keyword="false"
+                                    :placeholder="t('pgStopSequencesPlaceholder')"
+                                    style="width: 200px"
+                                    @change="val => savePgSetting('stopSequences', val)"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">{{ t("pgOutputLength") }}</span>
+                                <el-input-number
+                                    v-model="pgSettings.maxOutputTokens"
+                                    :min="1"
+                                    :max="1048576"
+                                    :step="1024"
+                                    :value-on-clear="null"
+                                    :controls="false"
+                                    :placeholder="t('pgModelDefault')"
+                                    style="width: 150px"
+                                    @change="val => savePgSetting('maxOutputTokens', val ?? null)"
+                                />
+                            </div>
+                            <div class="pg-settings-textarea">
+                                <span class="label">{{ t("pgSystemInstructions") }}</span>
+                                <el-input
+                                    v-model="pgSettings.systemInstruction"
+                                    type="textarea"
+                                    :autosize="{ minRows: 2, maxRows: 8 }"
+                                    :placeholder="t('pgSystemInstructionsPlaceholder')"
+                                    @change="val => savePgSetting('systemInstruction', val)"
+                                />
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -3821,6 +3956,63 @@ const state = reactive({
     usageCount: 0,
 });
 
+const pgSettings = reactive({
+    codeExecution: false,
+    googleSearch: false,
+    maxOutputTokens: null,
+    mediaResolution: "",
+    safetyThreshold: "",
+    stopSequences: [],
+    systemInstruction: "",
+    thinkingLevel: "MEDIUM",
+    urlContext: false,
+});
+
+const pgThinkingLevelOptions = [
+    { label: "pgModelDefault", value: "" },
+    { label: "pgLevel.MINIMAL", value: "MINIMAL" },
+    { label: "pgLevel.LOW", value: "LOW" },
+    { label: "pgLevel.MEDIUM", value: "MEDIUM" },
+    { label: "pgLevel.HIGH", value: "HIGH" },
+];
+
+const pgMediaResolutionOptions = [
+    { label: "pgModelDefault", value: "" },
+    { label: "pgLevel.LOW", value: "MEDIA_RESOLUTION_LOW" },
+    { label: "pgLevel.MEDIUM", value: "MEDIA_RESOLUTION_MEDIUM" },
+    { label: "pgLevel.HIGH", value: "MEDIA_RESOLUTION_HIGH" },
+];
+
+const fetchPgSettings = async () => {
+    try {
+        const res = await fetch("/api/settings/playground");
+        if (res.ok) Object.assign(pgSettings, await res.json());
+    } catch {
+        // Keep the defaults shown; the next save reports any error.
+    }
+};
+
+const savePgSetting = async (key, value) => {
+    try {
+        const res = await fetch("/api/settings/playground", {
+            body: JSON.stringify({ [key]: value }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json();
+        if (res.ok) {
+            Object.assign(pgSettings, data.value);
+            ElMessage.success(t("pgSettingSaved"));
+        } else {
+            ElMessage.error(t(data.message || "settingFailed", { message: data.error || "" }));
+            await fetchPgSettings();
+        }
+    } catch (err) {
+        ElMessage.error(t("settingFailed", { message: err.message || err }));
+        await fetchPgSettings();
+    }
+};
+
 const safetySettingsThresholdOptions = [
     { label: "safetySettingsThreshold.OFF", value: "OFF" },
     {
@@ -5116,6 +5308,7 @@ onMounted(() => {
     statsFiltersMobileMediaQuery.addEventListener("change", syncStatsFiltersViewport);
 
     Promise.all([updateContent(), fetchUsageStats()]).finally(scheduleUpdate);
+    fetchPgSettings();
 
     // Check for updates once on initial load
     checkForUpdates();
@@ -5759,6 +5952,25 @@ watchEffect(() => {
     align-items: center;
     font-size: 0.95rem;
     min-height: 32px;
+}
+
+.pg-settings-hint {
+    margin: -0.5rem 0 1rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.pg-settings-group {
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.pg-settings-textarea {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 0.95rem;
 }
 
 /* Logs View Specifics */

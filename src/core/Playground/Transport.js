@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const AntiTruncation = require("../AntiTruncation");
 const PlaygroundCatalog = require("./Catalog");
 const PlaygroundSession = require("./Session");
+const PlaygroundSettings = require("./Settings");
 const { WireCodec, WireStream } = require("./WireCodec");
 const { DEFAULT_TIMEOUTS } = require("../RequestHandler/constants");
 
@@ -22,6 +23,7 @@ class PlaygroundTransport {
         this.sessions = new WeakMap();
         this.cooldowns = new Map();
         this.catalog = new PlaygroundCatalog(handler.config, handler.logger);
+        this.settings = new PlaygroundSettings(handler.config, handler.logger);
     }
     get enabled() {
         return !!this.handler.config.playgroundEnabled;
@@ -164,7 +166,9 @@ class PlaygroundTransport {
                 session = new PlaygroundSession(context, raw => this.catalog.discover(raw));
                 this.sessions.set(context, session);
             }
-            const request = JSON.parse(spec.body);
+            const request = this.settings.apply(JSON.parse(spec.body), model, {
+                antiTruncation: spec.anti_truncation_mode === "duplex",
+            });
             const includeThoughts = WireCodec.includesThoughts(request);
             const parser = new WireStream(raw => {
                 const decoded = WireCodec.decode(raw, model);

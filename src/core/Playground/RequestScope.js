@@ -44,6 +44,21 @@ function createPlaygroundScope(handler) {
         },
     });
 
+    // Playground run settings replace the global force-tool switches and safety threshold.
+    const config = new Proxy(handler.config, {
+        get(target, key) {
+            const settings = handler.playground.settings.values;
+            if (key === "forceWebSearch") return settings.googleSearch;
+            if (key === "forceUrlContext") return settings.urlContext;
+            if (key === "forceCodeExecution") return settings.codeExecution;
+            if (key === "safetySettingsThreshold") return settings.safetyThreshold || target.safetySettingsThreshold;
+            return Reflect.get(target, key, target);
+        },
+    });
+    const formatConverter = Object.create(handler.formatConverter, {
+        serverSystem: { value: Object.create(handler.serverSystem, { config: { value: config } }) },
+    });
+
     const scope = Object.create(handler, {
         _dispatchCursor: {
             get: () => handler._dispatchCursor,
@@ -53,8 +68,10 @@ function createPlaygroundScope(handler) {
         },
         authSource: { value: authSource },
         authSwitcher: { value: authSwitcher },
+        config: { value: config },
         connectionRegistry: { value: connectionRegistry },
         dispatchChannel: { value: "playground" },
+        formatConverter: { value: formatConverter },
         needsSwitchingAfterRequest: { value: false, writable: true },
     });
 

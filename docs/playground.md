@@ -48,6 +48,8 @@ Playground 的鉴权失败对该账号和模型冷却 5 分钟，连续被拒时
 
 Playground 适配层支持文本、多轮对话、系统指令、函数调用和工具回传、内联媒体及常用生成参数；保留工具调用 ID、思考签名、结束原因和 token 用量。原生分块响应转换为 Gemini JSON/SSE，再交给现有 API 格式转换器。与公开 API 一致，只有 `includeThoughts: true` 时才返回思考内容（Gemma 等模板即使未请求也会输出思考，返回前会被过滤）；仅设置 `thinkingLevel`/`thinkingBudget` 或未设置思考配置时不返回，界面模板默认的显示思考也会被关闭。生成参数同时接受 camelCase 与 snake_case 写法。安全设置中 MakerSuite 未提供的公开类别（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）保持原生默认，不再导致 400。
 
+控制台“设置”页的 **Playground 运行设置** 对应 AI Studio 的 Run settings 面板，保存到 `data/playground-settings.json`，作用于所有 `pg-` 模型：思考等级（默认 Medium，只对 Gemini 3 及以上的文本模型生效）、代码执行 / Google 搜索 / URL 上下文（默认全部关闭）、媒体分辨率、安全阈值、停止序列、输出长度和系统指令。这些是默认值，客户端请求显式给出的参数优先；工具开关和安全阈值取代全局 `FORCE_*` 与 `SAFETY_SETTINGS_THRESHOLD`（安全阈值可选“跟随全局”），模型名 `-search` 后缀仍然生效。系统指令加在客户端系统指令之前。抗截断轮次只应用思考等级和媒体分辨率；TTS 模型不受影响。
+
 抗截断模型（Build 与 Playground）在 OpenAI、Responses、Claude 和 Gemini 原生接口上的流式输出使用独立配置 `ANTI_TRUNCATION_STREAMING_MODE=real`（默认），每段完成校验后立即发出，不再受普通模型的 `STREAMING_MODE=fake` 影响。需要完整缓冲时可显式设置为 `fake`。
 
 普通 OpenAI 模型使用 `STREAMING_MODE=fake` 时，等待上游完整生成后才输出正文。等待响应头和收集正文期间，每 12–18 秒发送两条空的 OpenAI SSE 数据帧，兼容过滤注释心跳、保留最后一帧的中转层；心跳不包含正文、用量或结束标记。完整正文按最多 128 个 Unicode 字符分块并短暂停顿后发送，工具参数与最终用量保持完整。生成前的心跳只用于保活，并不代表模型已经开始输出正文。

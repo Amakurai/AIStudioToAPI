@@ -760,6 +760,20 @@ class StatusRoutes {
             res.status(200).json({ message: "settingUpdateSuccess", setting: "forceUrlContext", value: statusText });
         });
 
+        app.get("/api/settings/playground", isAuthenticated, (req, res) => {
+            res.status(200).json(this.serverSystem.requestHandler.playground.settings.get());
+        });
+
+        app.put("/api/settings/playground", isAuthenticated, (req, res) => {
+            try {
+                const value = this.serverSystem.requestHandler.playground.settings.update(req.body);
+                this.logger.info(`[WebUI] Playground run settings updated: ${Object.keys(req.body || {}).join(", ")}`);
+                res.status(200).json({ message: "settingUpdateSuccess", setting: "playgroundSettings", value });
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message, message: "settingFailed" });
+            }
+        });
+
         app.put("/api/settings/check-update", isAuthenticated, (req, res) => {
             this.config.checkUpdate = !this.config.checkUpdate;
             const statusText = this.config.checkUpdate;
