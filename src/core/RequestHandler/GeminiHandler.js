@@ -117,38 +117,25 @@ class GeminiHandler extends RetryHandler {
             delete proxyRequest.query_params.alt;
         }
 
-        let connectionMaintainer;
-        this._startSseKeepAlive(
-            res,
-            ": keep-alive\n\n",
-            () => {
-                res.setHeader("Content-Type", "text/event-stream");
-                res.setHeader("Cache-Control", "no-cache");
-                res.setHeader("Connection", "keep-alive");
-            },
-            timer => {
-                connectionMaintainer = timer;
-            }
-        );
+        // Nothing is sent before the first text (fake streams: before generation has finished), so failures
+        // and empty replies keep a plain HTTP error status. Real-mode anti-truncation streams ping between segments.
+        const startStream = () => {
+            res.setHeader("Content-Type", "text/event-stream");
+            res.setHeader("Cache-Control", "no-cache");
+            res.setHeader("Connection", "keep-alive");
+        };
 
         try {
             const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
 
             if (!result.success) {
-                clearTimeout(connectionMaintainer);
-
                 if (isUserAbortedError(result.error)) {
                     this.logger.debug(
                         `[Request] Request #${proxyRequest.request_id} was properly cancelled by user, not counted in failure statistics.`
                     );
                 } else {
                     this._logFinalRequestFailure(result.error, "Gemini fake stream", proxyRequest.request_id);
-                    // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
-                    if (res.headersSent) {
-                        this._handleRequestError(result.error, res, proxyRequest.request_id);
-                    } else {
-                        this._sendErrorResponse(res, result.error.status || 500, result.error.message);
-                    }
+                    this._sendErrorResponse(res, result.error.status || 500, result.error.message);
 
                     const accountSwitchTask = this._handleFinalFailureAccountSwitch(result.error, {
                         connectionResetContext: "Gemini Non-Stream",
@@ -168,65 +155,29 @@ class GeminiHandler extends RetryHandler {
             // Use the queue that successfully received the initial message
             const activeQueue = result.queue;
 
-            if (!res.headersSent) {
-                res.setHeader("Content-Type", "text/event-stream");
-                res.setHeader("Cache-Control", "no-cache");
-                res.setHeader("Connection", "keep-alive");
-            }
             if (proxyRequest.anti_truncation) {
-                // Keep-alives continue while later segments are generated.
-                await this._streamAntiTruncationResponse(proxyRequest, result.message, activeQueue, res, chunk =>
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+                await this._streamAntiTruncationResponse(
+                    proxyRequest,
+                    result.message,
+                    activeQueue,
+                    res,
+                    startStream,
+                    chunk => res.write(`data: ${JSON.stringify(chunk)}\n\n`),
+                    ": keep-alive\n\n"
                 );
                 return;
             }
-            // Clear the keep-alive timer as we are about to send real data
-            clearTimeout(connectionMaintainer);
+
+            const fullData = await this._collectBufferedBody(
+                activeQueue,
+                res,
+                "Gemini fake stream",
+                proxyRequest.request_id
+            );
+            if (fullData === null) return;
+            if (!this._isResponseWritable(res)) return;
+            startStream();
             this.logger.info(`[Request] Gemini streaming response (Fake Mode) started...`);
-
-            // Read all data chunks until STREAM_END to handle potential fragmentation
-            let fullData = "";
-            let hadStreamError = false;
-            try {
-                // eslint-disable-next-line no-constant-condition
-                while (true) {
-                    const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM); // 5 min timeout for fake streaming
-                    if (message.type === "STREAM_END") {
-                        break;
-                    }
-
-                    if (message.event_type === "error") {
-                        this.logger.error(
-                            `❌ [Request] Error received during Gemini pseudo-stream: ${message.message}`
-                        );
-                        this._markTrackedResponseError(res, message.message, 500);
-                        hadStreamError = true;
-                        this._handleRequestError({ message: message.message }, res, proxyRequest.request_id);
-                        break;
-                    }
-
-                    if (message.data) {
-                        fullData += message.data;
-                    }
-                }
-            } catch (error) {
-                // Handle timeout or other errors during streaming
-                // Don't attempt to write if it's a connection reset or if response is destroyed
-                if (!this._isConnectionResetError(error)) {
-                    // Classify error type and send appropriate response
-                    this._handleFakeStreamError(error, res);
-                } else {
-                    this.logger.debug(
-                        "[Request] Gemini pseudo-stream interrupted by connection reset, skipping error write"
-                    );
-                }
-                // Return early to prevent JSON parsing of incomplete data
-                return;
-            }
-            if (hadStreamError) {
-                // Backend errored; don't attempt to parse/split/send "normal" chunks afterwards.
-                return;
-            }
 
             try {
                 const googleResponse = JSON.parse(fullData);
@@ -377,7 +328,6 @@ class GeminiHandler extends RetryHandler {
         } catch (error) {
             this._handleRequestError(error, res, proxyRequest.request_id);
         } finally {
-            clearTimeout(connectionMaintainer);
             if (!res.writableEnded) {
                 res.end();
             }
@@ -472,11 +422,16 @@ class GeminiHandler extends RetryHandler {
             res.type("text/event-stream");
         }
         this.logger.info(`[Request] Gemini streaming response (Real Mode) started...`);
+        const gate = this._createRealStreamGate();
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
                 const dataMessage = await currentQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (dataMessage.type === "STREAM_END") {
+                    if (!gate.open) {
+                        this._failBeforeOutput(res, gate.failure(), "Gemini real stream", proxyRequest.request_id);
+                        break;
+                    }
                     this.logger.info(
                         `✅ [Request] Response completed (Gemini real stream), request ID: ${proxyRequest.request_id}`
                     );
@@ -484,13 +439,23 @@ class GeminiHandler extends RetryHandler {
                 }
 
                 if (dataMessage.event_type === "error") {
+                    const status = this._getUpstreamErrorStatus(dataMessage);
+                    if (!gate.open) {
+                        this._failBeforeOutput(
+                            res,
+                            { message: dataMessage.message, status },
+                            "Gemini real stream",
+                            proxyRequest.request_id
+                        );
+                        break;
+                    }
                     this.logger.error(`❌ [Request] Error received during Gemini real stream: ${dataMessage.message}`);
-                    this._markTrackedResponseError(res, dataMessage.message, 500);
+                    this._markTrackedResponseError(res, dataMessage.message, status);
                     // Check if response is still writable before attempting to write
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write(
-                                `data: ${JSON.stringify({ error: { code: 500, message: dataMessage.message, status: "INTERNAL" } })}\n\n`
+                                `data: ${JSON.stringify({ error: { code: status, message: dataMessage.message, status: "INTERNAL" } })}\n\n`
                             );
                         } catch (writeError) {
                             this.logger.debug(
@@ -503,6 +468,8 @@ class GeminiHandler extends RetryHandler {
 
                 if (dataMessage.data) {
                     this._logGeminiNativeChunkDebug(dataMessage.data, "stream");
+                    const chunk = gate.push(dataMessage.data, dataMessage.data);
+                    if (!chunk) continue;
                     if (!this._isResponseWritable(res)) {
                         this.logger.debug(
                             "[Request] Response no longer writable during Gemini real stream; stopping stream."
@@ -510,7 +477,7 @@ class GeminiHandler extends RetryHandler {
                         break;
                     }
                     try {
-                        res.write(dataMessage.data);
+                        res.write(chunk);
                     } catch (writeError) {
                         this.logger.debug(
                             `[Request] Failed to write Gemini data chunk to stream: ${writeError.message}`
@@ -579,9 +546,10 @@ class GeminiHandler extends RetryHandler {
                 }
 
                 if (message.event_type === "error") {
+                    const status = this._getUpstreamErrorStatus(message);
                     this.logger.error(`❌ [Request] Error received during Gemini non-stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
-                    this._sendErrorResponse(res, 500, message.message);
+                    this._markTrackedResponseError(res, message.message, status);
+                    this._sendErrorResponse(res, status, message.message);
                     return;
                 }
 
@@ -591,6 +559,15 @@ class GeminiHandler extends RetryHandler {
             }
 
             let responseBodyBuffer = Buffer.concat(chunks);
+
+            // A generation without any output is an error, not an empty 200 reply.
+            if (proxyRequest.is_generative && proxyRequest.path.includes(":generateContent")) {
+                const failure = this._noOutputError(responseBodyBuffer.toString());
+                if (failure) {
+                    this._failBeforeOutput(res, failure, "Gemini non-stream", proxyRequest.request_id);
+                    return;
+                }
+            }
 
             try {
                 const fullResponse = JSON.parse(responseBodyBuffer.toString());

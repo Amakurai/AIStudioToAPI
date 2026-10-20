@@ -213,191 +213,103 @@ class ResponsesHandler extends RetryHandler {
                         responseFunctionNameMap,
                     });
                 } else {
-                    // OpenAI Response API Fake Stream / Non-Stream mode
-                    // Set up keep-alive timer for fake stream mode to prevent client timeout
-                    let connectionMaintainer;
-                    if (isOpenAIStream) {
-                        this._startSseKeepAlive(
-                            res,
-                            ": keep-alive\n\n",
-                            () => {
-                                res.status(200).set({
-                                    "Cache-Control": "no-cache",
-                                    Connection: "keep-alive",
-                                    "Content-Type": "text/event-stream",
-                                });
-                            },
-                            timer => {
-                                connectionMaintainer = timer;
-                            }
-                        );
+                    // OpenAI Response API Fake Stream / Non-Stream mode. Nothing is sent before the first
+                    // text (fake streams: before generation has finished), so failures and empty replies
+                    // keep a plain HTTP error status. Real-mode anti-truncation streams ping between segments.
+                    const startStream = () =>
+                        res.status(200).set({
+                            "Cache-Control": "no-cache",
+                            Connection: "keep-alive",
+                            "Content-Type": "text/event-stream",
+                        });
+
+                    const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
+
+                    if (!result.success) {
+                        this._logFinalRequestFailure(result.error, "OpenAI Response API fake/non-stream", requestId);
+                        // Send standard HTTP error response for both streaming and non-streaming
+                        this._sendErrorResponse(res, result.error.status || 500, result.error.message);
+
+                        const accountSwitchTask = this._handleFinalFailureAccountSwitch(result.error, {
+                            connectionResetContext: "Response API",
+                        });
+                        if (accountSwitchTask) await accountSwitchTask;
+                        return;
                     }
 
-                    try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
+                    if (this.authSwitcher.failureCount > 0) {
+                        this.logger.debug(
+                            `✅ [Auth] OpenAI Response API request successful - failure count reset to 0`
+                        );
+                        this.authSwitcher.failureCount = 0;
+                    }
 
-                        if (!result.success) {
-                            this._logFinalRequestFailure(
-                                result.error,
-                                "OpenAI Response API fake/non-stream",
-                                requestId
+                    // Use the queue that successfully received the initial message
+                    const activeQueue = result.queue;
+
+                    if (isOpenAIStream) {
+                        if (proxyRequest.anti_truncation) {
+                            const streamState = {
+                                responseDefaults,
+                                responseFunctionNameMap,
+                                sequenceNumber: res.__responseApiSeq,
+                            };
+                            await this._streamAntiTruncationResponse(
+                                proxyRequest,
+                                result.message,
+                                activeQueue,
+                                res,
+                                startStream,
+                                chunk => {
+                                    const events = this.formatConverter.translateGoogleToResponseAPIStream(
+                                        JSON.stringify(chunk),
+                                        model,
+                                        streamState
+                                    );
+                                    // Later error events continue the same sequence numbers.
+                                    res.__responseApiSeq = streamState.sequenceNumber;
+                                    if (events) res.write(events);
+                                },
+                                ": keep-alive\n\n"
                             );
-                            // Send standard HTTP error response for both streaming and non-streaming
-                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isOpenAIStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
-                                this._handleRequestError(result.error, res, requestId);
-                            } else {
-                                this._sendErrorResponse(res, result.error.status || 500, result.error.message);
-                            }
-
-                            const accountSwitchTask = this._handleFinalFailureAccountSwitch(result.error, {
-                                connectionResetContext: "Response API",
-                            });
-                            if (accountSwitchTask) await accountSwitchTask;
                             return;
                         }
 
-                        if (this.authSwitcher.failureCount > 0) {
+                        const fullBody = await this._collectBufferedBody(
+                            activeQueue,
+                            res,
+                            "OpenAI Response API fake stream",
+                            requestId
+                        );
+                        if (fullBody === null) return;
+                        const streamState = { responseDefaults, responseFunctionNameMap };
+                        const translatedChunk = this.formatConverter.translateGoogleToResponseAPIStream(
+                            fullBody,
+                            model,
+                            streamState
+                        );
+                        if (streamState.error) this._markTrackedResponseError(res, streamState.error.message, 400);
+                        if (!this._isResponseWritable(res)) {
                             this.logger.debug(
-                                `✅ [Auth] OpenAI Response API request successful - failure count reset to 0`
+                                "[Request] Response no longer writable before final fake OpenAI Response API stream chunks."
                             );
-                            this.authSwitcher.failureCount = 0;
+                            return;
                         }
-
-                        // Use the queue that successfully received the initial message
-                        const activeQueue = result.queue;
-
-                        if (isOpenAIStream) {
-                            // Fake stream - ensure headers are set before sending data
-                            if (!res.headersSent) {
-                                res.status(200).set({
-                                    "Cache-Control": "no-cache",
-                                    Connection: "keep-alive",
-                                    "Content-Type": "text/event-stream",
-                                });
-                            }
-                            if (proxyRequest.anti_truncation) {
-                                // Keep-alives continue while later segments are generated.
-                                const streamState = {
-                                    responseDefaults,
-                                    responseFunctionNameMap,
-                                    sequenceNumber: res.__responseApiSeq,
-                                };
-                                await this._streamAntiTruncationResponse(
-                                    proxyRequest,
-                                    result.message,
-                                    activeQueue,
-                                    res,
-                                    chunk => {
-                                        const events = this.formatConverter.translateGoogleToResponseAPIStream(
-                                            JSON.stringify(chunk),
-                                            model,
-                                            streamState
-                                        );
-                                        // Later error events continue the same sequence numbers.
-                                        res.__responseApiSeq = streamState.sequenceNumber;
-                                        if (events) res.write(events);
-                                    }
-                                );
-                                return;
-                            }
-                            // Clear keep-alive timer as we are about to send real data
-                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
-
-                            this.logger.info(`[Request] OpenAI Response API streaming response (Fake Mode) started...`);
-                            let fullBody = "";
-                            if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
-                            let hadStreamError = false;
-                            try {
-                                // eslint-disable-next-line no-constant-condition
-                                while (true) {
-                                    const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM);
-                                    if (message.type === "STREAM_END") {
-                                        break;
-                                    }
-
-                                    if (message.event_type === "error") {
-                                        this.logger.error(
-                                            `❌ [Request] Error received during OpenAI Response API fake stream: ${message.message}`
-                                        );
-                                        this._markTrackedResponseError(res, message.message, 500);
-                                        hadStreamError = true;
-                                        // Check if response is still writable before attempting to write
-                                        if (this._isResponseWritable(res)) {
-                                            try {
-                                                res.__responseApiSeq += 1;
-                                                res.write(
-                                                    `event: error\ndata: ${JSON.stringify({
-                                                        code: "api_error",
-                                                        message: message.message,
-                                                        param: null,
-                                                        sequence_number: res.__responseApiSeq,
-                                                        type: "error",
-                                                    })}\n\n`
-                                                );
-                                            } catch (writeError) {
-                                                this.logger.debug(
-                                                    `❌ [Request] Failed to write error to OpenAI Response API fake stream: ${writeError.message}`
-                                                );
-                                            }
-                                        }
-                                        break;
-                                    }
-
-                                    if (message.data) fullBody += message.data;
-                                }
-
-                                // If backend errored, don't attempt to translate/send a "normal" Responses stream afterwards.
-                                if (hadStreamError) {
-                                    return;
-                                }
-
-                                const streamState = {};
-                                streamState.responseDefaults = responseDefaults;
-                                streamState.responseFunctionNameMap = responseFunctionNameMap;
-                                const translatedChunk = this.formatConverter.translateGoogleToResponseAPIStream(
-                                    fullBody,
-                                    model,
-                                    streamState
-                                );
-                                if (streamState.error)
-                                    this._markTrackedResponseError(res, streamState.error.message, 400);
-                                if (this._isResponseWritable(res)) {
-                                    try {
-                                        if (translatedChunk) {
-                                            res.write(translatedChunk);
-                                        }
-                                    } catch (writeError) {
-                                        this.logger.debug(
-                                            `[Request] Failed to write final fake OpenAI Response API stream chunks: ${writeError.message}`
-                                        );
-                                    }
-                                } else {
-                                    this.logger.debug(
-                                        "[Request] Response no longer writable before final fake OpenAI Response API stream chunks."
-                                    );
-                                }
-                                this.logger.info(
-                                    `✅ [Request] Response completed (OpenAI Response API fake stream), request ID: ${requestId}`
-                                );
-                            } catch (error) {
-                                // Classify error type and send appropriate response
-                                this._handleFakeStreamError(error, res);
-                            }
-                        } else {
-                            // Non-stream
-                            await this._sendOpenAIResponseAPINonStreamResponse(
-                                activeQueue,
-                                res,
-                                model,
-                                requestId,
-                                responseDefaults,
-                                responseFunctionNameMap
-                            );
-                        }
-                    } finally {
-                        if (connectionMaintainer) clearTimeout(connectionMaintainer);
+                        startStream();
+                        if (translatedChunk) res.write(translatedChunk);
+                        this.logger.info(
+                            `✅ [Request] Response completed (OpenAI Response API fake stream), request ID: ${requestId}`
+                        );
+                    } else {
+                        // Non-stream
+                        await this._sendOpenAIResponseAPINonStreamResponse(
+                            activeQueue,
+                            res,
+                            model,
+                            requestId,
+                            responseDefaults,
+                            responseFunctionNameMap
+                        );
                     }
                 }
             } catch (error) {
@@ -564,12 +476,17 @@ class ResponsesHandler extends RetryHandler {
         // Keep Response API sequence numbers consistent across helpers that might write to the same SSE response.
         if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
         streamState.sequenceNumber = res.__responseApiSeq;
+        const gate = this._createRealStreamGate();
 
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (message.type === "STREAM_END") {
+                    if (!gate.open) {
+                        this._failBeforeOutput(res, gate.failure(), "OpenAI Response API real stream", requestId);
+                        break;
+                    }
                     this.logger.info(
                         `✅ [Request] Response completed (OpenAI Response API real stream), request ID: ${requestId}`
                     );
@@ -577,8 +494,18 @@ class ResponsesHandler extends RetryHandler {
                 }
 
                 if (message.event_type === "error") {
+                    const status = this._getUpstreamErrorStatus(message);
+                    if (!gate.open) {
+                        this._failBeforeOutput(
+                            res,
+                            { message: message.message, status },
+                            "OpenAI Response API real stream",
+                            requestId
+                        );
+                        break;
+                    }
                     this.logger.error(`❌ [Request] Error received during Response API stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
+                    this._markTrackedResponseError(res, message.message, status);
                     if (this._isResponseWritable(res)) {
                         try {
                             if (!Number.isInteger(streamState.sequenceNumber)) streamState.sequenceNumber = -1;
@@ -603,11 +530,19 @@ class ResponsesHandler extends RetryHandler {
                 }
 
                 if (message.data) {
-                    const responseAPIChunk = this.formatConverter.translateGoogleToResponseAPIStream(
+                    const responseAPIChunk = gate.push(
                         message.data,
-                        model,
-                        streamState
+                        this.formatConverter.translateGoogleToResponseAPIStream(message.data, model, streamState)
                     );
+                    if (streamState.error && !gate.open) {
+                        this._failBeforeOutput(
+                            res,
+                            { message: streamState.error.message, status: 400 },
+                            "OpenAI Response API real stream",
+                            requestId
+                        );
+                        break;
+                    }
                     if (streamState.error) this._markTrackedResponseError(res, streamState.error.message, 400);
                     if (typeof streamState.sequenceNumber === "number") {
                         res.__responseApiSeq = streamState.sequenceNumber;
@@ -651,28 +586,13 @@ class ResponsesHandler extends RetryHandler {
         responseDefaults = {},
         responseFunctionNameMap = {}
     ) {
-        let fullBody = "";
-        let receiving = true;
-        while (receiving) {
-            const message = await messageQueue.dequeue(this.timeouts.FAKE_STREAM);
-            if (message.type === "STREAM_END") {
-                this.logger.debug("[Request] OpenAI Response API received end signal.");
-                receiving = false;
-                break;
-            }
-
-            if (message.event_type === "error") {
-                this.logger.error(
-                    `❌ [Adapter] Error during OpenAI Response API non-stream conversion: ${message.message}`
-                );
-                this._sendErrorResponse(res, 500, message.message);
-                return;
-            }
-
-            if (message.event_type === "chunk" && message.data) {
-                fullBody += message.data;
-            }
-        }
+        const fullBody = await this._collectBufferedBody(
+            messageQueue,
+            res,
+            "OpenAI Response API non-stream",
+            requestId
+        );
+        if (fullBody === null) return;
 
         // Parse and convert to OpenAI Response API format
         try {

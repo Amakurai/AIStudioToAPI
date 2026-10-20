@@ -116,6 +116,24 @@ class DuplexToolTransport {
         return part;
     }
 
+    /** Summary of a rejected round for logs: finish reason, part kinds and token usage. */
+    static describe(response) {
+        const candidate = response?.candidates?.[0];
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+        const kinds = parts.map(part =>
+            part?.functionCall
+                ? `call:${part.functionCall.name}`
+                : typeof part?.text === "string"
+                  ? `${part.thought ? "thought" : "text"}:${part.text.length}`
+                  : Object.keys(part || {}).join("+") || "empty"
+        );
+        const usage = response?.usageMetadata || {};
+        return (
+            `finishReason=${candidate?.finishReason ?? "none"}, parts=[${kinds.join(", ")}], ` +
+            `outputTokens=${usage.candidatesTokenCount ?? "?"}, thoughtTokens=${usage.thoughtsTokenCount ?? "?"}`
+        );
+    }
+
     /**
      * Length of the longest run of trailing accepted segments that `text` repeats at its start.
      * Models sometimes resend acknowledged text before continuing; runs shorter than
@@ -186,16 +204,16 @@ class DuplexToolTransport {
         const notify = notice => {
             request.tools[0].functionDeclarations = this.declarations(limit, notice);
         };
-        const repair = (issue, shrink) => {
+        const repair = (issue, shrink, detail) => {
             if (repairs >= AntiTruncation.MAX_TOOL_REPAIRS) {
-                onDiagnostic({ issue, segments: segments.length, type: "repair_exhausted" });
+                onDiagnostic({ detail, issue, segments: segments.length, type: "repair_exhausted" });
                 return false;
             }
             repairs++;
             // Only a round that ran out of output budget or broke its arguments gets a smaller segment;
             // halving after an ordering mistake would only add rounds to the rest of the reply.
             if (shrink) limit = Math.max(32, Math.floor(limit / 2));
-            onDiagnostic({ issue, segments: segments.length, type: "repair" });
+            onDiagnostic({ detail, issue, segments: segments.length, type: "repair" });
             notify(
                 `The previous call was rejected (${issue}) and nothing from it was accepted. Retry the current step only, with at most ${limit} text characters; the next seq is ${segments.length + 1}.`
             );
@@ -375,7 +393,16 @@ class DuplexToolTransport {
                     issue = "invalid completion acknowledgement";
             } else issue = "unexpected output transport tool";
             if (issue) {
-                if (repair(issue, shrink)) {
+                // Before any text, a failed call (often an empty reply after long thinking) rarely
+                // recovers, and each repair round can take minutes. Fail now instead of keeping the
+                // client waiting; repairs only protect text that has already been accepted.
+                if (!segments.length) {
+                    onDiagnostic({ detail: this.describe(response), issue, segments: 0, type: "repair_exhausted" });
+                    throw Object.assign(AntiTruncation.protocolError(`the model produced no output (${issue}).`), {
+                        skipAccountSwitch: true,
+                    });
+                }
+                if (repair(issue, shrink, this.describe(response))) {
                     nextReason = "repair";
                     continue;
                 }

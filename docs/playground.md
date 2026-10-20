@@ -52,7 +52,7 @@ Playground 适配层支持文本、多轮对话、系统指令、函数调用和
 
 抗截断模型（Build 与 Playground）在 OpenAI、Responses、Claude 和 Gemini 原生接口上的流式输出使用独立配置 `ANTI_TRUNCATION_STREAMING_MODE=real`（默认），每段完成校验后立即发出，不再受普通模型的 `STREAMING_MODE=fake` 影响。需要完整缓冲时可显式设置为 `fake`。
 
-普通 OpenAI 模型使用 `STREAMING_MODE=fake` 时，等待上游完整生成后才输出正文。等待响应头和收集正文期间，每 12–18 秒发送两条空的 OpenAI SSE 数据帧，兼容过滤注释心跳、保留最后一帧的中转层；心跳不包含正文、用量或结束标记。完整正文按最多 128 个 Unicode 字符分块并短暂停顿后发送，工具参数与最终用量保持完整。生成前的心跳只用于保活，并不代表模型已经开始输出正文。
+所有接口使用 `STREAMING_MODE=fake` 时，等待上游完整生成后才响应：生成期间不发送响应头和心跳，生成完毕后一次性发出全部 SSE 帧，不再分块停顿。上游出错、超时或没有任何正文（只有思考、空回复、被拦截）时返回普通 HTTP 错误和错误信息，而不是空的 200 流。非流式请求同样处理，并保留上游状态码（如 429、503）。真流式（`STREAMING_MODE=real` 或 `-real` 后缀）在第一个带正文、思考、工具调用或媒体的数据块到达之前不发送任何内容，中转层统计的首字时间即为真实出字时间；此前出错或整段没有输出时同样返回普通 HTTP 错误。
 
 每个活跃账号按需创建一个专用临时 Playground 页面，该账号内的 Playground 请求串行执行，不同账号可以并发。同一模型在 10 分钟内复用页面，通过原生新对话及丢弃确认重置历史；模型改变、页面过期或重置失败时重新加载。每次仍获取新签名，签名材料和模型不匹配时只允许在推理之前重建页面重试。页面由现有浏览器上下文管理，关闭账号上下文时一起释放。文本中的 CRLF/CR 换行在签名和发送前统一为 LF，与网页输入框的签名材料保持一致。
 
@@ -72,7 +72,7 @@ Playground 适配层支持文本、多轮对话、系统指令、函数调用和
 - 3.8 的多说话人请求要求每个文本 part 标明说话人。公开格式 `Joe: ...\nJane: ...` 会按 `speakerVoiceConfigs` 中的说话人名拆成逐句 part（说话人行可以缩进，不带说话人前缀的行并入上一句）。第一句之前的文本（如官方示例 `TTS the following conversation between Joe and Jane:`、`Make Joe sound tired:`）是表演指示而非台词，作为每一句的声音风格发送，不会被读出；完全没有说话人行时返回 400。2.5/3.1 直接读取公开格式，不拆分。3.8 不接受 `systemInstruction`（上游返回 “Developer instruction is not enabled for this model”）。
 - `/v1/audio/speech` 的 `instructions` 在 `pg-` 3.8 模型上作为声音风格发送（实测前缀写法 `指示: 正文` 会被 3.8 读出：同一句话 3.84 秒对比 1.92 秒）；Build 与 2.5/3.1 仍按 `指示: 正文` 发送。非 TTS 的 `pg-` 模型请求该端点在本地返回 400。
 - 上游以多段 24kHz 16-bit 单声道 L16 PCM 流式返回音频，结束分块另带一个空 text part。Playground 会把连续的同格式 PCM 段拼接成一个 part 并去掉空 text part（与公开 API 一致）；TTS 的真流式请求同样等生成完成后以一个 SSE 事件发送整段音频，避免 OpenAI/Claude 格式中出现几十个无法单独播放的音频片段。`/v1/audio/speech` 再封装为 WAV 或按 `response_format=pcm` 返回原始 PCM。
-- OpenAI Chat Completions 与 Claude Messages 中的音频以 `![Generated Audio](data:audio/wav;base64,...)` 输出（原始 PCM 封装为 WAV，浏览器可直接播放；Build 链路同样适用）。假流式输出时整段媒体 data URI 作为一帧发送，不再按 128 字符切分（此前每片停顿 20 ms，3 秒音频约多等 30 秒，图片更久）。
+- OpenAI Chat Completions 与 Claude Messages 中的音频以 `![Generated Audio](data:audio/wav;base64,...)` 输出（原始 PCM 封装为 WAV，浏览器可直接播放；Build 链路同样适用）。假流式输出时整段媒体 data URI 作为一帧发送。
 - 部分账号的 3.8 页面也显示 “View mode” 切换，但 Text 选项被禁用（`aria-disabled`）。适配层只在 Text 可用且未选中时点选，否则直接使用语音块，并以实际出现的输入框为准；此前点击被禁用的选项会等满 30 秒超时。
 
 2026-10-18 实测（独立浏览器，未影响线上服务）：5 个 TTS 模型均返回 `STOP` 和音频；3.8 单说话人（`Fola`）、3.8 双说话人（`Rami`/`Fola`，含同页面复用，第二次约 2.4 秒）、2.5 双说话人、3.1 默认音色、3.8 lite 指定 `languageCode` 均成功；2.5 的 “Good morning.” 生成 1.05 秒音频，说明 `## Transcript:` 前缀没有被读出。官方多说话人示例（引导语 + 缩进的说话人行）在 3.8 上生成 3.3 秒双人音频，引导语未被读出。

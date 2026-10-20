@@ -7,6 +7,9 @@ class AntiTruncation {
     static MAX_CHUNK_CHARACTERS = 12000;
     // A resent prefix of acknowledged text is dropped from a new segment only from this length on.
     static MIN_REPEATED_CHARACTERS = 32;
+    // Without any accepted text by then, clients have usually given up; stop instead of starting
+    // more rounds. Once text has been accepted, rounds are bounded only by the per-call timeout.
+    static FIRST_OUTPUT_TIMEOUT_MS = 300000;
     static BLOCKED_FINISH_REASONS = [
         "SAFETY",
         "RECITATION",
@@ -216,6 +219,9 @@ class AntiTruncation {
         if (!parent || parent.closed) return;
         let activeChild = null;
         let activeAuthIndex = authIndex;
+        const firstOutputTimeout = handler.config?.antiTruncationFirstOutputTimeoutMs || this.FIRST_OUTPUT_TIMEOUT_MS;
+        const firstOutputBy = Date.now() + firstOutputTimeout;
+        let produced = false;
         let cancelled = false;
         let resolveCancellation;
         const cancellation = new Promise(resolve => {
@@ -257,6 +263,14 @@ class AntiTruncation {
             const splitThinking =
                 handler.config?.antiTruncationSplitThinking !== false && spec.anti_truncation_output !== "tools";
             const splitter = splitThinking ? new ReasoningSplitter() : null;
+            const roundTimeoutError = () =>
+                Object.assign(new Error("Anti-truncation upstream round timed out."), { status: 504 });
+            // Restarting the whole answer would only repeat the wait the client already gave up on.
+            const noOutputError = () =>
+                Object.assign(
+                    new Error(`Anti-truncation produced no output within ${Math.round(firstOutputTimeout / 1000)}s.`),
+                    { retryable: false, skipAccountSwitch: true, status: 504 }
+                );
             let publishedSeq = 0;
             const publish = pieces => {
                 for (const piece of pieces)
@@ -270,6 +284,14 @@ class AntiTruncation {
                     // upstream round is retried, including continuation and malformed-tool repair rounds.
                     for (;;) {
                         if (cancelled || parent.closed) throw cancelledError();
+                        // The deadline covers only this upstream round, and until the first accepted text
+                        // also the time left before the first-output deadline. Expiry stops this child,
+                        // not the whole answer, so the engine can keep already accepted segments.
+                        const deadline = Math.min(
+                            Date.now() + handler.timeouts.FAKE_STREAM,
+                            produced ? Infinity : firstOutputBy
+                        );
+                        if (deadline <= Date.now()) throw noOutputError();
                         const id = handler._generateRequestId();
                         const attempt = handler._generateRequestAttemptId(id, 1);
                         const queue = registry.createMessageQueue(id, activeAuthIndex, attempt, spec.request_id);
@@ -277,9 +299,6 @@ class AntiTruncation {
                         activeChild = child;
                         let finished = false;
                         let attemptError = null;
-                        // The deadline covers only this upstream round. Expiry stops this child, not the
-                        // whole answer, so the engine can keep already accepted segments.
-                        const deadline = Date.now() + handler.timeouts.FAKE_STREAM;
                         try {
                             handler._forwardRequest(
                                 {
@@ -299,10 +318,7 @@ class AntiTruncation {
                             let json = "";
                             while (!finished) {
                                 const remaining = deadline - Date.now();
-                                if (remaining <= 0)
-                                    throw Object.assign(new Error("Anti-truncation request timed out."), {
-                                        status: 504,
-                                    });
+                                if (remaining <= 0) throw produced ? roundTimeoutError() : noOutputError();
                                 const message = await queue.dequeue(remaining);
                                 if (message.event_type === "error")
                                     throw Object.assign(new Error(message.message), {
@@ -336,9 +352,9 @@ class AntiTruncation {
                         } catch (error) {
                             attemptError =
                                 error.code === "QUEUE_TIMEOUT"
-                                    ? Object.assign(new Error("Anti-truncation upstream round timed out."), {
-                                          status: 504,
-                                      })
+                                    ? produced || deadline < firstOutputBy
+                                        ? roundTimeoutError()
+                                        : noOutputError()
                                     : error;
                         } finally {
                             if (!finished && !cancelled) stopChild(child, "request_failed");
@@ -391,6 +407,7 @@ class AntiTruncation {
                     );
                 },
                 segment => {
+                    produced = true;
                     if (!spec.anti_truncation_segments) return;
                     publish(splitter ? splitter.push(segment.text) : [{ text: segment.text }]);
                 },
@@ -409,7 +426,8 @@ class AntiTruncation {
                               `(status ${diagnostic.status ?? "unknown"}: ${diagnostic.message}); returning them as incomplete`
                             : diagnostic.type === "repeat_trimmed"
                               ? `dropped ${diagnostic.characters} resent acknowledged character(s) from segment ${diagnostic.segments}`
-                              : `${diagnostic.type === "repair" ? "rejected" : "repair exhausted on"} transport call: ${diagnostic.issue}`;
+                              : `${diagnostic.type === "repair" ? "rejected" : "repair exhausted on"} transport call: ` +
+                                `${diagnostic.issue}${diagnostic.detail ? ` (${diagnostic.detail})` : ""}`;
                     handler.logger.warn?.(`${prefix} ${detail}`);
                 }
             );

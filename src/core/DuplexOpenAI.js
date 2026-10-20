@@ -83,13 +83,13 @@ class DuplexOpenAI {
                     });
                 }
             };
-            if (stream) {
+            // Nothing is sent before the first accepted text, in either stream mode: clients do not show
+            // an empty reply while the model thinks, and a failed or empty answer still gets a plain HTTP
+            // error. Once text has been sent, heartbeats keep the stream alive between segments.
+            const openStream = async () => {
+                if (res.headersSent) return;
                 ensureStream();
-                res.flushHeaders?.();
                 await write(frame({ content: "", role: "assistant" }));
-                // Relays such as new-api retain the latest frame to inspect final usage.
-                // An immediate empty frame releases the opening role frame downstream.
-                await write(frame({ content: "" }));
                 keepAlive = setInterval(() => {
                     if (handler._isResponseWritable(res) && !res.writableNeedDrain) {
                         res.write(": keep-alive\n\n");
@@ -97,9 +97,8 @@ class DuplexOpenAI {
                         res.write(`data: ${JSON.stringify(frame({ content: "" }))}\n\n`);
                     }
                 }, this.HEARTBEAT_INTERVAL_MS);
-            }
-            // Keep the SSE connection alive while shared browser recovery is pending.
-            // A disconnected client must never dispatch a new generation after recovery.
+            };
+            // A disconnected client must never dispatch a new generation after browser recovery.
             let waitingDisconnected = false;
             let onWaitingClose;
             const disconnected = new Promise(resolve => {
@@ -171,6 +170,7 @@ class DuplexOpenAI {
                     const call = tool("append_output", { seq, text: message.text });
                     calls.push(call);
                     if (stream && !fakeStream) {
+                        await openStream();
                         await write(
                             frame(
                                 output === "tools"
@@ -184,6 +184,8 @@ class DuplexOpenAI {
                 } else if (message.event_type === "chunk") fullBody += message.data || "";
             }
             const response = JSON.parse(fullBody);
+            const outputError = res.headersSent ? null : handler._noOutputError(response);
+            if (outputError) throw Object.assign(new Error(outputError.message), { status: outputError.status });
             const converted = handler.formatConverter.convertGoogleToOpenAINonStream(response, cleanModelName);
             handler.authSwitcher.failureCount = 0;
             let reason = converted.choices[0].finish_reason;
@@ -197,25 +199,17 @@ class DuplexOpenAI {
                 `[Duplex] Finished ${requestId}: reason=${response.candidates?.[0]?.finishReason}, segments=${seq}, output=${output}`
             );
             if (stream) {
+                await openStream();
                 if (fakeStream) {
                     if (output === "tools") {
                         for (const [index, call] of calls.entries()) {
                             await write(frame({ tool_calls: [{ index, ...call }] }));
                         }
                     } else {
-                        // The upstream answer is complete. Pace Unicode-safe SSE chunks so
-                        // clients still display a visible stream in fake mode; reasoning comes first.
+                        // The upstream answer is complete: send it at once, reasoning first.
                         const { content, reasoning_content: reasoning } = converted.choices[0].message;
-                        for (const [field, text] of [
-                            ["reasoning_content", reasoning],
-                            ["content", content],
-                        ]) {
-                            const characters = Array.from(text || "");
-                            for (let i = 0; i < characters.length; i += 128) {
-                                await write(frame({ [field]: characters.slice(i, i + 128).join("") }));
-                                if (i + 128 < characters.length) await new Promise(resolve => setTimeout(resolve, 20));
-                            }
-                        }
+                        if (reasoning) await write(frame({ reasoning_content: reasoning }));
+                        if (content) await write(frame({ content }));
                     }
                 }
                 await write(frame({}, reason, converted.usage));

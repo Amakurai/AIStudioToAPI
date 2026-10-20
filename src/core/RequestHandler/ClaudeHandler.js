@@ -147,165 +147,84 @@ class ClaudeHandler extends RetryHandler {
                     this.logger.info(`[Request] Claude streaming response (Real Mode) started...`);
                     await this._streamClaudeResponse(currentQueue, res, model, requestId);
                 } else {
-                    // Claude Fake Stream / Non-Stream mode
-                    let connectionMaintainer;
-                    if (isClaudeStream) {
-                        this._startSseKeepAlive(
-                            res,
-                            "event: ping\ndata: {}\n\n",
-                            () => {
-                                res.status(200).set({
-                                    "Cache-Control": "no-cache",
-                                    Connection: "keep-alive",
-                                    "Content-Type": "text/event-stream",
-                                });
-                            },
-                            timer => {
-                                connectionMaintainer = timer;
-                            }
-                        );
+                    // Claude Fake Stream / Non-Stream mode. Nothing is sent before the first text (fake
+                    // streams: before generation has finished), so failures and empty replies keep a
+                    // plain HTTP error status. Real-mode anti-truncation streams ping between segments.
+                    const startStream = () =>
+                        res.status(200).set({
+                            "Cache-Control": "no-cache",
+                            Connection: "keep-alive",
+                            "Content-Type": "text/event-stream",
+                        });
+
+                    const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
+
+                    if (!result.success) {
+                        this._logFinalRequestFailure(result.error, "Claude fake/non-stream", requestId);
+                        this._sendErrorResponse(res, result.error.status || 500, result.error.message, "api_error");
+                        const accountSwitchTask = this._handleFinalFailureAccountSwitch(result.error);
+                        if (accountSwitchTask) await accountSwitchTask;
+                        return;
                     }
 
-                    try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, res);
+                    if (this.authSwitcher.failureCount > 0) {
+                        this.logger.debug(`✅ [Auth] Claude request successful - failure count reset to 0`);
+                        this.authSwitcher.failureCount = 0;
+                    }
 
-                        if (!result.success) {
-                            this._logFinalRequestFailure(result.error, "Claude fake/non-stream", requestId);
-                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isClaudeStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
-                                this._handleRequestError(result.error, res, requestId);
-                            } else {
-                                this._sendErrorResponse(
-                                    res,
-                                    result.error.status || 500,
-                                    result.error.message,
-                                    "api_error"
-                                );
-                            }
-                            const accountSwitchTask = this._handleFinalFailureAccountSwitch(result.error);
-                            if (accountSwitchTask) await accountSwitchTask;
+                    // Use the queue that successfully received the initial message
+                    const activeQueue = result.queue;
+
+                    if (isClaudeStream) {
+                        if (proxyRequest.anti_truncation) {
+                            const streamState = {};
+                            await this._streamAntiTruncationResponse(
+                                proxyRequest,
+                                result.message,
+                                activeQueue,
+                                res,
+                                startStream,
+                                chunk => {
+                                    const events = this.formatConverter.translateGoogleToClaudeStream(
+                                        JSON.stringify(chunk),
+                                        model,
+                                        streamState
+                                    );
+                                    if (events) res.write(events);
+                                },
+                                "event: ping\ndata: {}\n\n"
+                            );
                             return;
                         }
 
-                        if (this.authSwitcher.failureCount > 0) {
-                            this.logger.debug(`✅ [Auth] Claude request successful - failure count reset to 0`);
-                            this.authSwitcher.failureCount = 0;
+                        const fullBody = await this._collectBufferedBody(
+                            activeQueue,
+                            res,
+                            "Claude fake stream",
+                            requestId
+                        );
+                        if (fullBody === null) return;
+                        const streamState = {};
+                        const translatedChunk = this.formatConverter.translateGoogleToClaudeStream(
+                            fullBody,
+                            model,
+                            streamState
+                        );
+                        if (streamState.error) this._markTrackedResponseError(res, streamState.error.message, 400);
+                        if (!this._isResponseWritable(res)) {
+                            this.logger.debug(
+                                "[Request] Response no longer writable before final fake Claude stream chunk."
+                            );
+                            return;
                         }
-
-                        // Use the queue that successfully received the initial message
-                        const activeQueue = result.queue;
-
-                        if (isClaudeStream) {
-                            // Fake stream
-                            if (!res.headersSent) {
-                                res.status(200).set({
-                                    "Cache-Control": "no-cache",
-                                    Connection: "keep-alive",
-                                    "Content-Type": "text/event-stream",
-                                });
-                            }
-                            if (proxyRequest.anti_truncation) {
-                                // Keep-alives continue while later segments are generated.
-                                const streamState = {};
-                                await this._streamAntiTruncationResponse(
-                                    proxyRequest,
-                                    result.message,
-                                    activeQueue,
-                                    res,
-                                    chunk => {
-                                        const events = this.formatConverter.translateGoogleToClaudeStream(
-                                            JSON.stringify(chunk),
-                                            model,
-                                            streamState
-                                        );
-                                        if (events) res.write(events);
-                                    }
-                                );
-                                return;
-                            }
-                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
-
-                            this.logger.info(`[Request] Claude streaming response (Fake Mode) started...`);
-                            let fullBody = "";
-                            let hadStreamError = false;
-                            try {
-                                // eslint-disable-next-line no-constant-condition
-                                while (true) {
-                                    const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM);
-                                    if (message.type === "STREAM_END") {
-                                        break;
-                                    }
-
-                                    if (message.event_type === "error") {
-                                        this.logger.error(
-                                            `❌ [Request] Error received during Claude fake stream: ${message.message}`
-                                        );
-                                        this._markTrackedResponseError(res, message.message, 500);
-                                        hadStreamError = true;
-                                        // Check if response is still writable before attempting to write
-                                        if (this._isResponseWritable(res)) {
-                                            try {
-                                                res.write(
-                                                    `event: error\ndata: ${JSON.stringify({
-                                                        error: {
-                                                            message: message.message,
-                                                            type: "api_error",
-                                                        },
-                                                        type: "error",
-                                                    })}\n\n`
-                                                );
-                                            } catch (writeError) {
-                                                this.logger.debug(
-                                                    `❌ [Request] Failed to write error to Claude fake stream: ${writeError.message}`
-                                                );
-                                            }
-                                        }
-                                        break;
-                                    }
-
-                                    if (message.data) fullBody += message.data;
-                                }
-                                if (hadStreamError) {
-                                    // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
-                                    return;
-                                }
-                                const streamState = {};
-                                const translatedChunk = this.formatConverter.translateGoogleToClaudeStream(
-                                    fullBody,
-                                    model,
-                                    streamState
-                                );
-                                if (streamState.error)
-                                    this._markTrackedResponseError(res, streamState.error.message, 400);
-                                if (this._isResponseWritable(res)) {
-                                    try {
-                                        if (translatedChunk) {
-                                            res.write(translatedChunk);
-                                        }
-                                    } catch (writeError) {
-                                        this.logger.debug(
-                                            `[Request] Failed to write final fake Claude stream chunk: ${writeError.message}`
-                                        );
-                                    }
-                                } else {
-                                    this.logger.debug(
-                                        "[Request] Response no longer writable before final fake Claude stream chunk."
-                                    );
-                                }
-                                this.logger.info(
-                                    `✅ [Request] Response completed (Claude fake stream), request ID: ${requestId}`
-                                );
-                            } catch (error) {
-                                // Classify error type and send appropriate response
-                                this._handleFakeStreamError(error, res);
-                            }
-                        } else {
-                            // Non-stream
-                            await this._sendClaudeNonStreamResponse(activeQueue, res, model, requestId);
-                        }
-                    } finally {
-                        if (connectionMaintainer) clearTimeout(connectionMaintainer);
+                        startStream();
+                        if (translatedChunk) res.write(translatedChunk);
+                        this.logger.info(
+                            `✅ [Request] Response completed (Claude fake stream), request ID: ${requestId}`
+                        );
+                    } else {
+                        // Non-stream
+                        await this._sendClaudeNonStreamResponse(activeQueue, res, model, requestId);
                     }
                 }
             } catch (error) {
@@ -449,6 +368,7 @@ class ClaudeHandler extends RetryHandler {
 
     async _streamClaudeResponse(messageQueue, res, model, requestId) {
         const streamState = {};
+        const gate = this._createRealStreamGate();
 
         try {
             // eslint-disable-next-line no-constant-condition
@@ -456,13 +376,27 @@ class ClaudeHandler extends RetryHandler {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
 
                 if (message.type === "STREAM_END") {
+                    if (!gate.open) {
+                        this._failBeforeOutput(res, gate.failure(), "Claude real stream", requestId);
+                        break;
+                    }
                     this.logger.info(`✅ [Request] Response completed (Claude real stream), request ID: ${requestId}`);
                     break;
                 }
 
                 if (message.event_type === "error") {
+                    const status = this._getUpstreamErrorStatus(message);
+                    if (!gate.open) {
+                        this._failBeforeOutput(
+                            res,
+                            { message: message.message, status },
+                            "Claude real stream",
+                            requestId
+                        );
+                        break;
+                    }
                     this.logger.error(`❌ [Request] Error received during Claude stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
+                    this._markTrackedResponseError(res, message.message, status);
                     // Attempt to send error event to client if headers allowed, then close
                     // Check if response is still writable before attempting to write
                     if (this._isResponseWritable(res)) {
@@ -486,11 +420,19 @@ class ClaudeHandler extends RetryHandler {
                 }
 
                 if (message.data) {
-                    const claudeChunk = this.formatConverter.translateGoogleToClaudeStream(
+                    const claudeChunk = gate.push(
                         message.data,
-                        model,
-                        streamState
+                        this.formatConverter.translateGoogleToClaudeStream(message.data, model, streamState)
                     );
+                    if (streamState.error && !gate.open) {
+                        this._failBeforeOutput(
+                            res,
+                            { message: streamState.error.message, status: 400 },
+                            "Claude real stream",
+                            requestId
+                        );
+                        break;
+                    }
                     if (streamState.error) this._markTrackedResponseError(res, streamState.error.message, 400);
                     if (claudeChunk) {
                         // Before writing, ensure the response is still writable to avoid
@@ -528,26 +470,8 @@ class ClaudeHandler extends RetryHandler {
     }
 
     async _sendClaudeNonStreamResponse(messageQueue, res, model, requestId) {
-        let fullBody = "";
-        let receiving = true;
-        while (receiving) {
-            const message = await messageQueue.dequeue(this.timeouts.FAKE_STREAM);
-            if (message.type === "STREAM_END") {
-                this.logger.debug("[Request] Claude received end signal.");
-                receiving = false;
-                break;
-            }
-
-            if (message.event_type === "error") {
-                this.logger.error(`❌ [Adapter] Error during Claude non-stream conversion: ${message.message}`);
-                this._sendErrorResponse(res, 500, message.message, "api_error");
-                return;
-            }
-
-            if (message.event_type === "chunk" && message.data) {
-                fullBody += message.data;
-            }
-        }
+        const fullBody = await this._collectBufferedBody(messageQueue, res, "Claude non-stream", requestId);
+        if (fullBody === null) return;
 
         try {
             const googleResponse = JSON.parse(fullBody);

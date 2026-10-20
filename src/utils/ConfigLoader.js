@@ -137,6 +137,10 @@ class ConfigLoader {
         }
         if (["real", "fake"].includes(process.env.ANTI_TRUNCATION_STREAMING_MODE))
             config.antiTruncationStreamingMode = process.env.ANTI_TRUNCATION_STREAMING_MODE;
+        if (process.env.ANTI_TRUNCATION_FIRST_OUTPUT_TIMEOUT_MS) {
+            const parsed = parseInt(process.env.ANTI_TRUNCATION_FIRST_OUTPUT_TIMEOUT_MS, 10);
+            if (Number.isFinite(parsed) && parsed > 0) config.antiTruncationFirstOutputTimeoutMs = parsed;
+        }
         if (process.env.ANTI_TRUNCATION_SPLIT_THINKING)
             config.antiTruncationSplitThinking = process.env.ANTI_TRUNCATION_SPLIT_THINKING.toLowerCase() !== "false";
         if (process.env.PLAYGROUND_ENABLED)

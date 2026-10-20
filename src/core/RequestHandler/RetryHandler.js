@@ -81,13 +81,154 @@ class RetryHandler extends ConnectionHandler {
     }
 
     /**
+     * Until the first byte is sent the response status is still open, so an empty or failed reply
+     * becomes an HTTP error instead of an empty 200 stream. Returns
+     * `{ message, status }` for a Gemini body without output, or null when it has output.
+     */
+    _noOutputError(body) {
+        let response = body;
+        if (typeof body === "string") {
+            try {
+                response = JSON.parse(body.startsWith("data: ") ? body.slice(6) : body);
+            } catch {
+                return { message: "Upstream returned an incomplete or invalid response.", status: 502 };
+            }
+        }
+        if (response?.error) {
+            return {
+                message: response.error.message || "Upstream generation failed.",
+                status: Number(response.error.code) || 502,
+            };
+        }
+        const blockReason = response?.promptFeedback?.blockReason;
+        if (blockReason && blockReason !== "BLOCK_REASON_UNSPECIFIED")
+            return { message: `Upstream blocked the prompt (${blockReason}).`, status: 400 };
+        const candidate = response?.candidates?.[0];
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+        // Thinking alone is not a reply; text, tool calls and media are.
+        const hasOutput = parts.some(
+            part =>
+                part &&
+                part.thought !== true &&
+                (typeof part.text === "string"
+                    ? part.text.trim().length > 0
+                    : Object.keys(part).some(key => key !== "thought" && key !== "thoughtSignature"))
+        );
+        if (hasOutput) return null;
+        return {
+            message: `Upstream returned no output (finishReason=${candidate?.finishReason ?? "none"}).`,
+            status: 502,
+        };
+    }
+
+    /** True when a raw Gemini response or SSE chunk carries any reply text, thought, tool call or media. */
+    _hasGoogleOutput(data) {
+        return (
+            /"text"\s*:\s*"(?!")/.test(data) ||
+            /"(?:functionCall|inlineData|fileData|executableCode|codeExecutionResult)"\s*:/.test(data)
+        );
+    }
+
+    /** Answers a request that failed before any output with a plain HTTP error. */
+    _failBeforeOutput(res, failure, label, requestId) {
+        this.logger.error(`❌ [Request] ${label} failed: ${failure.message}, request ID: ${requestId}`);
+        this._markTrackedResponseError(res, failure.message, failure.status);
+        if (this._isResponseWritable(res)) this._sendErrorResponse(res, failure.status, failure.message);
+    }
+
+    /**
+     * Collects a whole buffered (fake-stream or non-stream) body before anything is sent to the client.
+     * An upstream error or a reply without output is answered with a plain HTTP error and null is
+     * returned; queue timeouts and closed queues are thrown to the caller, whose error handler also
+     * answers with HTTP status.
+     */
+    async _collectBufferedBody(queue, res, label, requestId) {
+        let body = "",
+            failure = null;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            const message = await queue.dequeue(this.timeouts.FAKE_STREAM);
+            if (message.type === "STREAM_END") break;
+            if (message.event_type === "error") {
+                failure = { message: message.message, status: this._getUpstreamErrorStatus(message) };
+                break;
+            }
+            if (message.event_type === "chunk" && message.data) body += message.data;
+        }
+        failure ||= this._noOutputError(body);
+        if (!failure) return body;
+        this._failBeforeOutput(res, failure, label, requestId);
+        return null;
+    }
+
+    /**
+     * Holds the start of a real stream until the first upstream chunk with output, so clients see
+     * no empty reply (and relays measure the first token) only once text exists, and a stream that
+     * fails or ends without output still gets a plain HTTP error. `push(googleData, translated)`
+     * returns what to write now; `failure()` describes a stream that ended without output.
+     */
+    _createRealStreamGate() {
+        let pending = "",
+            raw = "",
+            open = false;
+        return {
+            failure: () => {
+                // The last complete Gemini event explains the empty reply (block or finish reason).
+                const events = raw
+                    .split(/\r?\n/)
+                    .filter(line => line.startsWith("data: "))
+                    .map(line => line.slice(6));
+                return (
+                    (events.length && this._noOutputError(events.at(-1))) ||
+                    this._noOutputError(raw.trim() || "{}") || {
+                        message: "Upstream returned no output.",
+                        status: 502,
+                    }
+                );
+            },
+            get open() {
+                return open;
+            },
+            push: (googleData, translated) => {
+                if (open) return translated || "";
+                pending += translated || "";
+                raw += googleData;
+                if (!this._hasGoogleOutput(raw)) return "";
+                open = true;
+                const held = pending;
+                pending = raw = "";
+                return held;
+            },
+        };
+    }
+
+    /**
      * Writes a streaming alias response, starting with the first queue message returned by
      * `_executeRequestWithRetries`. Real mode sends each accepted segment as it arrives; fake mode
-     * receives the finished answer and sends it in short paced chunks, reasoning first. `send(googleChunk)`
-     * writes one Gemini stream chunk in the client's format; the last one has no text and carries the
-     * finish reason and usage.
+     * receives the finished answer and sends it at once, reasoning first. `startStream()` sets the
+     * SSE headers and is called right before the first write, so a failure or an empty answer before
+     * any text still gets a plain HTTP error and clients show no empty reply while the model thinks.
+     * `write(googleChunk)` writes one Gemini stream chunk in the client's format; the last one has no
+     * text and carries the finish reason and usage. `heartbeat` is written between later segments.
      */
-    async _streamAntiTruncationResponse(proxyRequest, firstMessage, queue, res, send) {
+    async _streamAntiTruncationResponse(proxyRequest, firstMessage, queue, res, startStream, write, heartbeat) {
+        let keepAlive;
+        try {
+            await this._writeAntiTruncationStream(proxyRequest, firstMessage, queue, res, chunk => {
+                if (!res.headersSent) {
+                    startStream();
+                    this._startSseKeepAlive(res, heartbeat, startStream, timer => {
+                        keepAlive = timer;
+                    });
+                }
+                write(chunk);
+            });
+        } finally {
+            clearTimeout(keepAlive);
+        }
+    }
+
+    async _writeAntiTruncationStream(proxyRequest, firstMessage, queue, res, send) {
         const requestId = proxyRequest.request_id;
         // A leading thinking block arrives as reasoning pieces and is sent as Gemini thought parts.
         const textChunk = (text, thought) => ({
@@ -130,6 +271,15 @@ class RetryHandler extends ConnectionHandler {
         }
         const candidate = response.candidates?.[0];
         const parts = candidate?.content?.parts || [];
+        if (!seq) {
+            const outputError = this._noOutputError(response);
+            if (outputError) {
+                this.logger.warn(`[AntiTruncation] ${requestId}: ${outputError.message}`);
+                this._markTrackedResponseError(res, outputError.message, outputError.status);
+                this._sendErrorResponse(res, outputError.status, outputError.message);
+                return;
+            }
+        }
         for (const thought of [true, false]) {
             const sent = streamed[thought ? "reasoning" : "answer"];
             const text = parts
@@ -141,12 +291,10 @@ class RetryHandler extends ConnectionHandler {
                 this.logger.warn(`[AntiTruncation] ${requestId}: final text differs from the streamed segments.`);
                 continue;
             }
-            const rest = Array.from(text.slice(sent.length));
-            for (let i = 0; i < rest.length; i += 128) {
-                if (i) await new Promise(resolve => setTimeout(resolve, 20));
-                if (!this._isResponseWritable(res)) return;
-                send(textChunk(rest.slice(i, i + 128).join(""), thought));
-            }
+            const rest = text.slice(sent.length);
+            if (!rest) continue;
+            if (!this._isResponseWritable(res)) return;
+            send(textChunk(rest, thought));
         }
         if (!this._isResponseWritable(res)) return;
         send({
