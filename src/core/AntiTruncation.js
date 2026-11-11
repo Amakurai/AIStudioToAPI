@@ -1,14 +1,5 @@
 /** Request validation and forwarding for the opt-in anti-truncation model aliases. */
 class AntiTruncation {
-    // Same segment count for every budget, so a larger output budget never lowers total capacity.
-    static MAX_SEGMENTS = 8;
-    // Consecutive repairs allowed for one step; the counter restarts after new text is accepted.
-    static MAX_TOOL_REPAIRS = 2;
-    static MAX_CHUNK_CHARACTERS = 12000;
-    // A resent prefix of acknowledged text is dropped from a new segment only from this length on.
-    static MIN_REPEATED_CHARACTERS = 32;
-    // Without any accepted text by then, clients have usually given up; stop instead of starting
-    // more rounds. Once text has been accepted, rounds are bounded only by the per-call timeout.
     static FIRST_OUTPUT_TIMEOUT_MS = 300000;
     static BLOCKED_FINISH_REASONS = [
         "SAFETY",
@@ -39,18 +30,8 @@ class AntiTruncation {
         return stops;
     }
 
-    static textChunkLimit(maxOutputTokens, thinkingBudget) {
-        if (!maxOutputTokens) return this.MAX_CHUNK_CHARACTERS;
-        // Thinking shares the output budget, and JSON escaping costs tokens. Leave headroom for both;
-        // malformed or cut-off calls still halve the limit through bounded repair.
-        const reserved = Number.isInteger(thinkingBudget) && thinkingBudget > 0 ? thinkingBudget : 0;
-        const available = Math.max(0, maxOutputTokens - reserved);
-        return Math.min(this.MAX_CHUNK_CHARACTERS, Math.max(64, Math.floor(available * 0.75)));
-    }
-
     static maxWaitMs(perCallTimeout) {
-        // One upstream call per segment, an optional finish_output call and bounded repairs.
-        return perCallTimeout * (this.MAX_SEGMENTS + 1 + this.MAX_TOOL_REPAIRS) + 1000;
+        return perCallTimeout + 1000;
     }
 
     static baseModel(model) {
@@ -68,7 +49,7 @@ class AntiTruncation {
     }
 
     /**
-     * The duplex protocol owns tools and toolConfig. Requests that bring their own tools or cached
+     * The output wrapper owns tools and toolConfig. Requests that bring their own tools or cached
      * content fall back to the base model on the ordinary transport instead of failing.
      */
     static requiresOriginalModel(request) {
@@ -219,9 +200,11 @@ class AntiTruncation {
         if (!parent || parent.closed) return;
         let activeChild = null;
         let activeAuthIndex = authIndex;
-        const firstOutputTimeout = handler.config?.antiTruncationFirstOutputTimeoutMs || this.FIRST_OUTPUT_TIMEOUT_MS;
+        const firstOutputTimeout = Math.min(
+            handler.config?.antiTruncationFirstOutputTimeoutMs || this.FIRST_OUTPUT_TIMEOUT_MS,
+            handler.timeouts.FAKE_STREAM
+        );
         const firstOutputBy = Date.now() + firstOutputTimeout;
-        let produced = false;
         let cancelled = false;
         let resolveCancellation;
         const cancellation = new Promise(resolve => {
@@ -257,193 +240,146 @@ class AntiTruncation {
             const body = JSON.parse(spec.body);
             const cancelledError = () =>
                 Object.assign(new Error("Anti-truncation request cancelled."), { cancelled: true });
-            // A leading <thinking> block goes to the client's reasoning field, except for the optional
-            // tool output, whose segments must rebuild the reply byte for byte.
-            const ReasoningSplitter = require("./ReasoningSplitter");
-            const splitThinking =
-                handler.config?.antiTruncationSplitThinking !== false && spec.anti_truncation_output !== "tools";
-            const splitter = splitThinking ? new ReasoningSplitter() : null;
-            const roundTimeoutError = () =>
-                Object.assign(new Error("Anti-truncation upstream round timed out."), { status: 504 });
             // Restarting the whole answer would only repeat the wait the client already gave up on.
             const noOutputError = () =>
                 Object.assign(
                     new Error(`Anti-truncation produced no output within ${Math.round(firstOutputTimeout / 1000)}s.`),
                     { retryable: false, skipAccountSwitch: true, status: 504 }
                 );
-            let publishedSeq = 0;
-            const publish = pieces => {
-                for (const piece of pieces)
-                    parent.enqueue({ event_type: "tool_output", seq: ++publishedSeq, ...piece });
-            };
-            const response = await require("./DuplexToolTransport").generate(
-                body,
-                async requestBody => {
-                    const tracker = handler._createImmediateSwitchTracker(activeAuthIndex);
-                    // Keep the engine's acknowledged history and published segments intact: only this
-                    // upstream round is retried, including continuation and malformed-tool repair rounds.
-                    for (;;) {
-                        if (cancelled || parent.closed) throw cancelledError();
-                        // The deadline covers only this upstream round, and until the first accepted text
-                        // also the time left before the first-output deadline. Expiry stops this child,
-                        // not the whole answer, so the engine can keep already accepted segments.
-                        const deadline = Math.min(
-                            Date.now() + handler.timeouts.FAKE_STREAM,
-                            produced ? Infinity : firstOutputBy
+            const response = await require("./DuplexToolTransport").generate(body, async requestBody => {
+                const tracker = handler._createImmediateSwitchTracker(activeAuthIndex);
+                // Ordinary retryable account failures may switch accounts before output exists.
+                for (;;) {
+                    if (cancelled || parent.closed) throw cancelledError();
+                    const deadline = firstOutputBy;
+                    if (deadline <= Date.now()) throw noOutputError();
+                    const id = handler._generateRequestId();
+                    const attempt = handler._generateRequestAttemptId(id, 1);
+                    const queue = registry.createMessageQueue(id, activeAuthIndex, attempt, spec.request_id);
+                    const child = { attempt, authIndex: activeAuthIndex, id };
+                    activeChild = child;
+                    let finished = false;
+                    let attemptError = null;
+                    try {
+                        handler._forwardRequest(
+                            {
+                                ...spec,
+                                anti_truncation: false,
+                                body: JSON.stringify(
+                                    spec.channel === "playground" ? this.playgroundBody(requestBody) : requestBody
+                                ),
+                                path: spec.path.replace(":streamGenerateContent", ":generateContent"),
+                                query_params: { ...spec.query_params, alt: "json" },
+                                request_attempt_id: attempt,
+                                request_id: id,
+                                streaming_mode: "fake",
+                            },
+                            activeAuthIndex
                         );
-                        if (deadline <= Date.now()) throw noOutputError();
-                        const id = handler._generateRequestId();
-                        const attempt = handler._generateRequestAttemptId(id, 1);
-                        const queue = registry.createMessageQueue(id, activeAuthIndex, attempt, spec.request_id);
-                        const child = { attempt, authIndex: activeAuthIndex, id };
-                        activeChild = child;
-                        let finished = false;
-                        let attemptError = null;
-                        try {
-                            handler._forwardRequest(
-                                {
-                                    ...spec,
-                                    anti_truncation: false,
-                                    body: JSON.stringify(
-                                        spec.channel === "playground" ? this.playgroundBody(requestBody) : requestBody
-                                    ),
-                                    path: spec.path.replace(":streamGenerateContent", ":generateContent"),
-                                    query_params: { ...spec.query_params, alt: "json" },
-                                    request_attempt_id: attempt,
-                                    request_id: id,
-                                    streaming_mode: "fake",
-                                },
-                                activeAuthIndex
-                            );
-                            let json = "";
-                            while (!finished) {
-                                const remaining = deadline - Date.now();
-                                if (remaining <= 0) throw produced ? roundTimeoutError() : noOutputError();
-                                const message = await queue.dequeue(remaining);
-                                if (message.event_type === "error")
-                                    throw Object.assign(new Error(message.message), {
-                                        retryable: message.retryable,
-                                        status: message.status,
-                                    });
-                                if (message.event_type === "response_headers" && message.status >= 400) {
-                                    throw Object.assign(new Error(`Upstream returned HTTP ${message.status}`), {
-                                        status: message.status,
-                                    });
-                                }
-                                if (message.type === "STREAM_END") {
-                                    finished = true;
-                                    break;
-                                }
-                                if (message.event_type === "chunk") json += message.data || "";
-                            }
-                            let response;
-                            try {
-                                response = JSON.parse(json);
-                            } catch {
-                                throw this.protocolError("upstream returned incomplete or invalid JSON.");
-                            }
-                            // Some browser transports return a Google error as an ordinary JSON body.
-                            if (response?.error) {
-                                throw Object.assign(new Error(response.error.message || "Upstream generation failed"), {
-                                    status: response.error.code,
+                        let json = "";
+                        while (!finished) {
+                            const remaining = deadline - Date.now();
+                            if (remaining <= 0) throw noOutputError();
+                            const message = await queue.dequeue(remaining);
+                            if (message.event_type === "error")
+                                throw Object.assign(new Error(message.message), {
+                                    retryable: message.retryable,
+                                    status: message.status,
+                                });
+                            if (message.event_type === "response_headers" && message.status >= 400) {
+                                throw Object.assign(new Error(`Upstream returned HTTP ${message.status}`), {
+                                    status: message.status,
                                 });
                             }
-                            return response;
-                        } catch (error) {
-                            attemptError =
-                                error.code === "QUEUE_TIMEOUT"
-                                    ? produced || deadline < firstOutputBy
-                                        ? roundTimeoutError()
-                                        : noOutputError()
-                                    : error;
-                        } finally {
-                            if (!finished && !cancelled) stopChild(child, "request_failed");
-                            else registry.removeMessageQueue(id);
-                            if (activeChild === child) activeChild = null;
+                            if (message.type === "STREAM_END") {
+                                finished = true;
+                                break;
+                            }
+                            if (message.event_type === "chunk") json += message.data || "";
                         }
-                        if (cancelled || parent.closed) throw cancelledError();
-                        if (
-                            attemptError.retryable === false ||
-                            !handler.config?.immediateSwitchStatusCodes?.includes(Number(attemptError.status))
-                        ) {
-                            throw attemptError;
-                        }
-                        // No upstream work remains on this account. Recovery may close that context, so
-                        // detach the logical parent until a new account has actually been selected.
-                        if (!registry.setMessageQueueAuthIndex(spec.request_id, null, parent)) throw attemptError;
-                        let retryPrepared = false;
+                        let response;
                         try {
-                            retryPrepared = await Promise.race([
-                                handler._prepareImmediateStatusRetry(
-                                    attemptError,
-                                    spec.request_id,
-                                    tracker,
-                                    activeAuthIndex
-                                ),
-                                cancellation,
-                            ]);
-                        } catch (switchError) {
-                            handler.logger.warn?.(`[AntiTruncation] Account retry failed: ${switchError.message}`);
+                            response = JSON.parse(json);
+                        } catch {
+                            throw this.protocolError("upstream returned incomplete or invalid JSON.");
                         }
-                        if (cancelled || parent.closed) throw cancelledError();
-                        if (!retryPrepared || !Number.isInteger(tracker.nextAuthIndex) || tracker.nextAuthIndex < 0) {
-                            registry.setMessageQueueAuthIndex(spec.request_id, activeAuthIndex, parent);
-                            // The outer handler must not restart the whole response after bounded retries.
-                            throw Object.assign(attemptError, { retryable: false, skipAccountSwitch: true });
+                        // Some browser transports return a Google error as an ordinary JSON body.
+                        if (response?.error) {
+                            throw Object.assign(new Error(response.error.message || "Upstream generation failed"), {
+                                status: response.error.code,
+                            });
                         }
-                        activeAuthIndex = tracker.nextAuthIndex;
-                        if (!registry.setMessageQueueAuthIndex(spec.request_id, activeAuthIndex, parent)) {
-                            throw Object.assign(attemptError, { retryable: false, skipAccountSwitch: true });
-                        }
-                        recordAdditionalAttempt();
+                        return response;
+                    } catch (error) {
+                        attemptError = error.code === "QUEUE_TIMEOUT" ? noOutputError() : error;
+                    } finally {
+                        if (!finished && !cancelled) stopChild(child, "request_failed");
+                        else registry.removeMessageQueue(id);
+                        if (activeChild === child) activeChild = null;
                     }
-                },
-                reason => {
+                    if (cancelled || parent.closed) throw cancelledError();
+                    if (
+                        attemptError.retryable === false ||
+                        !handler.config?.immediateSwitchStatusCodes?.includes(Number(attemptError.status))
+                    ) {
+                        throw attemptError;
+                    }
+                    // No upstream work remains on this account. Recovery may close that context, so
+                    // detach the logical parent until a new account has actually been selected.
+                    if (!registry.setMessageQueueAuthIndex(spec.request_id, null, parent)) throw attemptError;
+                    let retryPrepared = false;
+                    try {
+                        retryPrepared = await Promise.race([
+                            handler._prepareImmediateStatusRetry(
+                                attemptError,
+                                spec.request_id,
+                                tracker,
+                                activeAuthIndex
+                            ),
+                            cancellation,
+                        ]);
+                    } catch (switchError) {
+                        handler.logger.warn?.(`[AntiTruncation] Account retry failed: ${switchError.message}`);
+                    }
+                    if (cancelled || parent.closed) throw cancelledError();
+                    if (!retryPrepared || !Number.isInteger(tracker.nextAuthIndex) || tracker.nextAuthIndex < 0) {
+                        registry.setMessageQueueAuthIndex(spec.request_id, activeAuthIndex, parent);
+                        // The outer handler must not restart the whole response after bounded retries.
+                        throw Object.assign(attemptError, { retryable: false, skipAccountSwitch: true });
+                    }
+                    activeAuthIndex = tracker.nextAuthIndex;
+                    if (!registry.setMessageQueueAuthIndex(spec.request_id, activeAuthIndex, parent)) {
+                        throw Object.assign(attemptError, { retryable: false, skipAccountSwitch: true });
+                    }
                     recordAdditionalAttempt();
-                    handler.logger.info(
-                        reason === "repair"
-                            ? `[AntiTruncation] Retrying rejected transport call for ${spec.request_id}`
-                            : `[AntiTruncation] Requesting next segment for ${spec.request_id}`
-                    );
-                },
-                segment => {
-                    produced = true;
-                    if (!spec.anti_truncation_segments) return;
-                    publish(splitter ? splitter.push(segment.text) : [{ text: segment.text }]);
-                },
-                diagnostic => {
-                    const prefix = `[AntiTruncation] ${spec.request_id}:`;
-                    if (diagnostic.type === "plain_text") {
-                        handler.logger.info(
-                            `${prefix} accepted a plain-text reply as segment ${diagnostic.segments} ` +
-                                `(${diagnostic.characters} characters, ${diagnostic.finishReason})`
-                        );
-                        return;
-                    }
-                    const detail =
-                        diagnostic.type === "interrupted"
-                            ? `upstream round failed after ${diagnostic.segments} accepted segment(s) ` +
-                              `(status ${diagnostic.status ?? "unknown"}: ${diagnostic.message}); returning them as incomplete`
-                            : diagnostic.type === "repeat_trimmed"
-                              ? `dropped ${diagnostic.characters} resent acknowledged character(s) from segment ${diagnostic.segments}`
-                              : `${diagnostic.type === "repair" ? "rejected" : "repair exhausted on"} transport call: ` +
-                                `${diagnostic.issue}${diagnostic.detail ? ` (${diagnostic.detail})` : ""}`;
-                    handler.logger.warn?.(`${prefix} ${detail}`);
                 }
-            );
+            });
             if (cancelled || parent.closed) throw cancelledError();
-            if (splitter && spec.anti_truncation_segments) publish(splitter.push("", true));
+            // Tag interpretation is an explicit compatibility option, independent of transport.
             const candidate = response.candidates[0];
-            const split = splitThinking ? ReasoningSplitter.split(candidate.content.parts[0].text) : null;
-            if (split) {
-                candidate.content.parts = [
-                    ...(split.reasoning ? [{ text: split.reasoning, thought: true }] : []),
-                    { text: split.answer },
-                ];
-                handler.logger.info(
-                    `[AntiTruncation] ${spec.request_id}: returned a ${split.reasoning.length}-character ` +
-                        "leading thinking block as reasoning"
-                );
+            if (handler.config?.antiTruncationSplitThinking === true && spec.anti_truncation_output !== "tools") {
+                const parts = candidate.content.parts;
+                const answer = parts
+                    .filter(part => part.thought !== true)
+                    .map(part => part.text)
+                    .join("");
+                const split = require("./ReasoningSplitter").split(answer);
+                if (split)
+                    candidate.content.parts = [
+                        ...parts.filter(part => part.thought === true),
+                        ...(split.reasoning ? [{ text: split.reasoning, thought: true }] : []),
+                        { text: split.answer },
+                    ];
+            }
+            if (spec.anti_truncation_segments) {
+                for (const part of candidate.content.parts) {
+                    if (part.text)
+                        parent.enqueue({
+                            event_type: "tool_output",
+                            text: part.text,
+                            ...(part.thought === true ? { thought: true } : {}),
+                        });
+                }
             }
             parent.enqueue({
                 event_type: "response_headers",

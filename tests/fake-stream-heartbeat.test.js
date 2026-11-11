@@ -109,26 +109,19 @@ function harness() {
     return { complete, handler, queue, release, response, run };
 }
 
-test("fake streaming survives a data-only relay while waiting for headers and the full body", async t => {
+test("fake streaming waits silently for the full body and sends one complete reply", async t => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const h = harness();
     const task = h.run();
     await settle();
     assert.equal(h.response.headersSent, false, "quick failures must still use their HTTP status");
     t.mock.timers.tick(18000);
-    const opening = frames(h.response.output);
-    assert.equal(opening.length, 2);
-    // Model New API's data-only, one-frame-delayed relay: the second frame releases the first.
-    const relayed = opening.slice(0, -1);
-    assert.equal(relayed.length, 1);
-    assert.equal(relayed[0].choices[0].delta.content, "");
-    assert.equal(relayed[0].choices[0].finish_reason, null);
-    assert.equal(relayed[0].usage, undefined);
-    assert.equal(h.response.headers["X-Accel-Buffering"], "no");
+    assert.equal(h.response.headersSent, false);
+    assert.equal(h.response.output, "");
     h.release({ queue: h.queue, success: true });
     await settle();
     t.mock.timers.tick(18000);
-    assert.ok(frames(h.response.output).length >= 4, "heartbeats stopped after upstream headers");
+    assert.equal(h.response.output, "", "no empty heartbeat response before text exists");
     // The full response may take longer than a common 60-second outer gateway timeout.
     t.mock.timers.tick(36000);
     h.complete();
@@ -157,7 +150,7 @@ test("quick fake-stream errors retain HTTP status and never emit successful data
     assert.equal(h.response.output, before);
 });
 
-test("a late upstream failure keeps its error code after heartbeat data", async t => {
+test("a delayed upstream failure retains HTTP status before output", async t => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const h = harness();
     const task = h.run();
@@ -166,7 +159,8 @@ test("a late upstream failure keeps its error code after heartbeat data", async 
     t.mock.timers.tick(18000);
     h.queue.enqueue({ event_type: "error", message: "upstream deadline", status: 504 });
     await task;
-    assert.equal(frames(h.response.output).at(-1).error.code, 504);
+    assert.equal(h.response.statusCode, 504);
+    assert.equal(JSON.parse(h.response.output).error.message, "upstream deadline");
     assert.equal(h.response.error.status, 504);
     assert.ok(!h.response.output.includes('"finish_reason":"stop"'));
 });
@@ -184,7 +178,7 @@ test("non-stream requests stay silent while waiting and return ordinary JSON", a
     assert.equal(JSON.parse(h.response.output).choices[0].message.content, "Hello");
 });
 
-test("paced fake output preserves HTML, Unicode, reasoning, tool arguments and final usage", async () => {
+test("buffered fake output preserves HTML, Unicode, reasoning, tool arguments and final usage", async () => {
     const h = harness();
     const text = "```html\n<div>你好💙</div>\n".repeat(25) + "```";
     const data = {
@@ -202,17 +196,15 @@ test("paced fake output preserves HTML, Unicode, reasoning, tool arguments and f
         ],
         usageMetadata: { candidatesTokenCount: 2, promptTokenCount: 3, totalTokenCount: 5 },
     };
-    const converted = h.handler.formatConverter.translateGoogleToOpenAIStream(
-        JSON.stringify(data),
-        "gemini-4-argon",
-        {}
-    );
-    assert.equal(await h.handler._writeOpenAIFakeStreamChunks(h.response, converted), true);
+    const task = h.run();
+    h.release({ queue: h.queue, success: true });
+    h.queue.enqueue({ data: JSON.stringify(data), event_type: "chunk" });
+    h.queue.enqueue({ type: "STREAM_END" });
+    await task;
     const events = frames(h.response.output);
     assert.equal(events.map(f => f.choices[0].delta.content || "").join(""), text);
     assert.equal(events.map(f => f.choices[0].delta.reasoning_content || "").join(""), "brief reasoning");
-    assert.ok(events.filter(f => f.choices[0].delta.content).length > 1);
-    assert.ok(events.every(f => Array.from(f.choices[0].delta.content || "").length <= 128));
+    assert.equal(events.filter(f => f.choices[0].delta.content).length, 1);
     const call = events.flatMap(f => f.choices[0].delta.tool_calls || []);
     assert.equal(call.length, 1);
     assert.equal(call[0].function.arguments, JSON.stringify(data.candidates[0].content.parts[2].functionCall.args));
@@ -220,21 +212,13 @@ test("paced fake output preserves HTML, Unicode, reasoning, tool arguments and f
     assert.equal(events.at(-1).usage.total_tokens, 5);
 });
 
-test("disconnect during paced output stops subsequent frames", async () => {
+test("disconnect before buffered output prevents any later content frames", async () => {
     const h = harness();
-    const converted = h.handler.formatConverter.translateGoogleToOpenAIStream(
-        JSON.stringify({
-            candidates: [{ content: { parts: [{ text: "x".repeat(400) }] }, finishReason: "STOP" }],
-        }),
-        "gemini-4-argon",
-        {}
-    );
-    const write = h.response.write.bind(h.response);
-    h.response.write = text => {
-        write(text);
-        h.response.end();
-        return true;
-    };
-    assert.equal(await h.handler._writeOpenAIFakeStreamChunks(h.response, converted), false);
-    assert.equal(frames(h.response.output).length, 1);
+    const task = h.run();
+    h.release({ queue: h.queue, success: true });
+    await settle();
+    h.response.end();
+    h.complete("x".repeat(400));
+    await task;
+    assert.equal(frames(h.response.output).length, 0);
 });

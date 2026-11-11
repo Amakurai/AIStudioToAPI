@@ -34,10 +34,23 @@ class ChatCompletionsConverter extends FormatConverter {
         let systemInstruction = null;
         const googleContents = [];
 
-        // Extract system messages
-        const systemMessages = openaiBody.messages.filter(msg => msg.role === "system");
+        // Both instruction roles accept text content parts. Joining an array directly would
+        // turn the caller's tool-use instructions into "[object Object]".
+        const isInstruction = msg => msg.role === "system" || msg.role === "developer";
+        const systemMessages = openaiBody.messages.filter(isInstruction);
         if (systemMessages.length > 0) {
-            const systemContent = systemMessages.map(msg => msg.content).join("\n");
+            const systemContent = systemMessages
+                .map(msg =>
+                    typeof msg.content === "string"
+                        ? msg.content
+                        : Array.isArray(msg.content)
+                          ? msg.content
+                                .filter(part => part.type === "text" && typeof part.text === "string")
+                                .map(part => part.text)
+                                .join("\n")
+                          : ""
+                )
+                .join("\n");
             systemInstruction = {
                 parts: [{ text: systemContent }],
                 role: "system",
@@ -45,7 +58,7 @@ class ChatCompletionsConverter extends FormatConverter {
         }
 
         // Convert conversation messages
-        const conversationMessages = openaiBody.messages.filter(msg => msg.role !== "system");
+        const conversationMessages = openaiBody.messages.filter(msg => !isInstruction(msg));
 
         // OpenAI tool-result messages identify the function call by `tool_call_id`;
         // they do not carry the function name. Resolve that name from the preceding
@@ -303,8 +316,8 @@ class ChatCompletionsConverter extends FormatConverter {
 
         // Generation config
         const generationConfig = {
-            maxOutputTokens: openaiBody.max_tokens,
-            stopSequences: openaiBody.stop,
+            maxOutputTokens: openaiBody.max_completion_tokens ?? openaiBody.max_tokens,
+            stopSequences: typeof openaiBody.stop === "string" ? [openaiBody.stop] : openaiBody.stop,
             temperature: openaiBody.temperature,
             topK: openaiBody.top_k,
             topP: openaiBody.top_p,
@@ -324,6 +337,14 @@ class ChatCompletionsConverter extends FormatConverter {
 
         if (rawThinkingConfig) {
             thinkingConfig = {};
+
+            for (const [camel, snake] of [
+                ["thinkingLevel", "thinking_level"],
+                ["thinkingBudget", "thinking_budget"],
+            ]) {
+                const value = rawThinkingConfig[camel] ?? rawThinkingConfig[snake];
+                if (value != null) thinkingConfig[camel] = value;
+            }
 
             if (rawThinkingConfig.include_thoughts !== undefined) {
                 thinkingConfig.includeThoughts = rawThinkingConfig.include_thoughts;
@@ -644,7 +665,7 @@ class ChatCompletionsConverter extends FormatConverter {
         if (candidate.finishReason) {
             // Determine the correct finish_reason for OpenAI format
             let finishReason;
-            if (streamState.hasFunctionCall) {
+            if (streamState.hasFunctionCall && candidate.finishReason === "STOP") {
                 finishReason = "tool_calls";
             } else {
                 finishReason = this._mapFinishReason(candidate.finishReason, modelName);
@@ -759,7 +780,7 @@ class ChatCompletionsConverter extends FormatConverter {
 
         // Determine finish_reason
         let finishReason;
-        if (tool_calls.length > 0) {
+        if (tool_calls.length > 0 && (!candidate.finishReason || candidate.finishReason === "STOP")) {
             finishReason = "tool_calls";
         } else {
             finishReason = this._mapFinishReason(candidate.finishReason, modelName);

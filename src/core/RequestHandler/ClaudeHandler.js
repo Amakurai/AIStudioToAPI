@@ -79,6 +79,7 @@ class ClaudeHandler extends RetryHandler {
                     let currentQueue = messageQueue;
                     let currentQueueAuthIndex = dispatchAuthIndex;
                     let initialMessage;
+                    let streamQueue;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
@@ -91,6 +92,12 @@ class ClaudeHandler extends RetryHandler {
                         );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
+                        ({ message: initialMessage, queue: streamQueue } = await this._readRealStreamStart(
+                            proxyRequest,
+                            currentQueue,
+                            initialMessage,
+                            currentQueueAuthIndex
+                        ));
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
@@ -145,7 +152,7 @@ class ClaudeHandler extends RetryHandler {
                         "Content-Type": "text/event-stream",
                     });
                     this.logger.info(`[Request] Claude streaming response (Real Mode) started...`);
-                    await this._streamClaudeResponse(currentQueue, res, model, requestId);
+                    await this._streamClaudeResponse(streamQueue, res, model, requestId);
                 } else {
                     // Claude Fake Stream / Non-Stream mode. Nothing is sent before the first text (fake
                     // streams: before generation has finished), so failures and empty replies keep a

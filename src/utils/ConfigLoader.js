@@ -48,7 +48,7 @@ class ConfigLoader {
     loadConfiguration() {
         const config = {
             aiStudioAppUrl: DEFAULT_AI_STUDIO_APP_URL,
-            antiTruncationSplitThinking: true,
+            antiTruncationSplitThinking: false,
             antiTruncationStreamingMode: "real",
             apiKeys: [],
             apiKeySource: "Not set",

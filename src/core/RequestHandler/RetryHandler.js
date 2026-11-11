@@ -9,7 +9,7 @@ const AntiTruncation = require("../AntiTruncation");
 
 const ConnectionHandler = require("./ConnectionHandler");
 const { isUserAbortedError } = require("../../utils/CustomErrors");
-const { QueueTimeoutError } = require("../../utils/MessageQueue");
+const { QueueClosedError, QueueTimeoutError } = require("../../utils/MessageQueue");
 
 class RetryHandler extends ConnectionHandler {
     /**
@@ -70,8 +70,8 @@ class RetryHandler extends ConnectionHandler {
 
     /**
      * Streaming alias responses follow ANTI_TRUNCATION_STREAMING_MODE instead of STREAMING_MODE; their
-     * upstream rounds are always non-streaming. In real mode the forwarder publishes each accepted
-     * segment on the request queue. Returns the client stream mode, or null for other requests.
+     * upstream generation is non-streaming. In real mode the forwarder publishes the decoded reply
+     * on the request queue. Returns the client stream mode, or null for other requests.
      */
     _prepareAntiTruncationStream(proxyRequest, isStreaming) {
         if (!isStreaming || !proxyRequest.anti_truncation) return null;
@@ -127,6 +127,116 @@ class RetryHandler extends ConnectionHandler {
             /"text"\s*:\s*"(?!")/.test(data) ||
             /"(?:functionCall|inlineData|fileData|executableCode|codeExecutionResult)"\s*:/.test(data)
         );
+    }
+
+    _embeddedUpstreamError(data, streaming = false) {
+        const bodies = streaming
+            ? data.split(/\r?\n\r?\n/).map(frame =>
+                  frame
+                      .split(/\r?\n/)
+                      .filter(line => line.startsWith("data:"))
+                      .map(line => line.slice(5).trimStart())
+                      .join("\n")
+              )
+            : [data];
+        for (const body of bodies) {
+            try {
+                const error = JSON.parse(body)?.error;
+                const status = Number(error?.code);
+                if (Number.isInteger(status) && status >= 400 && status <= 599) {
+                    return { event_type: "error", message: error.message || "Upstream generation failed.", status };
+                }
+            } catch {
+                continue;
+            }
+        }
+        return null;
+    }
+
+    _replayQueue(queue, messages, onMessage = null) {
+        return {
+            async dequeue(...args) {
+                const message = messages.length ? messages.shift() : await queue.dequeue(...args);
+                if (onMessage) onMessage(message);
+                return message;
+            },
+        };
+    }
+
+    _handleDeliveredStreamError(proxyRequest, authIndex, error) {
+        if (error.event_type === "error") {
+            this._getUsageStatsService()?.recordAttemptFailure?.(proxyRequest.request_id, authIndex, error);
+        }
+        if (
+            !proxyRequest.is_generative ||
+            proxyRequest.channel === "playground" ||
+            error.event_type !== "error" ||
+            ![429, 503].includes(Number(error.status)) ||
+            error.retryable === false ||
+            this._isZeroQuotaError(error) ||
+            !this.config?.immediateSwitchStatusCodes?.includes(Number(error.status))
+        )
+            return;
+        this.authSource.markAccountCoolingDown?.(
+            authIndex,
+            this.config.rateLimitCooldownMs ?? 60000,
+            Number(error.status)
+        );
+        this.authSwitcher.failureCount++;
+        const switchTask =
+            authIndex === this.currentAuthIndex
+                ? this.authSwitcher.switchToNextAuth({ excludeIndices: [authIndex] })
+                : Promise.resolve();
+        Promise.resolve(switchTask)
+            .catch(switchError => this.logger.warn(`[Request] Account replacement failed: ${switchError.message}`))
+            .finally(() => {
+                this.browserManager.rebalanceContextPool?.().catch(rebalanceError => {
+                    this.logger.warn(
+                        `[Request] Failed to rebalance accounts after rate limit: ${rebalanceError.message}`
+                    );
+                });
+            });
+    }
+
+    async _readRealStreamStart(proxyRequest, queue, firstMessage, authIndex) {
+        const failure = message => {
+            this._getUsageStatsService()?.recordAttemptFailure?.(proxyRequest.request_id, authIndex, message);
+            return { message, queue };
+        };
+        if (firstMessage.event_type === "error") return failure(firstMessage);
+        const pending = firstMessage.event_type === "response_headers" ? [] : [firstMessage];
+        let raw = pending.map(message => message.data || "").join("");
+        for (;;) {
+            const embeddedError = this._embeddedUpstreamError(raw, true);
+            if (embeddedError) return failure(embeddedError);
+            if (this._hasGoogleOutput(raw) || pending.at(-1)?.type === "STREAM_END") {
+                return {
+                    message: firstMessage,
+                    queue: this._replayQueue(queue, pending, message =>
+                        this._handleDeliveredStreamError(proxyRequest, authIndex, message)
+                    ),
+                };
+            }
+            const message = await queue.dequeue(this.timeouts.STREAM_CHUNK);
+            if (message.event_type === "error") return failure(message);
+            pending.push(message);
+            if (message.data) raw += message.data;
+        }
+    }
+
+    async _readBufferedGeneration(queue) {
+        const pending = [];
+        let body = "";
+        for (;;) {
+            const message = await queue.dequeue(this.timeouts.FAKE_STREAM);
+            if (message.event_type === "error") throw new Error(JSON.stringify(message));
+            pending.push(message);
+            if (message.event_type === "chunk" && message.data) body += message.data;
+            if (message.type === "STREAM_END") break;
+        }
+        const error = this._embeddedUpstreamError(body);
+        if (error) throw new Error(JSON.stringify(error));
+        return this._replayQueue(queue, pending);
     }
 
     /** Answers a request that failed before any output with a plain HTTP error. */
@@ -230,7 +340,7 @@ class RetryHandler extends ConnectionHandler {
 
     async _writeAntiTruncationStream(proxyRequest, firstMessage, queue, res, send) {
         const requestId = proxyRequest.request_id;
-        // A leading thinking block arrives as reasoning pieces and is sent as Gemini thought parts.
+        // Native thoughts and an explicitly enabled compatibility split use Gemini thought parts.
         const textChunk = (text, thought) => ({
             candidates: [
                 { content: { parts: [thought ? { text, thought: true } : { text }], role: "model" }, index: 0 },
@@ -239,16 +349,14 @@ class RetryHandler extends ConnectionHandler {
         const streamed = { answer: "", reasoning: "" };
         let message = firstMessage,
             body = "",
-            seq = 0,
+            pieces = 0,
             response;
         try {
             while (message.type !== "STREAM_END") {
                 if (message.event_type === "error")
                     throw Object.assign(new Error(message.message), { status: message.status });
                 if (message.event_type === "tool_output") {
-                    if (message.seq !== seq + 1)
-                        throw AntiTruncation.protocolError("non-contiguous published sequence.");
-                    seq = message.seq;
+                    pieces++;
                     streamed[message.thought ? "reasoning" : "answer"] += message.text;
                     if (!this._isResponseWritable(res)) return;
                     send(textChunk(message.text, message.thought));
@@ -259,19 +367,19 @@ class RetryHandler extends ConnectionHandler {
         } catch (error) {
             // Until text reaches the client the usual stream error applies. Afterwards the delivered
             // text stands and the answer ends as incomplete instead of being replayed.
-            if (!seq || !this._isResponseWritable(res)) {
+            if ((!streamed.answer && !streamed.reasoning) || !this._isResponseWritable(res)) {
                 this._handleRequestError(error, res, requestId);
                 return;
             }
             this.logger.warn(
-                `[AntiTruncation] ${requestId}: stream interrupted after ${seq} published piece(s) (${error.message}); ending it as incomplete.`
+                `[AntiTruncation] ${requestId}: stream interrupted after ${pieces} published piece(s) (${error.message}); ending it as incomplete.`
             );
             const parts = [{ text: streamed.reasoning, thought: true }, { text: streamed.answer }];
             response = { candidates: [{ content: { parts }, finishReason: "MAX_TOKENS" }], usageMetadata: {} };
         }
         const candidate = response.candidates?.[0];
         const parts = candidate?.content?.parts || [];
-        if (!seq) {
+        if (!pieces) {
             const outputError = this._noOutputError(response);
             if (outputError) {
                 this.logger.warn(`[AntiTruncation] ${requestId}: ${outputError.message}`);
@@ -302,7 +410,7 @@ class RetryHandler extends ConnectionHandler {
             usageMetadata: response.usageMetadata,
         });
         this.logger.info(
-            `✅ [Request] Anti-truncation stream completed: reason=${candidate?.finishReason}, pieces=${seq}, request ID: ${requestId}`
+            `✅ [Request] Anti-truncation stream completed: reason=${candidate?.finishReason}, pieces=${pieces}, request ID: ${requestId}`
         );
     }
 
@@ -343,8 +451,8 @@ class RetryHandler extends ConnectionHandler {
 
     /**
      * A 429 with `limit: 0` means this account's tier has no quota for the model at all. It is not a
-     * rate limit: cooling, switching or rebalancing the account would take it away from every other
-     * model without making this one available. Only another account can serve the request.
+     * rate limit: cooling the account would take it away from every other model without making
+     * this one available. Try other ready or cold accounts without cooling it or counting a failure.
      */
     _isZeroQuotaError(errorDetails) {
         return Number(errorDetails?.status) === 429 && /limit:\s*0\b/.test(String(errorDetails?.message ?? ""));
@@ -377,6 +485,12 @@ class RetryHandler extends ConnectionHandler {
             immediateSwitchTracker,
             currentQueueAuthIndex
         );
+        if (
+            currentQueue.closed ||
+            this.connectionRegistry.messageQueues.get(proxyRequest.request_id)?.queue !== currentQueue
+        ) {
+            throw new QueueClosedError("Queue is closed during account retry", currentQueue.closeReason || "unknown");
+        }
         if (!retryPrepared) return null;
 
         const errorStatus = Number(errorDetails?.status);
@@ -401,6 +515,7 @@ class RetryHandler extends ConnectionHandler {
     }
 
     async _prepareImmediateStatusRetry(errorDetails, requestId, tracker, sourceAuthIndex) {
+        this._getUsageStatsService()?.recordAttemptFailure?.(requestId, sourceAuthIndex, errorDetails);
         if (errorDetails.retryable === false) return false;
         const originalQueue = this.connectionRegistry.messageQueues.get(requestId)?.queue;
         const requestIsActive = () =>
@@ -412,22 +527,36 @@ class RetryHandler extends ConnectionHandler {
             tracker.attemptedAuthIndices.add(sourceAuthIndex);
         }
         const zeroQuota = this._isZeroQuotaError(errorDetails);
-        const isRateLimited = Number(errorDetails.status) === 429 && !zeroQuota;
-        if (isRateLimited) {
-            this.authSource.markAccountCoolingDown?.(sourceAuthIndex, this.config.rateLimitCooldownMs ?? 60000);
+        const isRateLimited = [429, 503].includes(Number(errorDetails.status)) && !zeroQuota;
+        if (isRateLimited && !errorDetails.coolingDown) {
+            this.authSource.markAccountCoolingDown?.(
+                sourceAuthIndex,
+                this.config.rateLimitCooldownMs ?? 60000,
+                Number(errorDetails.status)
+            );
         }
-        if (!zeroQuota) this.authSwitcher.failureCount++;
+        if (!zeroQuota && !errorDetails.coolingDown) this.authSwitcher.failureCount++;
         const exclusions = () => [...tracker.attemptedAuthIndices];
         const select = () => this._selectDispatchAuthIndex(exclusions(), { allowFallback: false });
 
         try {
-            if (!requestIsActive() || !(await this._waitForSystemReady()) || !requestIsActive()) return false;
+            if (!requestIsActive()) return false;
             let nextAuthIndex = select();
-            // Rotate the primary account when it failed, or initialize a standby account
-            // when every ready account has already been tried by this request.
-            if (!zeroQuota && (sourceAuthIndex === this.currentAuthIndex || nextAuthIndex < 0)) {
+            const hasUntriedAccount = (this.authSource.getAvailableRotationIndices?.() || []).some(
+                index =>
+                    !exclusions().some(
+                        tried =>
+                            (this.authSource.getCanonicalIndex?.(tried) ?? tried) ===
+                            (this.authSource.getCanonicalIndex?.(index) ?? index)
+                    )
+            );
+            if (nextAuthIndex < 0) {
+                if (!(await this._waitForSystemReady()) || !requestIsActive()) return false;
+                nextAuthIndex = select();
+            }
+            if (nextAuthIndex < 0 && (!zeroQuota || hasUntriedAccount)) {
                 const result = await this.authSwitcher
-                    .switchToNextAuth({ excludeIndices: exclusions() })
+                    .switchToNextAuth({ excludeIndices: exclusions(), resetCounters: !zeroQuota })
                     .catch(error => {
                         this.logger.warn(
                             `[Request] Account replacement failed for request #${requestId}: ${error.message}`
@@ -454,11 +583,19 @@ class RetryHandler extends ConnectionHandler {
             // until their caller has prepared the next attempt.
             if (!this.connectionRegistry.setMessageQueueAuthIndex(requestId, nextAuthIndex, originalQueue))
                 return false;
+            const switchExclusions = exclusions();
             tracker.nextAuthIndex = nextAuthIndex;
             tracker.attemptedAuthIndices.add(nextAuthIndex);
             this.logger.info(
                 `[Request] Retrying request #${requestId} after ${errorDetails.status}: account #${sourceAuthIndex} -> #${nextAuthIndex}.`
             );
+            if (!zeroQuota && sourceAuthIndex === this.currentAuthIndex && !this.authSwitcher.isSystemBusy) {
+                this.authSwitcher.switchToNextAuth({ excludeIndices: switchExclusions }).catch(error => {
+                    this.logger.warn(
+                        `[Request] Account replacement failed for request #${requestId}: ${error.message}`
+                    );
+                });
+            }
             return true;
         } finally {
             // Refill the dispatch pool even when the failed account was not the primary.
@@ -570,8 +707,13 @@ class RetryHandler extends ConnectionHandler {
                     throw new Error(JSON.stringify(initialMessage));
                 }
 
-                // Success, return the initial message and the queue that received it
-                return { message: initialMessage, queue: currentQueue, success: true };
+                const responseQueue =
+                    proxyRequest.is_generative &&
+                    !proxyRequest.anti_truncation &&
+                    initialMessage.event_type === "response_headers"
+                        ? await this._readBufferedGeneration(currentQueue)
+                        : currentQueue;
+                return { message: initialMessage, queue: responseQueue, success: true };
             } catch (error) {
                 // Parse the structured error message
                 let errorPayload;
@@ -585,6 +727,12 @@ class RetryHandler extends ConnectionHandler {
                         errorPayload = { message: error.message, status: 500 };
                     }
                 }
+
+                this._getUsageStatsService()?.recordAttemptFailure?.(
+                    proxyRequest.request_id,
+                    currentQueueAuthIndex,
+                    errorPayload
+                );
 
                 if (
                     errorPayload.retryable === false ||

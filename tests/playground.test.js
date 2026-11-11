@@ -50,6 +50,26 @@ test("tool declarations, signed history and system instructions use distinct pro
     assert.equal(wire[6][0][1][0][2][6][0][0], "query");
 });
 
+test("mixed tools retain the server-side invocation opt-in in MakerSuite ToolConfig", () => {
+    const tools = [{ functionDeclarations: [{ name: "lookup" }] }, { googleSearch: {} }];
+    for (const toolConfig of [
+        { includeServerSideToolInvocations: true },
+        { include_server_side_tool_invocations: true },
+    ]) {
+        for (const key of ["toolConfig", "tool_config"]) {
+            const wire = WireCodec.encode("gemini-4-argon", { ...body(), [key]: toolConfig, tools });
+            assert.equal(wire[6][0][1][0][0], "lookup");
+            assert.ok(wire[6][1][3], "the search tool remains enabled");
+            assert.deepEqual(wire[13][0], [null, null, "UTC"], "retrieval defaults are preserved");
+            assert.equal(wire[13][2], true, "ToolConfig field 3 enables mixed tools");
+        }
+    }
+    for (const toolConfig of [undefined, {}, { includeServerSideToolInvocations: false }]) {
+        const wire = WireCodec.encode("gemini-4-argon", { ...body(), toolConfig });
+        assert.deepEqual(wire[13], [[null, null, "UTC"]]);
+    }
+});
+
 test("every UTF-8 text boundary and JSON escape can be fragmented without losing parts", () => {
     const expected = '中文🙂 [brackets] "quotes" \\ slash\nnext';
     const out = {};
@@ -94,6 +114,7 @@ function harness(t, mode = "fake") {
             playgroundCatalogPath: path.join(dir, "playground-models.json"),
             playgroundEnabled: true,
             playgroundModelList: [{ name: "models/gemini-4-argon" }],
+            playgroundSettingsPath: path.join(dir, "settings.json"),
         },
         connectionRegistry: registry,
         logger,
@@ -117,6 +138,82 @@ function harness(t, mode = "fake") {
     });
     return { calls: () => calls, context, handler, queue, registry, router, spec };
 }
+
+test("buffering client tools preserves their instructions and explicit tool choice", async t => {
+    for (const mode of [undefined, "AUTO", "ANY", "NONE"])
+        await t.test(String(mode), async t => {
+            const h = harness(t, "real");
+            const request = {
+                ...body(),
+                systemInstruction: { parts: [{ text: "Follow the tool description." }] },
+                tools: [{ functionDeclarations: [{ description: "Return the reply in query.", name: "lookup" }] }],
+                ...(mode ? { toolConfig: { functionCallingConfig: { mode } } } : {}),
+            };
+            h.spec.body = JSON.stringify(request);
+            h.router.sessions.set(h.context, {
+                async request(_model, sent, { onData }) {
+                    assert.deepEqual(sent.tools, request.tools);
+                    assert.deepEqual(sent.toolConfig, request.toolConfig);
+                    assert.deepEqual(sent.systemInstruction, request.systemInstruction);
+                    onData(response("plain text without a call"));
+                },
+            });
+            h.router.forward(h.spec, 1);
+            const first = await h.queue.dequeue();
+            if (mode === "ANY") {
+                assert.equal(first.event_type, "error");
+                assert.equal(first.status, 502);
+                assert.equal(first.retryable, false);
+                assert.match(first.message, /required by tool_choice/);
+                assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
+            } else {
+                assert.equal(first.event_type, "response_headers");
+                assert.match((await h.queue.dequeue()).data, /plain text without a call/);
+                assert.equal((await h.queue.dequeue()).type, "STREAM_END");
+            }
+        });
+});
+
+test("an explicitly named function choice cannot be satisfied by a different tool", async t => {
+    for (const name of ["lookup", "other"])
+        await t.test(name, async t => {
+            const h = harness(t, "real");
+            h.spec.body = JSON.stringify({
+                ...body(),
+                toolConfig: { functionCallingConfig: { allowedFunctionNames: ["lookup"], mode: "ANY" } },
+                tools: [{ functionDeclarations: [{ name: "lookup" }, { name: "other" }] }],
+            });
+            h.router.sessions.set(h.context, {
+                async request(_model, _body, { onData }) {
+                    const part = [];
+                    part[3] = [name, WireCodec.struct({ query: "done" }), "call1"];
+                    const raw = [[[[[part], "model"], 1]], null, [1, 1, 2]];
+                    onData(JSON.stringify([[raw]]));
+                },
+            });
+            h.router.forward(h.spec, 1);
+            const first = await h.queue.dequeue();
+            assert.equal(first.event_type, name === "lookup" ? "response_headers" : "error");
+            if (name === "other") assert.equal(first.status, 502);
+        });
+});
+
+test("a tool request failing after preliminary text returns only the 503 and remains retryable", async t => {
+    const h = harness(t, "real");
+    h.spec.body = JSON.stringify({ ...body(), tools: [{ functionDeclarations: [{ name: "lookup" }] }] });
+    h.router.sessions.set(h.context, {
+        async request(_model, _body, { onData }) {
+            onData(JSON.stringify([[wireChunk("preliminary text", 0)]]));
+            throw Object.assign(new Error("temporarily unavailable"), { status: 503 });
+        },
+    });
+    h.router.forward(h.spec, 1);
+    const first = await h.queue.dequeue();
+    assert.equal(first.event_type, "error");
+    assert.equal(first.status, 503);
+    assert.notEqual(first.retryable, false);
+    assert.ok(h.router.isCoolingDown("gemini-4-argon", 1));
+});
 
 test("native stream and buffered requests get Gemini output via the existing queue", async t => {
     for (const mode of ["real", "fake"]) {
@@ -276,9 +373,34 @@ test("cooling Playground accounts fail quickly without dispatch or extending coo
     h.router.fail("gemini-4-argon", 1, 429);
     const until = h.router.cooldownUntil("gemini-4-argon", 1);
     h.router.forward(h.spec, 1);
-    assert.equal((await h.queue.dequeue()).status, 503);
+    assert.equal((await h.queue.dequeue()).status, 429);
     assert.equal(h.calls(), 0);
     assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), until);
+});
+
+test("Playground preserves the original 403 during cooldown", async t => {
+    const h = harness(t);
+    h.router.fail("gemini-4-argon", 1, 403);
+    h.router.forward(h.spec, 1);
+    assert.equal((await h.queue.dequeue()).status, 403);
+    assert.equal(h.calls(), 0);
+});
+
+test("Playground can retry a rate limit after metadata but before output", async t => {
+    const h = harness(t, "real");
+    h.router.sessions.set(h.context, {
+        async request(_model, _body, { onData }) {
+            onData(JSON.stringify([[[null, null, [1, 0, 1]]]]));
+            throw Object.assign(new Error("Rate limited"), { status: 429 });
+        },
+    });
+    h.router.forward(h.spec, 1);
+    assert.equal((await h.queue.dequeue()).status, 200);
+    assert.equal((await h.queue.dequeue()).event_type, "chunk");
+    const error = await h.queue.dequeue();
+    assert.equal(error.status, 429);
+    assert.notEqual(error.retryable, false);
+    assert.ok(h.router.isCoolingDown("gemini-4-argon", 1));
 });
 
 test("first Playground permission failure can switch accounts, but committed streams cannot retry", async t => {
@@ -298,7 +420,7 @@ test("first Playground permission failure can switch accounts, but committed str
             await h.queue.dequeue();
         }
         const error = await h.queue.dequeue();
-        assert.equal(error.status, committed ? 403 : 503);
+        assert.equal(error.status, 403);
         if (committed) assert.equal(error.retryable, false);
         assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
         assert.equal(h.router.cooldownUntil("gemini-4-argon", 2), 0);
@@ -329,7 +451,13 @@ test("the Playground catalog keeps configured models, adds discovered ones once 
     h.router.catalog.discover(raw);
     const names = h.router.models().map(m => m.name);
     // Supported base models also get their anti-truncation alias, with the base model's limits.
-    assert.deepEqual(names, ["models/gemini-4-argon", "models/gemini-new", "models/gemini-4-argon-抗截断"]);
+    assert.deepEqual(names, [
+        "models/gemini-4-argon",
+        "models/gemini-new",
+        "models/gemini-4-argon-抗截断",
+        "models/gemini-4-argon-预设",
+        "models/gemini-new-预设",
+    ]);
     assert.equal(h.router.models()[0].outputTokenLimit, 100);
     assert.equal(h.router.models()[2].outputTokenLimit, 100);
     assert.equal(h.router.models()[2].displayName, "Argon 抗截断");
@@ -360,6 +488,6 @@ test("a catalog saved by the removed router is restored once", t => {
     });
     assert.deepEqual(
         transport.models().map(m => m.name),
-        ["models/gemini-old"]
+        ["models/gemini-old", "models/gemini-old-预设"]
     );
 });

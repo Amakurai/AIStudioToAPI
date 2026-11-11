@@ -15,6 +15,8 @@
 
 ## Build / Playground 双链路
 
+当前模型列表和控制台仅展示 Playground（`pg-*`）模型，Build 模型的列表注册已在代码中注释停用。
+
 Build 和 Playground 是两条独立链路，由模型名前缀决定：`build-` 前缀（如 `build-gemini-4-argon`、`build-gemini-4-argon-抗截断`）走 Build，模型列表来自 `configs/models.json`；`pg-` 前缀（如 `pg-gemini-4-argon`、`pg-gemini-4-argon-抗截断`）走 Playground，模型列表来自 `configs/playground-models.json` 及 Playground 页面的原生目录。两条链路互不回退，均支持抗截断。不带前缀的旧模型名仍按 Build 处理。共用已登录账号池，无需额外抓取 Cookie。详见 [Playground 说明](docs/playground.md)。
 
 ## 🚀 快速开始
@@ -270,14 +272,16 @@ services:
 | `SWITCH_ON_USES`                | 自动切换帐户前允许的请求次数（设为 `0` 禁用）。                                                                                                                     | `40`      |
 | `FAILURE_THRESHOLD`             | 切换帐户前允许的连续失败次数（设为 `0` 禁用）。                                                                                                                     | `3`       |
 | `IMMEDIATE_SWITCH_STATUS_CODES` | 触发立即切换帐户的 HTTP 状态码（逗号分隔，设为空值以禁用）。                                                                                                        | `429,503` |
-| `RATE_LIMIT_COOLDOWN_MS`        | 429 后已换下账号重新参与分发前的间隔（毫秒，必须为正数）。有可用账号时立即换号重试，不等待此间隔。                                                                  | `60000`   |
+| `RATE_LIMIT_COOLDOWN_MS`        | Build 遇到可重试的 429/503 后，账号重新参与分发前的间隔（毫秒，必须为正数）。有可用账号时立即换号重试。                                                             | `60000`   |
 | `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
 | `AI_STUDIO_APP_URL`             | 要打开的 AI Studio 应用地址（可选），格式为 `https://ai.studio/apps/<应用 ID>`；留空时使用内置应用。[教程](docs/zh/create-ai-studio-app.md)                         | 内置应用  |
 | `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |
 | `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
 | `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |
 
-普通模型和抗截断模型遇到 429 时，都会替换实际处理请求的账号，并从分发池中移出该限流账号、补入备用账号。抗截断只重试失败的当前一轮，保留已确认的输出和续写历史。每轮不会重复尝试同一账号；所有可用账号均失败后返回原错误。
+普通模型和抗截断模型遇到 429 时，都会替换实际处理请求的账号，并从分发池中移出该限流账号、补入备用账号。抗截断仅在输出前重试账号错误，不自动续写或修复回复；同一请求不会重复尝试同一账号，所有可用账号均失败后返回原错误。
+
+流式请求在正文输出前遇到可重试的 429/503 也会冷却并换号重试；正文已经发出时保留已发送内容并结束当前流，同时冷却该账号，避免重复输出。
 
 #### 🗒️ 其他配置
 
@@ -372,4 +376,4 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ### 抗截断模型
 
-直接选择 `build-gemini-3.7-flash-抗截断`、`build-gemini-3.8-flash-抗截断` 或 `build-gemini-4-argon-抗截断`（`build-` 前缀可省略），或 Playground 链路的 `pg-gemini-3.7-flash-抗截断`、`pg-gemini-3.8-flash-抗截断`、`pg-gemini-4-argon-抗截断`，即自动启用工具输出抗截断：原始对话直接发送，模型通过工具按序交付正文，未完成时有限续写；单段完整回答可在一次上游调用内完成。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。
+直接选择 `build-gemini-3.7-flash-抗截断`、`build-gemini-3.8-flash-抗截断` 或 `build-gemini-4-argon-抗截断`（`build-` 前缀可省略），或 Playground 链路的 `pg-gemini-3.7-flash-抗截断`、`pg-gemini-3.8-flash-抗截断`、`pg-gemini-4-argon-抗截断`，即自动启用单工具输出包装：模型通过 `output_content(content)` 一次交付完整回复，网关还原为普通正文；有效纯文本同样接收，不自动分段、续写或修复。**无需额外请求头或客户端脚本**，其他模型不受影响。OpenAI Chat Completions、Responses、Claude 和 Gemini 原生接口均支持，默认返回普通正文。流式行为、限制和测试方式见 [抗截断模型说明](docs/anti-truncation.md)。

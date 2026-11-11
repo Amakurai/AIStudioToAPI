@@ -5,6 +5,12 @@
             "displayName": "Gemini 4 Argon (Playground)",
             "description": "Gemini 4 Argon through AI Studio Playground. Availability depends on the upstream account.",
             "supportedGenerationMethods": ["generateContent"]
+        },
+        {
+            "name": "models/gemini-3.8-flash",
+            "displayName": "Gemini 3.8 Flash (Playground)",
+            "description": "Gemini 3.8 Flash through AI Studio Playground. Availability depends on the upstream account.",
+            "supportedGenerationMethods": ["generateContent"]
         }
     ]
 }

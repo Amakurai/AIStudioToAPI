@@ -12,25 +12,54 @@
 - 模型名前缀唯一决定链路，请求进入时剥掉前缀再发往上游，例如 `build-gemini-4-argon` 与 `pg-gemini-4-argon` 是同一个上游模型的两条链路。思考等级、流式模式和内置工具后缀照常叠加在后面（如 `pg-gemini-4-argon-high`）。
 - 两条链路互不回退：Build 的 403、404、429、400 等错误直接按 Build 原有的重试与换号流程处理，不会改走 Playground；Playground 的错误同样只在 Playground 内处理。
 - 不带前缀的旧模型名（如 `gemini-3.8-flash`）仍按 Build 处理，兼容现有客户端，但不再出现在模型列表中。
-- `GET /v1/models` 与 `GET /v1beta/models` 分别列出 `build-*` 与 `pg-*` 模型，`upstream_channel`/`upstreamChannel` 字段为 `build` 或 `playground`。控制台“模型通道”按链路分组展示。
+- `GET /v1/models` 与 `GET /v1beta/models` 当前仅列出 `pg-*` 模型，`upstream_channel`/`upstreamChannel` 字段为 `playground`。Build 模型的列表注册已在代码中注释停用，控制台“模型通道”仅展示 Playground。
 - Playground 页面加载时读取原生模型目录，可生成内容的模型加入 Playground 列表（不影响 Build 列表），token 上限覆盖配置值，并保存到 `data/playground-models.json`，重启后立即恢复。旧版 `data/model-routes.json` 中保存的目录会在首次启动时读取一次，其中的通道学习记录不再使用。
 - 转写（transcribe）、Lyria 音乐、Omni、Deep Research 和 Antigravity 等模型在 Playground 中不是聊天输入页面，适配层无法驱动，实测会在 95–190 秒后超时并占住该账号的 Playground 页面。这些模型不列入 `pg-` 列表，请求在本地返回 400，请改用对应的 `build-` 模型。语音合成（TTS）模型走专用的语音页面，见下文“语音合成（TTS）”。
 - `pg-` 模型只支持内容生成（OpenAI Chat Completions、Responses、Claude Messages、Gemini `generateContent`/`streamGenerateContent`，TTS 模型另支持 OpenAI `/v1/audio/speech`）。`countTokens`、嵌入、文件上传、模型详情等请求在本地返回 400，不会改发到 Build。
-- 抗截断：`pg-gemini-3.7-flash-抗截断`、`pg-gemini-3.8-flash-抗截断`、`pg-gemini-4-argon-抗截断` 使用与 Build 相同的分段工具输出协议，每轮内部调用都是一次 Playground 生成；模型列表只为 Playground 目录中存在的基础模型列出别名。详见 [抗截断模型说明](anti-truncation.md#playground-链路)。
+- 抗截断：`pg-gemini-3.7-flash-抗截断`、`pg-gemini-3.8-flash-抗截断`、`pg-gemini-4-argon-抗截断` 使用与 Build 相同的单工具输出包装，一次正常请求只进行一次 Playground 生成，不自动分段或续写；模型列表只为 Playground 目录中存在的基础模型列出别名。详见 [抗截断模型说明](anti-truncation.md)。
+
+## 预设模型
+
+聊天模型新增 `-预设` 别名，默认提供 `pg-gemini-4-argon-预设` 和 `pg-gemini-3.8-flash-预设`，无需等待 Playground 页面发现模型即可从模型列表选择。后缀放在最后，例如 `pg-gemini-4-argon-high-fake-search-预设`。
+
+- 纯文本请求在客户端请求流式时使用真流式，即使全局设置或 `-fake` 后缀指定假流式；省略 `stream` 或传 `stream: false` 时返回普通 JSON。
+- 带自定义工具的请求等待本轮完整生成后再返回，生成期间不提前发送正文、思考或工具参数。`stream: true` 仍按客户端的 SSE 协议一次性发送完整结果，非流式返回 JSON。
+- 自定义工具定义、提示词、工具选择和结果回传沿用原请求，不因带有工具或历史工具结果而擅自强制或禁用调用；与 Google 搜索同时使用时保留工具组合开关。显式要求必须调用工具（`required`/指定工具，转换后为 `ANY`）却只得到普通正文时返回 502，避免把未执行的必需调用当作成功回复。
+- 工具生成以 `MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL` 或 `TOO_MANY_TOOL_CALLS` 结束时，返回包含原生原因的 502，不把半截正文作为正常回复，也不因此冷却账号。输出达到 token 上限时，Chat/Claude 分别保留 `length`/`max_tokens`，不因出现工具调用而覆盖为正常工具结束。
+- Chat 将 `PROHIBITED_CONTENT`、`BLOCKLIST`、`SPII` 等上游拦截原因映射为 `content_filter`，即使此前已有部分正文或工具调用，也不误报为普通 `stop` 或 `tool_calls`。
+- Chat 的 `max_completion_tokens` 优先于旧参数 `max_tokens`，单个字符串 `stop` 转为停止序列。文本请求的输出上限和停止序列只来自客户端或 Playground 运行设置，不继承临时网页的保存值；显式空停止序列可以清除项目默认值。
+- Chat 的 `system`/`developer` 指令支持字符串与文本分块数组，完整传入系统指令通道。显式 `thinkingConfig`/`thinking_config` 中的思考等级和预算保留，模型名的思考等级后缀仍优先。
+- 支持 OpenAI Chat Completions、Responses、Claude Messages 和 Gemini 原生生成接口。Gemini 使用 `generateContent` 返回 JSON，使用 `streamGenerateContent` 返回流式响应。
+- 思考等级、搜索等设置继续生效。与抗截断别名叠加时，预设使用基础模型。
+- 仅作用于 `pg-` 聊天模型；TTS 不提供预设别名。
+
+```json
+{
+  "model": "pg-gemini-4-argon-预设",
+  "stream": false,
+  "messages": [{ "role": "user", "content": "你好" }]
+}
+```
+
+以上请求返回普通 JSON；设置 `stream: true` 可获得真流式响应。
 
 ## 账号与并发
 
 两条链路共用同一个账号池，但互不改动对方的账号状态：
 
 - 同一账号可以同时处理 Build 和 Playground 请求：Build 使用 Build App 页面，可并发；Playground 使用该账号的专用临时页面，同一账号内串行，不同账号之间并发。默认 `MAX_CONTEXTS=1` 时池中只有一个账号，两条链路的请求都会落在这个账号上。
+- 两条链路分别轮询各自负载较低的就绪账号，重复登录文件按同一账号合并计算负载，优先避开正在排空的浏览器上下文；一个账号正在切换时，其他就绪账号仍可处理请求。
+- 并发请求已经发往上游时，多个请求可能先后收到 429；冷却生效后不再向该账号分发新请求。Playground 排队请求在真正开始前再次检查模型冷却，避免排队期间发生的 429 被忽略。
 - 分发时两条链路各自按负载选择账号：Build 只统计 Build 的在途请求，Playground 只统计 Playground 的在途请求，在 Playground 排队的请求不会让 Build 避开该账号。
-- `pg-` 请求不计入 `SWITCH_ON_USES` 轮换次数和 `FAILURE_THRESHOLD` 失败次数。Playground 的 429/503 不会冷却账号，也不会切换当前账号或重排账号池；这类错误只会让该请求改用尚未尝试的其他就绪账号，没有可用账号时直接返回错误。Playground 取消请求时也不会向 Build 页面发送指令。
+- `pg-` 请求不计入 `SWITCH_ON_USES` 轮换次数和 `FAILURE_THRESHOLD` 失败次数。Playground 与 Build 共用临时账号冷却状态：冷却账号会同时退出当前账号选择和所有模型的并发分发，手动切号也不能绕过冷却。先改用尚未尝试的其他就绪账号；没有可用的就绪账号时，自动启动未尝试且未冷却的备用账号。冷启动沿用共享浏览器账号池的容量与在途请求保护，并保留 Build 的使用和失败计数。发送前和 Playground 内部排队结束时再次检查冷却，避免并发请求使用刚进入冷却的账号。Playground 取消请求时也不会向 Build 页面发送指令。
 - 两条链路的 400（如输入 token 超限、参数错误）和 413 与账号无关：不重试、不计入失败次数、不触发换号，直接返回给客户端；`API_KEY_INVALID` 等与账号相关的 400 仍按原流程处理。
-- Build 的 429 若带 `limit: 0`，表示该账号对这个模型没有额度（未开通），并非限流：只换其他未尝试的账号重试，不冷却账号、不计失败、不切换或重排账号池，避免一个无权限模型的请求让所有模型都无法使用。普通 429 仍冷却账号 1 分钟。
-- Build 账号的限流冷却只针对 Build 额度，不影响 Playground 选用该账号。
+- Build 的 429 若带 `limit: 0`，表示该账号对这个模型没有额度（未开通），并非限流：先换其他未尝试的就绪账号重试，必要时启动备用账号；不冷却账号、不计失败，避免一个无权限模型的请求让所有模型都无法使用。普通 429 仍冷却账号 1 分钟。
+- Build 与 Playground 的临时冷却都按 Google 账号共享（含同邮箱的重复认证文件），到期自动恢复选用资格，不标记认证过期。
 - Build 自身的轮换、冷却和换号仍按原规则进行。如果 Build 关闭了某个账号的上下文，该账号上正在进行的 Playground 请求会随之失败。
 
-Playground 的鉴权失败对该账号和模型冷却 5 分钟，连续被拒时每次翻倍（10、20、40 分钟……最长 6 小时），成功一次即清零；限流、网络和服务错误冷却 1 分钟（仅保存在内存中）。分发 `pg-` 请求时优先跳过对该模型正在冷却的账号，只有全部账号都在冷却时才返回冷却错误。首次明确鉴权失败且尚未输出时，以及冷却期间，快速返回可触发现有账号切换机制的 503，不重复等待同一个失败通道；成功后清除冷却。内容过滤和参数错误不进入此冷却；格式错误的请求（如缺少 `parts`）在本地返回不可重试的 400。请求在同账号队列中等待超时时，账号并无故障且尚未发送，返回可换号的 503，不进入冷却；界面提交阶段超时同样尚未推理，允许换号重试。
+Playground 的 401、403、429 和临时服务错误默认冷却 60 秒，使用 `RATE_LIMIT_COOLDOWN_MS` 配置。通用 403 只说明本次上游请求未获授权，不据此判断账号没有会员，也不再递增到数小时冷却。保留原始 403 并尝试其他账号；明确的网页权限验证弹窗也保留 403。已经向客户端发送内容的流不会重放，账号仍会退出后续分发。内容过滤、参数错误和同账号排队超时不会触发账号冷却。
+
+管理界面的账号列表每秒更新冷却倒计时，显示原始 HTTP 状态码；悬停可查看触发通道和模型。冷却账号不显示“当前”或“可分发”，切号按钮禁用；倒计时依据服务端截止时间校正，页面关闭时停止计时器。请求统计的“尝试路径”保留各账号的原始失败状态，即使后续重试成功也可查看。
 
 设置 `PLAYGROUND_ENABLED=false` 并重启可关闭 Playground 链路：`pg-*` 模型不再列出，请求返回 400；Build 链路不受影响。
 
@@ -61,6 +90,8 @@ Playground 适配层支持文本、多轮对话、系统指令、函数调用和
 适配层在临时页面中提交与原始内容具有相同签名材料的文本，拦截原生生成请求取得当次请求的签名及权益请求头；这次界面提交不进入推理服务。随后使用完整结构化请求在同一页面发起真实生成。原生签名材料不一致时明确报错，不发送内容被改变的请求。流式读取直接等待浏览器 reader 的下一块数据，不再定时轮询或维护浏览器生产队列；真流式转发只跟踪完成状态，不额外累计整份回复。
 
 鉴权请求头仅驻留内存，不写入路由文件或日志。取消或超时会停止专用页面的请求；响应被截断时返回错误，不伪装成正常完成。
+
+Playground 调用记录的 `generation` 字段及 INFO 日志保存请求的输出上限、停止序列数量、工具名称与定义摘要，以及上游原生结束原因、工具调用数量和 token 用量。提示词、系统指令和工具定义仅保存 SHA-256 摘要，不保存正文或参数。可据此区分输出上限、工具生成异常与传输中断；`STOP` 只代表模型正常结束，不保证内容满足用户预期。
 
 ## 语音合成（TTS）
 

@@ -377,7 +377,8 @@ class WireCodec {
                 mediaResolution
             ];
         const tools = [];
-        const fc = pick(pick(body, "toolConfig"), "functionCallingConfig") || {};
+        const toolConfig = pick(body, "toolConfig") || {};
+        const fc = pick(toolConfig, "functionCallingConfig") || {};
         for (const [toolIndex, tool] of (body.tools || []).entries()) {
             const functions = pick(tool, "functionDeclarations");
             if (functions && fc.mode !== "NONE") {
@@ -450,6 +451,8 @@ class WireCodec {
         out[10] = 1;
         out[11] = pick(body, "cachedContent") || null;
         out[13] = [[null, null, "UTC"]];
+        // MakerSuite ToolConfig field 3 is required when built-in tools and functions are combined.
+        if (pick(toolConfig, "includeServerSideToolInvocations") === true) out[13][2] = true;
         return out;
     }
     /**

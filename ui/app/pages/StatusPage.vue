@@ -642,11 +642,7 @@
                     <div class="status-card">
                         <h3 class="card-title">{{ t("modelChannels") }}</h3>
                         <p>{{ t("modelChannelsHelp") }}</p>
-                        <details
-                            v-for="channel in ['build', 'playground']"
-                            :key="channel"
-                            :open="channel === 'playground'"
-                        >
+                        <details v-for="channel in ['playground']" :key="channel" :open="channel === 'playground'">
                             <summary>
                                 {{ channel === "build" ? "Build" : "Playground" }} ({{
                                     state.modelChannels[channel].length
@@ -854,7 +850,15 @@
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
                                         </span>
-                                        <span v-if="item.isReady" class="ready-badge">
+                                        <span
+                                            v-if="isAccountCoolingDown(item)"
+                                            class="cooldown-badge"
+                                            :title="accountCooldownTitle(item)"
+                                        >
+                                            {{ t("tagCoolingDown") }} {{ formatAccountCooldown(item) }} · HTTP
+                                            {{ item.cooldown.status }}
+                                        </span>
+                                        <span v-else-if="item.isReady" class="ready-badge">
                                             {{ t("tagDispatchReady") }}
                                         </span>
                                         <span v-if="item.inFlightRequests > 0" class="inflight-badge">
@@ -869,13 +873,19 @@
                                             'is-active': item.index === state.currentAuthIndex,
                                             'is-fast': item.hasContext && item.index !== state.currentAuthIndex,
                                         }"
-                                        :disabled="isBusy || item.index === state.currentAuthIndex"
+                                        :disabled="
+                                            isBusy ||
+                                            item.index === state.currentAuthIndex ||
+                                            isAccountCoolingDown(item)
+                                        "
                                         :title="
-                                            item.index === state.currentAuthIndex
-                                                ? t('currentAccount')
-                                                : item.hasContext
-                                                  ? t('fastSwitch')
-                                                  : t('btnSwitchAccount')
+                                            isAccountCoolingDown(item)
+                                                ? accountCooldownTitle(item)
+                                                : item.index === state.currentAuthIndex
+                                                  ? t('currentAccount')
+                                                  : item.hasContext
+                                                    ? t('fastSwitch')
+                                                    : t('btnSwitchAccount')
                                         "
                                         @click.stop="switchAccountByIndex(item.index)"
                                     >
@@ -3030,6 +3040,25 @@ const activeTab = ref("home");
 const isDownloadingUsageStats = ref(false);
 const isImportingUsageStats = ref(false);
 const isUsageStatsTransferBusy = computed(() => isDownloadingUsageStats.value || isImportingUsageStats.value);
+const cooldownNow = ref(Date.now());
+let cooldownClockOffset = 0;
+let cooldownTimer = null;
+
+const isAccountCoolingDown = account => (account?.cooldown?.until || 0) > cooldownNow.value;
+const formatAccountCooldown = account => {
+    const seconds = Math.max(0, Math.ceil(((account?.cooldown?.until || 0) - cooldownNow.value) / 1000));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const rest = String(seconds % 60).padStart(2, "0");
+    return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+};
+const accountCooldownTitle = account =>
+    t("accountCooldownDetail", {
+        channel: account.cooldown?.channel === "playground" ? "Playground" : "Build",
+        model: account.cooldown?.model || "—",
+        status: account.cooldown?.status || "—",
+        time: formatAccountCooldown(account),
+    });
 
 // Create reactive version counter
 const langVersion = ref(0);
@@ -3739,6 +3768,15 @@ const showAttemptsDetail = record => {
                     String(index + 1)
                 ),
                 h("span", { style: "color: #606266;" }, `#${authIndex} ${accountName}`),
+                ...(item.upstreamStatus
+                    ? [
+                          h(
+                              "span",
+                              { style: "color: #f56c6c;", title: item.errorMessage || "" },
+                              `HTTP ${item.upstreamStatus}`
+                          ),
+                      ]
+                    : []),
             ]
         );
     });
@@ -4672,12 +4710,16 @@ const handleStreamingModeBeforeChange = async () => {
 
 // Switch account by index
 const switchAccountByIndex = targetIndex => {
+    const targetAccount = state.accountDetails.find(acc => acc.index === targetIndex);
+    if (isAccountCoolingDown(targetAccount)) {
+        ElMessage.warning(accountCooldownTitle(targetAccount));
+        return;
+    }
     if (state.currentAuthIndex === targetIndex) {
         ElMessage.warning(t("alreadyCurrentAccount"));
         return;
     }
 
-    const targetAccount = state.accountDetails.find(acc => acc.index === targetIndex);
     const accountSuffix = targetAccount ? ` (${getAccountDisplayName(targetAccount)})` : "";
 
     ElMessageBox.confirm(`${t("confirmSwitch")} #${targetIndex}${accountSuffix}?`, {
@@ -4754,6 +4796,8 @@ const updateStatus = data => {
     state.forceUrlContextEnabled = isEnabled(data.status.forceUrlContext);
     state.debugModeEnabled = isEnabled(data.status.debugMode);
     state.currentAuthIndex = data.status.currentAuthIndex;
+    cooldownClockOffset = Number.isFinite(data.serverTime) ? data.serverTime - Date.now() : 0;
+    cooldownNow.value = Date.now() + cooldownClockOffset;
     state.accountDetails = data.status.accountDetails || [];
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.maxContexts = data.status.maxContexts ?? 1;
@@ -5295,6 +5339,9 @@ const checkForUpdates = async () => {
 // Theme handling is now managed by useTheme composable
 
 onMounted(() => {
+    cooldownTimer = setInterval(() => {
+        cooldownNow.value = Date.now() + cooldownClockOffset;
+    }, 1000);
     // Listen for language changes
     I18n.onChange(() => {
         langVersion.value++;
@@ -5318,6 +5365,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+    clearInterval(cooldownTimer);
     isActive = false;
     if (updateTimer) {
         clearTimeout(updateTimer);
@@ -5804,6 +5852,7 @@ watchEffect(() => {
     gap: 5px;
     flex: 1;
     min-width: 0;
+    flex-wrap: wrap;
 }
 
 .account-index {
@@ -5850,6 +5899,17 @@ watchEffect(() => {
     flex-shrink: 0;
     margin-left: 0;
     margin-right: 6px;
+}
+
+.cooldown-badge {
+    display: inline-flex;
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: rgba(230, 162, 60, 0.12);
+    color: @warning-color;
+    font-family: @font-family-mono;
+    font-size: 0.75rem;
 }
 
 .ready-badge {

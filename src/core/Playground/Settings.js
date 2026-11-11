@@ -118,7 +118,7 @@ class PlaygroundSettings {
         if (s.mediaResolution && pick(gc, "mediaResolution") == null) gc.mediaResolution = s.mediaResolution;
         if (antiTruncation) return request;
         if (s.maxOutputTokens && pick(gc, "maxOutputTokens") == null) gc.maxOutputTokens = s.maxOutputTokens;
-        if (s.stopSequences.length && !pick(gc, "stopSequences")?.length) gc.stopSequences = [...s.stopSequences];
+        if (s.stopSequences.length && pick(gc, "stopSequences") == null) gc.stopSequences = [...s.stopSequences];
         if (s.systemInstruction.trim()) {
             const key =
                 request.systemInstruction || !request.system_instruction ? "systemInstruction" : "system_instruction";

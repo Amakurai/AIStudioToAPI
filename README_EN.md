@@ -4,6 +4,8 @@
 
 A tool that wraps the Google AI Studio Build App web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests into browser interactions with the AI Studio Build App interface.
 
+The model list and web console currently show only Playground (`pg-*`) models. Build model registration is commented out in the code.
+
 ## ✨ Features
 
 - 🔄 **API Compatibility**: Compatible with OpenAI API, Gemini API, and Anthropic API formats
@@ -263,7 +265,7 @@ Usage:
 | `SWITCH_ON_USES`                | Number of requests before automatically switching accounts (`0` to disable).                                                                                                                                                                                          | `40`         |
 | `FAILURE_THRESHOLD`             | Number of consecutive failures before switching accounts (`0` to disable).                                                                                                                                                                                            | `3`          |
 | `IMMEDIATE_SWITCH_STATUS_CODES` | HTTP status codes that trigger immediate account switching (comma-separated, set to empty to disable).                                                                                                                                                                | `429,503`    |
-| `RATE_LIMIT_COOLDOWN_MS` | Delay in milliseconds before a replaced, rate-limited account becomes eligible again (positive values only). Requests retry immediately on an available account. | `60000` |
+| `RATE_LIMIT_COOLDOWN_MS`        | Delay in milliseconds before a Build account that returned a retryable 429 or 503 becomes eligible again (positive values only). Requests retry immediately on an available account.                                                                                  | `60000`      |
 | `MAX_CONTEXTS`                  | Maximum number of accounts that can be logged in simultaneously. Accounts logged in simultaneously can switch faster without re-login. Higher values consume more memory (approx: 1 account ~700MB, 2 accounts ~950MB, 3 accounts ~1100MB). Set to `0` for unlimited. | `1`          |
 | `AI_STUDIO_APP_URL`             | AI Studio app URL to open (optional), in the format `https://ai.studio/apps/<app-id>`. Leave empty to use the built-in app. [Guide](docs/en/create-ai-studio-app.md)                                                                                                  | Built-in app |
 | `HTTP_PROXY`                    | HTTP proxy address for accessing Google services.                                                                                                                                                                                                                     | None         |

@@ -15,19 +15,28 @@ class PlaygroundSession {
         this.pending = Promise.resolve();
     }
 
-    async request(model, body, { signal, onData, timeoutMs, onStage = () => {} }) {
+    async request(model, body, { signal, onData, timeoutMs, onStage = () => {}, beforeStart, onFailure }) {
         // Each account has one temporary UI used to obtain fresh native request credentials.
         // Separate account contexts remain independent and can run concurrently.
         if (signal.aborted) throw cancelled();
         onStage("queued");
-        const run = this.pending.then(() => {
+        const run = this.pending.then(async () => {
             if (signal.aborted) throw cancelled();
-            return this._request(model, body, { onData, onStage, signal, timeoutMs }).catch(error => {
-                // Only retry preparation; never repeat an inference which may have produced output.
-                if (error.resetFailed && !signal.aborted)
-                    return this._request(model, body, { onData, onStage, signal, timeoutMs });
+            try {
+                beforeStart?.();
+                try {
+                    return await this._request(model, body, { onData, onStage, signal, timeoutMs });
+                } catch (error) {
+                    if (error.resetFailed && !signal.aborted) {
+                        beforeStart?.();
+                        return await this._request(model, body, { onData, onStage, signal, timeoutMs });
+                    }
+                    throw error;
+                }
+            } catch (error) {
+                onFailure?.(error);
                 throw error;
-            });
+            }
         });
         // Keep the account lock until the active operation has actually stopped, even if
         // its caller has cancelled. A cancelled waiter must never open a page later.
@@ -51,6 +60,14 @@ class PlaygroundSession {
         if (!this.page || this.page.isClosed()) {
             this.page = await this.context.newPage();
             this.pageModel = null;
+            // The Glue cookie notice can appear after page load or reappear on a reused page.
+            // Handle it during actionability checks so it cannot block Run or speech controls.
+            // Hide only this informational overlay; do not depend on localized button text
+            // or change the account's cookie consent settings.
+            await this.page.addLocatorHandler(
+                this.page.locator(".glue-cookie-notification-bar:visible").first(),
+                notice => notice.evaluate(element => element.style.setProperty("display", "none", "important"))
+            );
             this.page.on("response", async response => {
                 if (response.url() === `${RPC_ORIGIN}${RPC_PATH.replace("GenerateContent", "ListModels")}`) {
                     try {
@@ -137,12 +154,10 @@ class PlaygroundSession {
                     { status: 401 }
                 );
             }
-            const cookieNotice = page.getByRole("button", { exact: true, name: "OK, got it" });
             const input = speech
-                ? await this._speechInput(page, cookieNotice, Math.min(timeoutMs, 30000))
+                ? await this._speechInput(page, Math.min(timeoutMs, 30000))
                 : page.getByRole("textbox", { exact: true, name: "Enter a prompt" });
             await input.waitFor({ timeout: Math.min(timeoutMs, 30000) });
-            if (await cookieNotice.isVisible()) await cookieNotice.click();
             const envelope = new Promise((resolve, reject) => {
                 this.capture = { reject, resolve };
                 // UI submission has its own short deadline; model generation keeps
@@ -168,7 +183,7 @@ class PlaygroundSession {
             onStage("submit_prompt");
             await input.fill(hashText || " ");
             await page.getByRole("button", { name: /^Run(?:\s|$)/ }).click({ timeout: Math.min(timeoutMs, 30000) });
-            const template = await envelope;
+            const template = await this._awaitEnvelope(page, envelope);
             clearTimeout(preparationTimer);
             onStage("request_dispatched");
             if (signal.aborted) throw cancelled();
@@ -183,6 +198,12 @@ class PlaygroundSession {
             const payload = template.body;
             for (const index of [0, 1, 2, 5, 6, 11, 13]) payload[index] = wire[index] ?? null;
             const generation = payload[3] || [];
+            // Text API limits come from the request/run settings, never from a reused UI's
+            // saved settings. An omitted limit must leave the upstream model default intact.
+            if (!speech) {
+                generation[1] = null;
+                generation[3] = null;
+            }
             // Discard UI tools/format while preserving protocol-only defaults from the native envelope.
             generation[7] = null;
             generation[8] = null;
@@ -277,15 +298,55 @@ class PlaygroundSession {
         }
     }
 
+    async _awaitEnvelope(page, envelope) {
+        // Some models open an upgrade dialog instead of sending GenerateContent when this
+        // account has no entitlement. Limit detection to that dialog, not prompt text.
+        const upgrade = page
+            .locator("ms-upgrade-options-dialog")
+            .getByText(/needs a Google AI plan or a Gemini API key/i)
+            .first();
+        let stopped = false;
+        let timer;
+        const denied = new Promise((_, reject) => {
+            const check = async () => {
+                let visible = false;
+                try {
+                    visible = await upgrade.isVisible();
+                } catch {
+                    // The page may be closing; the envelope/abort path reports that failure.
+                }
+                if (stopped) return;
+                if (visible) {
+                    reject(
+                        Object.assign(
+                            new Error(
+                                "Playground page requested account access verification (Google AI plan or Gemini API key dialog)."
+                            ),
+                            { status: 403 }
+                        )
+                    );
+                } else {
+                    timer = setTimeout(check, 250);
+                }
+            };
+            void check();
+        });
+        try {
+            return await Promise.race([envelope, denied]);
+        } finally {
+            stopped = true;
+            clearTimeout(timer);
+        }
+    }
+
     /**
      * Opens a text dialog on the generate-speech page. 2.5/3.1 TTS pages offer a plain "Text" view
      * (one textarea); 3.8 pages have a single speech block. Both send the textarea text unchanged,
      * except that 2.5/3.1 prefix it with `## Transcript:` (see WireCodec.alignTranscript).
      */
-    async _speechInput(page, cookieNotice, timeout) {
+    async _speechInput(page, timeout) {
         const create = page.getByRole("button", { exact: true, name: "Create new dialog" });
         await create.waitFor({ timeout });
-        if (await cookieNotice.isVisible()) await cookieNotice.click();
         await create.click({ timeout });
         const textView = page.getByRole("radio", { exact: true, name: "Text" });
         const block = page.getByRole("textbox", { exact: true, name: "Speech block text" });

@@ -2,43 +2,25 @@
 (function (root) {
     class Decoder {
         constructor() {
-            this.segments = [];
-            this.finished = false;
+            this.received = false;
             this.terminal = false;
             this.failed = false;
         }
         call(call) {
             const args = JSON.parse(call.function?.arguments || "{}");
-            if (call.function?.name === "append_output") {
-                if (this.finished || !Number.isSafeInteger(args.seq) || args.seq < 1 || typeof args.text !== "string")
-                    throw new Error("Invalid duplex output sequence.");
-                if (args.seq <= this.segments.length) {
-                    if (this.segments[args.seq - 1] !== args.text)
-                        throw new Error("Conflicting duplex output segment.");
-                    return "";
-                }
-                if (args.seq !== this.segments.length + 1) throw new Error("Missing duplex output segment.");
-                this.segments.push(args.text);
-                return args.text;
-            }
-            if (
-                call.function?.name === "finish_output" &&
-                Number.isSafeInteger(args.last_seq) &&
-                args.last_seq === this.segments.length
-            ) {
-                this.finished = true;
-                return "";
-            }
-            throw new Error("Unexpected duplex transport tool.");
+            if (this.received || call.function?.name !== "output_content" || typeof args.content !== "string")
+                throw new Error("Invalid output_content response.");
+            this.received = true;
+            return args.content;
         }
         reason(reason) {
             if (!reason) return reason;
             this.terminal = true;
             if (reason === "tool_calls" || reason === "stop") {
-                if (!this.finished) throw new Error("Duplex response ended without a completion acknowledgement.");
+                if (!this.received) throw new Error("Tool output ended without content.");
                 return "stop";
             }
-            return reason; // Keep length and content_filter visible to the client.
+            return reason;
         }
         event(value) {
             if (value.error) {
@@ -81,7 +63,7 @@
             return new Response(JSON.stringify(value), { headers, status: response.status });
         }
         if (!type.includes("text/event-stream") || !response.body)
-            throw new Error("Unsupported duplex response format.");
+            throw new Error("Unsupported tool output response format.");
         const decoder = new TextDecoder();
         const encoder = new TextEncoder();
         let buffer = "",
@@ -96,9 +78,10 @@
                 controller.enqueue(encoder.encode(raw + "\n\n"));
                 return;
             }
-            if (done) throw new Error("Unexpected data after duplex stream end.");
+            if (done) throw new Error("Unexpected data after tool output stream end.");
             if (data.trim() === "[DONE]") {
-                if (!state.terminal && !state.failed) throw new Error("Duplex stream closed before its final status.");
+                if (!state.terminal && !state.failed)
+                    throw new Error("Tool output stream closed before its final status.");
                 done = true;
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 return;
@@ -112,7 +95,7 @@
                 buffer = buffer.slice(match.index + match[0].length);
                 event(raw, controller);
             }
-            if (buffer.length > 1024 * 1024) throw new Error("Duplex event exceeds the client buffer limit.");
+            if (buffer.length > 1024 * 1024) throw new Error("Tool output event exceeds the client buffer limit.");
         };
         const body = response.body.pipeThrough(
             new TransformStream({
@@ -120,7 +103,7 @@
                     buffer += decoder.decode();
                     consume(controller);
                     if (buffer.trim()) event(buffer, controller);
-                    if (!done) throw new Error("Duplex stream disconnected before [DONE].");
+                    if (!done) throw new Error("Tool output stream disconnected before [DONE].");
                 },
                 transform(chunk, controller) {
                     buffer += decoder.decode(chunk, { stream: true });
@@ -142,14 +125,16 @@
             } catch {
                 return nativeFetch(request);
             }
-            if (!/^(?:gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/.test(payload.model || ""))
+            if (!/^(?:build-|pg-)?(?:gemini-3\.[78]-flash|gemini-4-argon)-抗截断$/.test(payload.model || ""))
                 return nativeFetch(request);
             const headers = new Headers(request.headers);
             headers.set("X-Anti-Truncation-Output", "tools");
             const response = await nativeFetch(new Request(request, { headers }));
             if (response.ok && response.headers.get("x-anti-truncation-output") !== "tools") {
                 await response.body?.cancel();
-                throw new Error("Server did not enable duplex tools mode; check deployment and header forwarding.");
+                throw new Error(
+                    "Server did not enable tool output tools mode; check deployment and header forwarding."
+                );
             }
             return decodeResponse(response);
         };

@@ -1,6 +1,8 @@
 {
     "aborted": "已中止",
     "account": "账号",
+    "accountCooldownDetail": "{channel} · {model} · 上游 HTTP {status} · 剩余 {time}，期间暂停选用此账号",
+    "accountCoolingDown": "账号正在临时冷却，剩余 {seconds} 秒，暂时不能切换",
     "accountDedupConfirm": "将按同一邮箱保留最大 index 的 auth 文件并删除其余重复文件（前提：同一账号的多个 auth 按 index 递增生成，index 越大越新）。是否继续？",
     "accountDedupFailed": "去重清理失败：{error}",
     "accountDedupNoop": "未发现需要清理的重复 auth。",
@@ -272,6 +274,7 @@
     "switchLanguage": "切换语言",
     "systemBusySwitchingOrRecoveringAccounts": "系统正在切换或恢复账号，请稍后重试。",
     "systemSettings": "系统",
+    "tagCoolingDown": "冷却中",
     "tagCurrent": "当前",
     "tagDispatchReady": "可分发",
     "tagExpired": "过期",

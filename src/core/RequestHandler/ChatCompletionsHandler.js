@@ -88,6 +88,7 @@ class ChatCompletionsHandler extends RetryHandler {
                     let currentQueue = messageQueue;
                     let currentQueueAuthIndex = dispatchAuthIndex;
                     let initialMessage;
+                    let streamQueue;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
@@ -100,6 +101,12 @@ class ChatCompletionsHandler extends RetryHandler {
                         );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
+                        ({ message: initialMessage, queue: streamQueue } = await this._readRealStreamStart(
+                            proxyRequest,
+                            currentQueue,
+                            initialMessage,
+                            currentQueueAuthIndex
+                        ));
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
@@ -160,7 +167,7 @@ class ChatCompletionsHandler extends RetryHandler {
                         "Content-Type": "text/event-stream",
                     });
                     this.logger.info(`[Request] OpenAI streaming response (Real Mode) started...`);
-                    await this._streamOpenAIResponse(currentQueue, res, model, requestId);
+                    await this._streamOpenAIResponse(streamQueue, res, model, requestId);
                 } else {
                     // OpenAI Fake Stream / Non-Stream mode. Nothing is sent until generation has
                     // finished, so failures and empty replies keep a plain HTTP error status.

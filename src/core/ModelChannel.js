@@ -4,6 +4,23 @@
  */
 class ModelChannel {
     static PREFIXES = { build: "build-", playground: "pg-" };
+    static PRESET_SUFFIX = "-预设";
+
+    /** The Playground model selected by a preset alias, or null for ordinary model IDs. */
+    static playgroundPreset(name) {
+        let value = String(name ?? "");
+        try {
+            value = decodeURIComponent(value);
+        } catch {
+            // Keep malformed escapes for the normal request validation.
+        }
+        const { channel, model } = this.parse(value);
+        return channel === "playground" &&
+            model.endsWith(this.PRESET_SUFFIX) &&
+            model.length > this.PRESET_SUFFIX.length
+            ? model.slice(0, -this.PRESET_SUFFIX.length)
+            : null;
+    }
 
     /**
      * @param {string} name - Model ID, optionally with a `models/` prefix (raw or URL-encoded).

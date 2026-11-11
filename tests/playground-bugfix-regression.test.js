@@ -63,11 +63,19 @@ const waitForAbort = signal =>
     );
 
 /** A browser page double: the UI submission is signed over textarea-normalized text. */
-function fakeContext({ capture = true, firstEvaluate, chunks = [], template16 } = {}) {
+function fakeContext({
+    capture = true,
+    firstEvaluate,
+    chunks = [],
+    template16,
+    templateGeneration = [],
+    upgrade = false,
+} = {}) {
     const state = { headers: null, payload: null };
     let routeHandler;
     let filled = "";
     const page = {
+        async addLocatorHandler() {},
         async close() {
             this.closed = true;
         },
@@ -87,7 +95,12 @@ function fakeContext({ capture = true, firstEvaluate, chunks = [], template16 } 
             return {
                 async click() {
                     if (!(name instanceof RegExp) || !capture) return;
-                    const template = ["models/gemini-4-argon", [[[[null, filled]], "user"]], null, []];
+                    const template = [
+                        "models/gemini-4-argon",
+                        [[[[null, filled]], "user"]],
+                        null,
+                        [...templateGeneration],
+                    ];
                     template[3][4] = 1;
                     template[3][16] = template16;
                     await routeHandler({
@@ -115,6 +128,11 @@ function fakeContext({ capture = true, firstEvaluate, chunks = [], template16 } 
         isClosed() {
             return this.closed;
         },
+        locator(selector) {
+            if (selector === "ms-upgrade-options-dialog")
+                return { getByText: () => ({ first: () => ({ isVisible: async () => upgrade }) }) };
+            return { first: () => ({}) };
+        },
         on() {},
         async route(_pattern, handlerFn) {
             routeHandler = handlerFn;
@@ -134,6 +152,26 @@ const runSession = (context, request, timeoutMs = 1000) => {
     return { promise, received };
 };
 
+test("text requests discard hidden UI output limits and stops while keeping explicit request settings", async () => {
+    const templateGeneration = [];
+    templateGeneration[1] = ["UI_STOP"];
+    templateGeneration[3] = 2048;
+    for (const generationConfig of [
+        undefined,
+        { maxOutputTokens: 8192, stopSequences: [] },
+        { stop_sequences: ["END"] },
+    ]) {
+        const { context, state } = fakeContext({ chunks: [`[[${chunk("ok", 1)}]]`], templateGeneration });
+        await runSession(context, { ...body(), generationConfig }).promise;
+        assert.equal(state.payload[3][3], generationConfig?.maxOutputTokens ?? null);
+        assert.deepEqual(
+            state.payload[3][1],
+            generationConfig?.stopSequences ?? generationConfig?.stop_sequences ?? null
+        );
+        assert.equal(state.payload[3][4], 1);
+    }
+});
+
 test("#1 a request timing out while queued behind the account's active request does not cool the account down", async t => {
     const h = harness(t, { fakeStream: 30 });
     const session = new PlaygroundSession(h.context, () => {});
@@ -146,6 +184,183 @@ test("#1 a request timing out while queued behind the account's active request d
     assert.notEqual(error.retryable, false, "nothing was dispatched, so another account may retry");
     assert.match(error.message, /queued/);
     assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
+});
+
+test("queued Playground requests recheck a 429 before starting inference", async t => {
+    const h = harness(t);
+    const session = new PlaygroundSession(h.context, () => {});
+    let release;
+    let started;
+    const running = new Promise(resolve => {
+        started = resolve;
+    });
+    let calls = 0;
+    session._request = async (_model, _body, { onData, onStage }) => {
+        calls++;
+        onStage("request_dispatched");
+        if (calls === 1) {
+            started();
+            await new Promise(resolve => {
+                release = resolve;
+            });
+            throw Object.assign(new Error("rate limited"), { status: 429 });
+        }
+        onData(`[[${chunk("unexpected", 1)}]]`);
+    };
+    h.router.sessions.set(h.context, session);
+    const secondQueue = h.registry.createMessageQueue("second", 1, "attempt2");
+    const secondSpec = { ...h.spec, request_attempt_id: "attempt2", request_id: "second" };
+    h.router.forward(h.spec, 1);
+    await running;
+    h.router.forward(secondSpec, 1);
+    release();
+    const [first, second] = await Promise.all([drain(h.queue), drain(secondQueue)]);
+    assert.equal(first.at(-1).status, 429);
+    assert.equal(second.at(-1).status, 429);
+    assert.equal(calls, 1);
+    assert.ok(h.router.isCoolingDown("gemini-4-argon", 1));
+});
+
+test("a queued Playground request for another model is not blocked by a 429", async t => {
+    const h = harness(t);
+    const session = new PlaygroundSession(h.context, () => {});
+    let release;
+    let started;
+    const running = new Promise(resolve => {
+        started = resolve;
+    });
+    let calls = 0;
+    session._request = async (_model, _body, { onData }) => {
+        calls++;
+        if (calls === 1) {
+            started();
+            await new Promise(resolve => {
+                release = resolve;
+            });
+            throw Object.assign(new Error("rate limited"), { status: 429 });
+        }
+        onData(`[[${chunk("other model", 1)}]]`);
+    };
+    h.router.sessions.set(h.context, session);
+    const secondQueue = h.registry.createMessageQueue("other-model", 1, "attempt2");
+    const secondSpec = {
+        ...h.spec,
+        path: "/v1beta/models/gemini-3.8-flash:generateContent",
+        request_attempt_id: "attempt2",
+        request_id: "other-model",
+    };
+    h.router.forward(h.spec, 1);
+    await running;
+    h.router.forward(secondSpec, 1);
+    release();
+    const [first, second] = await Promise.all([drain(h.queue), drain(secondQueue)]);
+    assert.equal(first.at(-1).status, 429);
+    assert.equal(second.at(-1).type, "STREAM_END");
+    assert.equal(calls, 2);
+    assert.equal(h.router.isCoolingDown("gemini-3.8-flash", 1), false);
+});
+
+test("an older concurrent Playground success cannot clear a newer 429 cooldown", async t => {
+    const h = harness(t);
+    const secondContext = {};
+    h.router.handler.browserManager.contexts.set(2, { context: secondContext });
+    h.router.handler.authSource = {
+        accountNameMap: new Map([
+            [1, "same@example.com"],
+            [2, "same@example.com"],
+        ]),
+    };
+    const firstSession = new PlaygroundSession(h.context, () => {});
+    const secondSession = new PlaygroundSession(secondContext, () => {});
+    let release;
+    let started;
+    const running = new Promise(resolve => {
+        started = resolve;
+    });
+    firstSession._request = async (_model, _body, { onData }) => {
+        started();
+        await new Promise(resolve => {
+            release = resolve;
+        });
+        onData(`[[${chunk("success", 1)}]]`);
+    };
+    secondSession._request = async () => {
+        throw Object.assign(new Error("rate limited"), { status: 429 });
+    };
+    h.router.sessions.set(h.context, firstSession);
+    h.router.sessions.set(secondContext, secondSession);
+    const secondQueue = h.registry.createMessageQueue("second", 2, "attempt2");
+    h.router.forward(h.spec, 1);
+    await running;
+    h.router.forward({ ...h.spec, request_attempt_id: "attempt2", request_id: "second" }, 2);
+    assert.equal((await drain(secondQueue)).at(-1).status, 429);
+    const cooldown = h.router.cooldownUntil("gemini-4-argon", 2);
+    assert.ok(cooldown > Date.now());
+    release();
+    assert.equal((await drain(h.queue)).at(-1).type, "STREAM_END");
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), cooldown);
+});
+
+test("an older concurrent Playground error cannot replace a newer 429 cooldown with 503", async t => {
+    const h = harness(t);
+    const secondContext = {};
+    h.router.handler.browserManager.contexts.set(2, { context: secondContext });
+    h.router.handler.authSource = {
+        accountNameMap: new Map([
+            [1, "same@example.com"],
+            [2, "same@example.com"],
+        ]),
+    };
+    const firstSession = new PlaygroundSession(h.context, () => {});
+    const secondSession = new PlaygroundSession(secondContext, () => {});
+    let release;
+    let started;
+    const running = new Promise(resolve => {
+        started = resolve;
+    });
+    firstSession._request = async () => {
+        started();
+        await new Promise(resolve => {
+            release = resolve;
+        });
+        throw Object.assign(new Error("temporary failure"), { status: 503 });
+    };
+    secondSession._request = async () => {
+        throw Object.assign(new Error("rate limited"), { status: 429 });
+    };
+    h.router.sessions.set(h.context, firstSession);
+    h.router.sessions.set(secondContext, secondSession);
+    const secondQueue = h.registry.createMessageQueue("second", 2, "attempt2");
+    h.router.forward(h.spec, 1);
+    await running;
+    h.router.forward({ ...h.spec, request_attempt_id: "attempt2", request_id: "second" }, 2);
+    assert.equal((await drain(secondQueue)).at(-1).status, 429);
+    const cooldown = h.router.cooldownUntil("gemini-4-argon", 2);
+    release();
+    assert.equal((await drain(h.queue)).at(-1).status, 503);
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), cooldown);
+    assert.equal(h.router.coolingDownError("gemini-4-argon", 1).status, 429);
+});
+
+test("Playground rechecks cooldown before retrying a failed page reset", async () => {
+    const session = new PlaygroundSession({}, () => {});
+    let attempts = 0;
+    let checks = 0;
+    session._request = async () => {
+        attempts++;
+        throw Object.assign(new Error("page reset failed"), { resetFailed: true });
+    };
+    await assert.rejects(
+        session.request("gemini-4-argon", body(), {
+            beforeStart: () => {
+                checks++;
+                if (checks === 2) throw Object.assign(new Error("rate limited"), { status: 429 });
+            },
+            signal: new AbortController().signal,
+        }),
+        error => error.status === 429
+    );
+    assert.equal(attempts, 1);
 });
 
 test("#1 a timeout after dispatch still reports 504 and cools the account down", async t => {
@@ -231,6 +446,23 @@ test("#4 a UI submission timeout before inference may be retried on another acco
     });
 });
 
+test("an upgrade dialog is treated as an account/model permission denial before inference", async t => {
+    const { context, page, state } = fakeContext({ capture: false, upgrade: true });
+    const h = harness(t, { fakeStream: 5000, mode: "real" });
+    h.router.sessions.set(h.context, new PlaygroundSession(context, () => {}));
+    const startedAt = Date.now();
+    h.router.forward(h.spec, 1);
+    const error = (await drain(h.queue)).at(-1);
+    assert.equal(error.status, 403, "the public handler retries the original status");
+    assert.match(error.message, /access verification.*Google AI plan or Gemini API key/i);
+    assert.notEqual(error.retryable, false);
+    assert.ok(Date.now() - startedAt < 2000, "do not wait for the 60-second submission timeout");
+    assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
+    assert.equal(h.router.cooldownUntil("gemini-3.8-flash", 1), 0);
+    assert.equal(page.closed, true);
+    assert.equal(state.payload, null, "the request must not reach inference");
+});
+
 test("#5 public safety categories unknown to MakerSuite are left at their defaults", () => {
     const wire = encode({
         ...body(),
@@ -255,6 +487,20 @@ test("#6 CRLF content signs successfully and is sent with the signed line breaks
     assert.equal(state.payload[1][0][0][0][1], "line 1\nline 2\nline 3");
     assert.equal(state.headers.cookie, undefined);
     assert.match(received.join(""), /ok/);
+});
+
+test("mixed-tool configuration reaches the browser fetch after native envelope capture", async () => {
+    const { context, state } = fakeContext({ chunks: [`[[${chunk("ok", 1)}]]`] });
+    const request = {
+        ...body(),
+        toolConfig: { includeServerSideToolInvocations: true },
+        tools: [{ functionDeclarations: [{ name: "lookup" }] }, { googleSearch: {} }],
+    };
+    await runSession(context, request).promise;
+    assert.equal(state.payload[13][2], true);
+    assert.equal(state.payload[6][0][1][0][0], "lookup");
+    assert.ok(state.payload[6][1][3]);
+    assert.equal(state.headers.cookie, undefined);
 });
 
 test("#7 thoughts are only requested when includeThoughts is true", async () => {

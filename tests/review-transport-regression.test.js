@@ -75,8 +75,8 @@ test("detaching the last busy anti-truncation queue cannot initialize a replacem
                                 parts: [
                                     {
                                         functionCall: {
-                                            args: { done: true, seq: 1, text: "recovered" },
-                                            name: "append_output",
+                                            args: { content: "recovered" },
+                                            name: "output_content",
                                         },
                                     },
                                 ],

@@ -43,6 +43,7 @@ class RequestHandler {
         // Round-robin cursor for multi-account dispatch: rotates among equally
         // least-loaded ready accounts so a single account is not always preferred
         this._dispatchCursor = 0;
+        this._playgroundDispatchCursor = 0;
 
         // Timeout settings
         this.timeouts = {
@@ -77,7 +78,9 @@ class RequestHandler {
         const publish = (channel, models) =>
             models.map(model => ({ ...model, name: `models/${ModelChannel.publicName(channel, model.name)}` }));
         return {
-            build: publish("build", this.config.modelList || []),
+            // Build models are no longer advertised. Keep the empty channel for existing clients.
+            // build: publish("build", this.config.modelList || []),
+            build: [],
             playground: publish("playground", this.playground.models()),
         };
     }
@@ -88,10 +91,12 @@ class RequestHandler {
      * @returns {string|null} Reason for rejecting the request, or null when it may proceed.
      */
     _unsupportedPlaygroundRequest(req) {
-        const { channel, method, model } = this._requestModel(req);
+        const { channel, method, model, preset } = this._requestModel(req);
         if (channel !== "playground") return null;
         if (!this.playground.enabled) return "The Playground channel is disabled (PLAYGROUND_ENABLED=false).";
         const upstream = AntiTruncation.baseModel(model) || FormatConverter.stripModelSuffixes(model);
+        if (preset && PlaygroundCatalog.isSpeech(upstream))
+            return "Playground preset aliases require a chat model; use the original model for text-to-speech.";
         const unsupported = PlaygroundCatalog.unsupportedReason(upstream);
         if (unsupported) return unsupported;
         if (req.path === "/v1/audio/speech" && !PlaygroundCatalog.isSpeech(upstream))
@@ -113,13 +118,20 @@ class RequestHandler {
             // Keep the raw name.
         }
         const { channel, model } = ModelChannel.parse(typeof named === "string" ? named : "");
-        return { channel, method: pathMatch ? (pathMatch[2] ?? null) : undefined, model };
+        const preset = ModelChannel.playgroundPreset(named);
+        return {
+            channel,
+            method: pathMatch ? (pathMatch[2] ?? null) : undefined,
+            model: preset === null ? model : ModelChannel.parse(FormatConverter.stripModelSuffixes(named)).model,
+            preset: preset !== null,
+        };
     }
 
-    /** Handler for a public request: `pg-` requests get a scope that leaves Build's account state alone. */
+    /** Playground shares cooldowns and browser capacity while keeping Build's usage/failure counters separate. */
     forRequest(req) {
-        const { channel, model } = this._requestModel(req);
+        const { channel, model, preset } = this._requestModel(req);
         if (channel !== "playground") return this;
+        if (preset) req.playgroundPreset = true;
         // Cooldowns are kept per upstream model, so an anti-truncation alias uses its base model.
         return playgroundRequestScope(
             this,
@@ -137,6 +149,20 @@ class RequestHandler {
         }
 
         return this.authSource?.accountNameMap?.get(authIndex) || null;
+    }
+
+    _accountCooldownError(authIndex) {
+        const cooldown = this.authSource?.getAccountCooldown?.(authIndex);
+        if (!cooldown) return null;
+        return Object.assign(
+            new Error(`Account #${authIndex} is cooling down; retry in ${Math.ceil(cooldown.remainingMs / 1000)}s.`),
+            {
+                coolingDown: true,
+                retryAfterMs: cooldown.remainingMs,
+                status: cooldown.status,
+                upstreamStatus: cooldown.status,
+            }
+        );
     }
 
     _getClientIp(req) {

@@ -346,6 +346,7 @@ class GeminiHandler extends RetryHandler {
                 ? registeredQueueAuthIndex
                 : this.currentAuthIndex;
         let headerMessage;
+        let streamQueue;
         let skipFinalFailureSwitch = false;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
@@ -359,6 +360,12 @@ class GeminiHandler extends RetryHandler {
             );
             this._forwardRequest(proxyRequest, currentQueueAuthIndex);
             headerMessage = await currentQueue.dequeue();
+            ({ message: headerMessage, queue: streamQueue } = await this._readRealStreamStart(
+                proxyRequest,
+                currentQueue,
+                headerMessage,
+                currentQueueAuthIndex
+            ));
 
             const headerStatus = Number(headerMessage?.status);
             if (
@@ -426,7 +433,7 @@ class GeminiHandler extends RetryHandler {
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
-                const dataMessage = await currentQueue.dequeue(this.timeouts.STREAM_CHUNK);
+                const dataMessage = await streamQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (dataMessage.type === "STREAM_END") {
                     if (!gate.open) {
                         this._failBeforeOutput(res, gate.failure(), "Gemini real stream", proxyRequest.request_id);

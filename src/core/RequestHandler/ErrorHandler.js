@@ -262,7 +262,10 @@ class ErrorHandler extends TransportHandler {
             let status = defaultStatus;
             let errorType = this._getDefaultErrorType(format, defaultStatus);
             // Use precise error type checking instead of string matching
-            if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
+            if (error.coolingDown && [429, 503].includes(Number(error.status))) {
+                status = Number(error.status);
+                errorType = this._getDefaultErrorType(format, status);
+            } else if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                 status = 504;
                 errorType = "timeout_error";
             } else if (this._isConnectionResetError(error)) {

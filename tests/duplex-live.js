@@ -12,7 +12,7 @@ async function main() {
     const model = args.find(arg => arg.startsWith("--model="))?.slice(8) || "gemini-3.8-flash";
     if (!["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"].includes(model))
         throw new Error("Unexpected test model");
-    // Playground signs every round in its page, so a multi-segment answer needs more time.
+    // Playground signs this one generation in its dedicated page.
     const channel = args.find(arg => arg.startsWith("--channel="))?.slice(10) || "build";
     if (!["build", "pg"].includes(channel)) throw new Error("Unexpected channel");
     const publicModel = `${channel}-${model}`;
@@ -32,6 +32,7 @@ async function main() {
         expected;
     const start = Date.now();
     const rounds = [];
+    const maxTokens = Number(args.find(arg => arg.startsWith("--max-tokens="))?.slice(13) || 32000);
     let text = "",
         finishReason,
         firstOutputMs = null;
@@ -53,7 +54,7 @@ async function main() {
         const result = await Duplex.generate(
             {
                 contents: [{ parts: [{ text: prompt }], role: "user" }],
-                generationConfig: { maxOutputTokens: 4096, temperature: 0 },
+                generationConfig: { maxOutputTokens: maxTokens, temperature: 0 },
             },
             async body => {
                 const response = await (await request(`/v1beta/models/${publicModel}:generateContent`, body)).json();
@@ -61,27 +62,26 @@ async function main() {
                 const call = candidate?.content?.parts?.find(part => part.functionCall)?.functionCall;
                 const info = {
                     blockReason: response.promptFeedback?.blockReason,
-                    characters: typeof call?.args?.text === "string" ? [...call.args.text].length : undefined,
+                    characters: typeof call?.args?.content === "string" ? [...call.args.content].length : undefined,
                     finishReason: candidate?.finishReason,
-                    seq: call?.args?.seq,
                     tool: call?.name,
                 };
                 rounds.push(info);
                 console.log(JSON.stringify({ event: "round", ...info }));
                 return response;
-            },
-            () => {},
-            () => {
-                firstOutputMs ??= Date.now() - start;
             }
         );
-        text = result.candidates[0].content.parts[0].text;
+        firstOutputMs ??= Date.now() - start;
+        text = result.candidates[0].content.parts
+            .filter(part => !part.thought)
+            .map(part => part.text || "")
+            .join("");
         finishReason = result.candidates[0].finishReason;
     } else {
         const response = await request(
             "/v1/chat/completions",
             {
-                max_tokens: 4096,
+                max_tokens: maxTokens,
                 messages: [{ content: prompt, role: "user" }],
                 model: publicModel + "-抗截断",
                 stream: true,
@@ -90,10 +90,10 @@ async function main() {
             toolOutput ? { "X-Anti-Truncation-Output": "tools" } : {}
         );
         if (
-            response.headers.get("x-anti-truncation-mode") !== "duplex" ||
+            response.headers.get("x-anti-truncation-mode") !== "tool" ||
             response.headers.get("x-anti-truncation-output") !== (toolOutput ? "tools" : "text")
         )
-            throw new Error("Deployment did not automatically enable duplex for the alias");
+            throw new Error("Deployment did not automatically enable tool output for the alias");
         const decoded = await decodeResponse(response);
         const reader = decoded.body.getReader();
         const decoder = new TextDecoder();

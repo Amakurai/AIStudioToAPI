@@ -28,12 +28,12 @@ class DuplexOpenAI {
                 throw AntiTruncation.invalidRequest("output must be text or tools when explicitly requested.");
             }
             if (!AntiTruncation.baseModel(model))
-                throw AntiTruncation.invalidRequest("duplex mode only supports the supported anti-truncation aliases.");
+                throw AntiTruncation.invalidRequest("tool output only supports the supported anti-truncation aliases.");
             if (req.body.stream !== undefined && typeof req.body.stream !== "boolean")
                 throw AntiTruncation.invalidRequest("stream must be boolean.");
             const { googleRequest, cleanModelName } = await handler.formatConverter.translateOpenAIToGoogle(req.body);
             DuplexToolTransport.prepare(googleRequest); // Reject unsupported input before account usage or network calls.
-            res.set("X-Anti-Truncation-Mode", "duplex");
+            res.set("X-Anti-Truncation-Mode", "tool");
             res.set("X-Anti-Truncation-Output", output);
             const ensureStream = () => {
                 if (!res.headersSent)
@@ -54,7 +54,7 @@ class DuplexOpenAI {
                 ...(usage ? { usage } : {}),
             });
             const write = async data => {
-                if (!handler._isResponseWritable(res)) throw new Error("Client disconnected during duplex output.");
+                if (!handler._isResponseWritable(res)) throw new Error("Client disconnected during tool output.");
                 ensureStream();
                 if (res.write(`data: ${JSON.stringify(data)}\n\n`) === false) {
                     await new Promise((resolve, reject) => {
@@ -69,12 +69,14 @@ class DuplexOpenAI {
                         };
                         const close = () => {
                             cleanup();
-                            reject(new Error("Client disconnected during duplex output."));
+                            reject(new Error("Client disconnected during tool output."));
                         };
                         const timer = setTimeout(
                             () => {
                                 cleanup();
-                                reject(Object.assign(new Error("Duplex client write timed out."), { status: 504 }));
+                                reject(
+                                    Object.assign(new Error("Tool output client write timed out."), { status: 504 })
+                                );
                             },
                             Math.min(handler.timeouts.FAKE_STREAM, 30000)
                         );
@@ -85,7 +87,7 @@ class DuplexOpenAI {
             };
             // Nothing is sent before the first accepted text, in either stream mode: clients do not show
             // an empty reply while the model thinks, and a failed or empty answer still gets a plain HTTP
-            // error. Once text has been sent, heartbeats keep the stream alive between segments.
+            // error. Once text has been sent, heartbeats cover downstream backpressure.
             const openStream = async () => {
                 if (res.headersSent) return;
                 ensureStream();
@@ -128,7 +130,7 @@ class DuplexOpenAI {
             }
             const authIndex = handler._selectDispatchAuthIndex();
             const spec = {
-                anti_truncation_mode: "duplex",
+                anti_truncation_mode: "tool",
                 anti_truncation_output: output,
                 anti_truncation_segments: true,
                 body: JSON.stringify(googleRequest),
@@ -150,8 +152,7 @@ class DuplexOpenAI {
                 ._getUsageStatsService()
                 ?.recordAttempt(requestId, authIndex, handler._getAccountNameForIndex(authIndex));
             const calls = [];
-            let fullBody = "",
-                seq = 0;
+            let fullBody = "";
             const tool = (name, args) => ({
                 function: { arguments: JSON.stringify(args), name },
                 id: `${requestId}-tool-${calls.length + 1}`,
@@ -164,16 +165,13 @@ class DuplexOpenAI {
                     throw Object.assign(new Error(message.message), { status: message.status });
                 if (message.type === "STREAM_END") break;
                 if (message.event_type === "tool_output") {
-                    if (message.seq !== seq + 1)
-                        throw AntiTruncation.protocolError("non-contiguous published sequence.");
-                    seq = message.seq;
-                    const call = tool("append_output", { seq, text: message.text });
-                    calls.push(call);
+                    const call = message.thought ? null : tool("output_content", { content: message.text });
+                    if (call) calls.push(call);
                     if (stream && !fakeStream) {
                         await openStream();
                         await write(
                             frame(
-                                output === "tools"
+                                output === "tools" && !message.thought
                                     ? { tool_calls: [{ index: calls.length - 1, ...call }] }
                                     : message.thought
                                       ? { reasoning_content: message.text }
@@ -189,19 +187,16 @@ class DuplexOpenAI {
             const converted = handler.formatConverter.convertGoogleToOpenAINonStream(response, cleanModelName);
             handler.authSwitcher.failureCount = 0;
             let reason = converted.choices[0].finish_reason;
-            if (output === "tools" && reason === "stop") {
-                const call = tool("finish_output", { last_seq: seq });
-                calls.push(call);
-                if (stream && !fakeStream) await write(frame({ tool_calls: [{ index: calls.length - 1, ...call }] }));
-                reason = "tool_calls";
-            }
+            if (output === "tools" && reason === "stop") reason = "tool_calls";
             handler.logger.info(
-                `[Duplex] Finished ${requestId}: reason=${response.candidates?.[0]?.finishReason}, segments=${seq}, output=${output}`
+                `[AntiTruncation] Finished ${requestId}: reason=${response.candidates?.[0]?.finishReason}, output=${output}`
             );
             if (stream) {
                 await openStream();
                 if (fakeStream) {
                     if (output === "tools") {
+                        const reasoning = converted.choices[0].message.reasoning_content;
+                        if (reasoning) await write(frame({ reasoning_content: reasoning }));
                         for (const [index, call] of calls.entries()) {
                             await write(frame({ tool_calls: [{ index, ...call }] }));
                         }
@@ -216,7 +211,11 @@ class DuplexOpenAI {
                 res.write("data: [DONE]\n\n");
             } else {
                 if (output === "tools") {
-                    converted.choices[0].message = { content: null, role: "assistant", tool_calls: calls };
+                    converted.choices[0].message = {
+                        ...converted.choices[0].message,
+                        content: null,
+                        tool_calls: calls,
+                    };
                     converted.choices[0].finish_reason = reason;
                 }
                 res.status(200).json(converted);
@@ -246,7 +245,7 @@ class DuplexOpenAI {
                 handler.needsSwitchingAfterRequest = false;
                 handler.authSwitcher
                     .switchToNextAuth()
-                    .catch(error => handler.logger.error(`[Duplex] Account rotation failed: ${error.message}`));
+                    .catch(error => handler.logger.error(`[AntiTruncation] Account rotation failed: ${error.message}`));
             }
             if (!res.writableEnded) res.end();
             handler._finalizeTrackedRequest(requestId, res);

@@ -117,6 +117,13 @@ class ConnectionHandler extends ErrorHandler {
             allowAnyReadyAccount = false,
         } = options;
 
+        if (
+            allowAnyReadyAccount &&
+            this.authSwitcher.isSystemBusy &&
+            this._getReadyAuthIndices().some(index => !this.browserManager.pendingContextClosures?.has(index))
+        )
+            return true;
+
         const ready = await this._waitForSystemReady();
         if (!ready) {
             sendError(503, busyMessage);
@@ -157,9 +164,19 @@ class ConnectionHandler extends ErrorHandler {
             this.authSource.getRotationIndices?.().length > 0 &&
             this.authSource.getAvailableRotationIndices?.().length === 0
         ) {
-            const message = "All accounts are temporarily rate limited. Please try again later.";
-            if (res.headersSent) this._handleRequestError({ message, status: 429 }, res);
-            else this._sendErrorResponse(res, 429, message);
+            const statuses = this.authSource
+                .getRotationIndices()
+                .map(index => this.authSource.getAccountCooldownStatus?.(index));
+            const status = statuses.includes(429) ? 429 : statuses.every(value => value === 403) ? 403 : 503;
+            const message = "All accounts are temporarily cooling down. Please try again after the cooldown.";
+            const remaining = this.authSource
+                .getRotationIndices()
+                .map(index => this.authSource.getAccountCooldown?.(index)?.remainingMs)
+                .filter(value => Number.isFinite(value) && value > 0);
+            if (!res.headersSent && remaining.length)
+                res.setHeader("Retry-After", String(Math.ceil(Math.min(...remaining) / 1000)));
+            if (res.headersSent) this._handleRequestError({ coolingDown: true, message, status }, res);
+            else this._sendErrorResponse(res, status, message);
             return false;
         }
 
@@ -393,31 +410,54 @@ class ConnectionHandler extends ErrorHandler {
     _selectDispatchAuthIndex(excludeIndices = [], { allowFallback = true } = {}) {
         const canonical = index => this.authSource.getCanonicalIndex?.(index) ?? index;
         const excluded = new Set(excludeIndices.map(canonical));
-        const eligible = index => !excluded.has(canonical(index)) && !this.authSource.isAccountCoolingDown?.(index);
-        const candidates = this._getReadyAuthIndices().filter(eligible);
+        const eligible = index =>
+            Number.isInteger(index) &&
+            index >= 0 &&
+            (!Array.isArray(this.authSource.availableIndices) || this.authSource.availableIndices.includes(index)) &&
+            !excluded.has(canonical(index)) &&
+            !this.authSource.isAccountCoolingDown?.(index);
+        const readyCandidates = this._getReadyAuthIndices().filter(eligible);
+        const stableCandidates = readyCandidates.filter(
+            index => !this.browserManager.pendingContextClosures?.has(index)
+        );
+        const candidates = stableCandidates.length ? stableCandidates : readyCandidates;
 
         if (candidates.length === 0) {
+            if (allowFallback) {
+                const cooling = this._accountCooldownError(this.currentAuthIndex);
+                if (cooling) throw cooling;
+            }
             return allowFallback && eligible(this.currentAuthIndex) ? this.currentAuthIndex : -1;
-        }
-        if (candidates.length === 1) {
-            return candidates[0];
         }
 
         // Keep the ascending order from _getReadyAuthIndices so the round-robin
         // cursor walks accounts deterministically
         // Build and Playground use separate pages per account, so each balances only its own load.
         const channel = this.dispatchChannel || "build";
-        const load = authIndex => this.connectionRegistry.getQueueCountForAuth(authIndex, channel);
-        let minQueueCount = Infinity;
-        for (const authIndex of candidates) {
-            minQueueCount = Math.min(minQueueCount, load(authIndex));
+        const candidatesSet = new Set(candidates);
+        const groups = new Map();
+        for (const authIndex of readyCandidates) {
+            const account = canonical(authIndex);
+            const group = groups.get(account) || { account, indices: [], load: 0 };
+            group.load += this.connectionRegistry.getQueueCountForAuth(authIndex, channel);
+            if (candidatesSet.has(authIndex)) group.indices.push(authIndex);
+            groups.set(account, group);
         }
-        const leastLoaded = candidates.filter(authIndex => load(authIndex) === minQueueCount);
+        const eligibleGroups = [...groups.values()].filter(group => group.indices.length);
+        const minQueueCount = Math.min(...eligibleGroups.map(group => group.load));
+        const leastLoaded = eligibleGroups
+            .filter(group => group.load === minQueueCount)
+            .sort((a, b) => a.account - b.account);
 
         // Round-robin among the least-loaded accounts
-        const selected = leastLoaded[this._dispatchCursor % leastLoaded.length];
-        this._dispatchCursor = (this._dispatchCursor + 1) % Number.MAX_SAFE_INTEGER;
-        return selected;
+        const cursor = channel === "playground" ? "_playgroundDispatchCursor" : "_dispatchCursor";
+        const selected = leastLoaded.find(group => group.account >= this[cursor]) ?? leastLoaded[0];
+        this[cursor] = selected.account < Number.MAX_SAFE_INTEGER ? selected.account + 1 : 0;
+        return (
+            selected.indices.find(index => index === this.currentAuthIndex) ??
+            selected.indices.find(index => index === selected.account) ??
+            selected.indices[0]
+        );
     }
 
     _getReadyAuthIndices() {
@@ -426,6 +466,11 @@ class ConnectionHandler extends ErrorHandler {
             return readyIndices;
         }
         for (const [authIndex, contextData] of this.browserManager.contexts.entries()) {
+            if (
+                Array.isArray(this.authSource.availableIndices) &&
+                !this.authSource.availableIndices.includes(authIndex)
+            )
+                continue;
             if (this.authSource.isAccountCoolingDown?.(authIndex)) continue;
             if (this.browserManager.initializingContexts.has(authIndex)) {
                 continue;

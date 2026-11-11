@@ -48,6 +48,8 @@ class BrowserManager {
         this._backgroundPreloadTask = null; // Current background preload task promise (only one at a time)
         this._backgroundPreloadAbort = false; // Flag to signal background task to abort
         this._backgroundPreloadGeneration = 0; // Invalidates pending starts when refills overlap or are cancelled
+        this._rebalanceTask = null;
+        this._rebalanceRequested = false;
 
         // Legacy single context references (for backward compatibility)
         this.context = null;
@@ -779,6 +781,9 @@ class BrowserManager {
      * @param {number} authIndex - The auth index being activated
      */
     _activateContext(ctx, pg, authIndex) {
+        if (this.authSource.isAccountCoolingDown?.(authIndex)) {
+            throw new ContextAbortedError(authIndex, "account is cooling down");
+        }
         this.context = ctx;
         this.page = pg;
         this._currentAuthIndex = authIndex;
@@ -1983,13 +1988,40 @@ class BrowserManager {
      * Rebalance context pool after account changes
      * Removes excess contexts and starts missing ones in background
      */
-    async rebalanceContextPool() {
+    rebalanceContextPool() {
+        this._rebalanceRequested = true;
+        if (!this._rebalanceTask) {
+            this._rebalanceTask = (async () => {
+                await Promise.resolve();
+                try {
+                    while (this._rebalanceRequested) {
+                        this._rebalanceRequested = false;
+                        await this._rebalanceContextPoolOnce();
+                    }
+                } finally {
+                    this._rebalanceTask = null;
+                }
+            })();
+        }
+        return this._rebalanceTask;
+    }
+
+    async _rebalanceContextPoolOnce() {
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
 
         // Build full rotation ordered from current account
         const rotation = this.authSource.getAvailableRotationIndices();
+        const startingAuthIndex = this._currentAuthIndex;
+        const snapshotIsCurrent = () => {
+            if (this.config.maxContexts !== maxContexts || this._currentAuthIndex !== startingAuthIndex) return false;
+            const available = this.authSource.getAvailableRotationIndices();
+            return (
+                available.length === rotation.length &&
+                available.every((index, position) => index === rotation[position])
+            );
+        };
         const currentCanonical =
             this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
         const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
@@ -2062,9 +2094,17 @@ class BrowserManager {
         );
 
         for (const idx of idle) {
+            if (!snapshotIsCurrent()) {
+                this._rebalanceRequested = true;
+                return;
+            }
             await this._closeContextForPoolIfPossible(idx, "rebalance");
         }
 
+        if (!snapshotIsCurrent()) {
+            this._rebalanceRequested = true;
+            return;
+        }
         for (const entry of busy) {
             this._scheduleContextClosureWhenIdle(entry.authIndex, "rebalance");
         }
@@ -2421,6 +2461,11 @@ class BrowserManager {
 
                     if (isAuthExpired) {
                         // Auth is expired, don't retry - just throw the error
+                        throw error;
+                    }
+
+                    if (!contextData.page.isClosed() && this._hasActiveQueueForAuth(authIndex)) {
+                        this._scheduleContextClosureWhenIdle(authIndex, "fast_switch_check_failed");
                         throw error;
                     }
 

@@ -276,13 +276,40 @@ class AuthSource {
         return email ? `email:${email}` : `index:${index}`;
     }
 
-    markAccountCoolingDown(index, durationMs = 60000) {
+    markAccountCoolingDown(index, durationMs = 60000, status = 429, details = {}) {
         if (!Number.isInteger(index) || !this.availableIndices.includes(index)) return false;
         const duration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 60000;
         const key = this._getCooldownKey(index);
-        const until = Math.max(this.accountCooldowns.get(key) || 0, Date.now() + duration);
+        const previousUntil = this.accountCooldowns.get(key) || 0;
+        const until = Math.max(previousUntil, Date.now() + duration);
         this.accountCooldowns.set(key, until);
+        this.accountCooldownStatuses ||= new Map();
+        this.accountCooldownDetails ||= new Map();
+        if (until > previousUntil) {
+            this.accountCooldownStatuses.set(key, status);
+            this.accountCooldownDetails.set(key, {
+                channel: details.channel || "build",
+                model: details.model || null,
+            });
+        }
         return true;
+    }
+
+    getAccountCooldown(index) {
+        if (!this.isAccountCoolingDown(index)) return null;
+        const key = this._getCooldownKey(index);
+        const until = this.accountCooldowns.get(key);
+        return {
+            ...this.accountCooldownDetails?.get(key),
+            remainingMs: Math.max(0, until - Date.now()),
+            status: this.accountCooldownStatuses?.get(key) || 429,
+            until,
+        };
+    }
+
+    getAccountCooldownStatus(index) {
+        if (!this.isAccountCoolingDown(index)) return null;
+        return this.accountCooldownStatuses?.get(this._getCooldownKey(index)) || 429;
     }
 
     isAccountCoolingDown(index) {
@@ -291,6 +318,8 @@ class AuthSource {
         if (!until) return false;
         if (until <= Date.now()) {
             this.accountCooldowns.delete(key);
+            this.accountCooldownStatuses?.delete(key);
+            this.accountCooldownDetails?.delete(key);
             return false;
         }
         return true;

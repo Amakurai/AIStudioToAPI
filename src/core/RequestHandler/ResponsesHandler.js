@@ -135,6 +135,7 @@ class ResponsesHandler extends RetryHandler {
                     let currentQueue = messageQueue;
                     let currentQueueAuthIndex = dispatchAuthIndex;
                     let initialMessage;
+                    let streamQueue;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
@@ -147,6 +148,12 @@ class ResponsesHandler extends RetryHandler {
                         );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
+                        ({ message: initialMessage, queue: streamQueue } = await this._readRealStreamStart(
+                            proxyRequest,
+                            currentQueue,
+                            initialMessage,
+                            currentQueueAuthIndex
+                        ));
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
@@ -207,7 +214,7 @@ class ResponsesHandler extends RetryHandler {
                         "Content-Type": "text/event-stream",
                     });
                     this.logger.info(`[Request] OpenAI Response API streaming response (Real Mode) started...`);
-                    await this._streamOpenAIResponseAPIResponse(currentQueue, res, model, {
+                    await this._streamOpenAIResponseAPIResponse(streamQueue, res, model, {
                         requestId,
                         responseDefaults,
                         responseFunctionNameMap,

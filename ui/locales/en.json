@@ -1,6 +1,8 @@
 {
     "aborted": "Aborted",
     "account": "Account",
+    "accountCooldownDetail": "{channel} · {model} · upstream HTTP {status} · {time} remaining; this account is temporarily excluded",
+    "accountCoolingDown": "Account is temporarily cooling down for {seconds} more seconds and cannot be selected",
     "accountDedupConfirm": "Deduplicate auth files by email, keeping the highest index and deleting other duplicates (assumes indices increase over time for the same account). Continue?",
     "accountDedupFailed": "Deduplication failed: {error}",
     "accountDedupNoop": "No duplicate auth files found to clean up.",
@@ -272,6 +274,7 @@
     "switchLanguage": "Switch Language",
     "systemBusySwitchingOrRecoveringAccounts": "The system is switching or recovering accounts. Please try again later.",
     "systemSettings": "System",
+    "tagCoolingDown": "Cooling down",
     "tagCurrent": "Current",
     "tagDispatchReady": "Dispatchable",
     "tagExpired": "Expired",

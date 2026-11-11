@@ -273,6 +273,12 @@ class StatusRoutes {
                     const result = await this.serverSystem.requestHandler._switchToSpecificAuth(targetIndex);
                     if (result.success) {
                         res.status(200).json({ message: "accountSwitchSuccess", newIndex: result.newIndex });
+                    } else if (result.cooldown) {
+                        res.status(409).json({
+                            cooldown: result.cooldown,
+                            message: "accountCoolingDown",
+                            seconds: Math.ceil(result.cooldown.remainingMs / 1000),
+                        });
                     } else {
                         res.status(400).json({ message: "accountSwitchFailed", reason: result.reason });
                     }
@@ -1034,12 +1040,14 @@ class StatusRoutes {
             const isExpired = expiredIndices.includes(index);
 
             const hasContext = browserManager.contexts.has(index);
+            const cooldown = authSource.getAccountCooldown?.(index) || null;
             // Multi-account dispatch status: ready = can serve dispatched requests right now
-            const isReady = readyIndexSet.has(index);
+            const isReady = !cooldown && readyIndexSet.has(index);
             const inFlightRequests = connectionRegistry.getQueueCountForAuth(index);
 
             return {
                 canonicalIndex,
+                cooldown,
                 hasContext,
                 index,
                 inFlightRequests,
@@ -1052,7 +1060,9 @@ class StatusRoutes {
             };
         });
 
-        const currentAuthIndex = requestHandler.currentAuthIndex;
+        const currentAuthIndex = authSource.isAccountCoolingDown?.(requestHandler.currentAuthIndex)
+            ? -1
+            : requestHandler.currentAuthIndex;
         const currentAccountName = accountNameMap.get(currentAuthIndex) || "N/A";
 
         const usageCount =
@@ -1068,6 +1078,7 @@ class StatusRoutes {
         return {
             logCount: displayLogs.length,
             logs: displayLogs.join("\n"),
+            serverTime: Date.now(),
             status: {
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,

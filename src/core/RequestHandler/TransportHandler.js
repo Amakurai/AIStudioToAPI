@@ -160,10 +160,10 @@ class TransportHandler extends RequestHandler {
             if (
                 proxyRequest.is_generative &&
                 /:(?:streamGenerateContent|generateContent)$/.test(proxyRequest.path) &&
-                (proxyRequest.anti_truncation_mode === "duplex" || !this._antiTruncationFallback(proxyRequest))
+                (proxyRequest.anti_truncation_mode === "tool" || !this._antiTruncationFallback(proxyRequest))
             ) {
                 proxyRequest.anti_truncation = true;
-                proxyRequest.anti_truncation_mode = "duplex";
+                proxyRequest.anti_truncation_mode = "tool";
                 proxyRequest.streaming_mode = "fake";
             }
         }
@@ -200,6 +200,21 @@ class TransportHandler extends RequestHandler {
     }
 
     _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
+        // Another concurrent request may have cooled this account after its queue was reserved.
+        const cooldown = this._accountCooldownError(authIndex);
+        if (cooldown) {
+            const entry = this.connectionRegistry.messageQueues.get(proxyRequest.request_id);
+            if (entry && entry.requestAttemptId === (proxyRequest.request_attempt_id ?? null)) {
+                entry.queue.enqueue({
+                    coolingDown: true,
+                    event_type: "error",
+                    message: cooldown.message,
+                    status: cooldown.status,
+                    upstreamStatus: cooldown.upstreamStatus,
+                });
+            }
+            return;
+        }
         if (proxyRequest.anti_truncation) {
             void AntiTruncation.forward(this, proxyRequest, authIndex);
             return;

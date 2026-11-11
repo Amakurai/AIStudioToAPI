@@ -1,11 +1,11 @@
 /**
  * Request handler views for `pg-` requests. It shares the account pool, format conversion and
- * response handling with Build, but never changes Build's account state:
+ * response handling with Build, with separate quota and failure state:
  * - no rotation (SWITCH_ON_USES) or failure (FAILURE_THRESHOLD) counting;
- * - a Playground 429/503 never cools down, switches or rebalances an account;
+ * - all channels share a temporary account cooldown; Playground leaves Build counters alone;
+ * - retries use ready accounts first, then rotate the shared browser pool to an eligible spare;
  * - dispatch balances Playground requests among themselves, so they never count as Build load;
- * - Build's account cooldowns (Build quota) do not hide accounts from Playground, whose quota differs.
- * Playground keeps its own per-account/model cooldown in PlaygroundTransport.
+ * - a cooling account is excluded from both current-account and concurrent dispatch selection.
  */
 const bindTo = target => value => (typeof value === "function" ? value.bind(target) : value);
 
@@ -15,6 +15,8 @@ function createPlaygroundScope(handler) {
             if (key === "incrementUsageCount") return () => 0;
             if (key === "shouldSwitchByUsage") return () => false;
             if (key === "handleRequestFailureAndSwitch") return async () => {};
+            if (key === "switchToNextAuth")
+                return (options = {}) => target.switchToNextAuth({ ...options, resetCounters: false });
             return bindTo(target)(Reflect.get(target, key, target));
         },
         set(target, key, value) {
@@ -35,18 +37,11 @@ function createPlaygroundScope(handler) {
         },
     });
 
-    const authSource = new Proxy(handler.authSource, {
-        get(target, key) {
-            if (key === "isAccountCoolingDown") return () => false;
-            if (key === "getAvailableRotationIndices")
-                return () => target.getRotationIndices?.() ?? target.getAvailableRotationIndices();
-            return bindTo(target)(Reflect.get(target, key, target));
-        },
-    });
-
     // Playground run settings replace the global force-tool switches and safety threshold.
     const config = new Proxy(handler.config, {
         get(target, key) {
+            if (key === "immediateSwitchStatusCodes")
+                return [...new Set([...(target.immediateSwitchStatusCodes || []), 401, 403])];
             const settings = handler.playground.settings.values;
             if (key === "forceWebSearch") return settings.googleSearch;
             if (key === "forceUrlContext") return settings.urlContext;
@@ -66,7 +61,13 @@ function createPlaygroundScope(handler) {
                 handler._dispatchCursor = value;
             },
         },
-        authSource: { value: authSource },
+        _playgroundDispatchCursor: {
+            get: () => handler._playgroundDispatchCursor,
+            set: value => {
+                handler._playgroundDispatchCursor = value;
+            },
+        },
+        authSource: { value: handler.authSource },
         authSwitcher: { value: authSwitcher },
         config: { value: config },
         connectionRegistry: { value: connectionRegistry },
@@ -75,25 +76,90 @@ function createPlaygroundScope(handler) {
         needsSwitchingAfterRequest: { value: false, writable: true },
     });
 
-    /** Retry on another ready account this request has not tried, without touching account state. */
+    /** Use an eligible ready account, or initialise a spare through the shared pool's bounded switch. */
+    scope._preparePlaygroundAccount = async function (excludeIndices, requestIsActive) {
+        const canonical = index => this.authSource.getCanonicalIndex?.(index) ?? index;
+        const excluded = new Set(excludeIndices.map(canonical));
+        const eligible = index =>
+            !excluded.has(canonical(index)) && !this.playground.isCoolingDown(this.playgroundModel, index);
+        const select = () => this._selectDispatchAuthIndex(excludeIndices, { allowFallback: false });
+        if (!requestIsActive()) return -1;
+        let next = select();
+        if (next >= 0) return next;
+
+        // Both channels honour the same temporary account cooldown.
+        const candidates = handler.authSource.getAvailableRotationIndices?.() || [];
+        if (!candidates.some(eligible)) return -1;
+        if (this.authSwitcher.isSystemBusy) {
+            if (!(await this._waitForSystemReady()) || !requestIsActive()) return -1;
+            next = select();
+            if (next >= 0) return next;
+        }
+        if (!requestIsActive()) return -1;
+        const cooling = (this.authSource.getRotationIndices?.() || []).filter(index => !eligible(index));
+        try {
+            await this.authSwitcher.switchToNextAuth({
+                excludeIndices: [...excludeIndices, ...cooling],
+                resetCounters: false,
+            });
+        } catch (error) {
+            this.logger.warn(`[Playground] Failed to prepare a spare account: ${error.message}`);
+        }
+        return requestIsActive() ? select() : -1;
+    };
+
+    // A fresh request can arrive while all resident accounts are cooling down, even though an
+    // unused auth file is available. Prepare it before synchronous dispatch rejects the request.
+    scope._ensureBrowserBackedRequestReady = async function (res, options) {
+        if (!(await handler._ensureBrowserBackedRequestReady.call(this, res, options))) return false;
+        if (!this._getReadyAuthIndices().some(index => !this.playground.isCoolingDown(this.playgroundModel, index))) {
+            await this._preparePlaygroundAccount([], () => this._isResponseWritable(res));
+        }
+        return this._isResponseWritable(res);
+    };
+
+    /** Retry another account once, preserving the queue if the client disconnects during startup. */
     scope._prepareImmediateStatusRetry = async function (errorDetails, requestId, tracker, sourceAuthIndex) {
+        this._getUsageStatsService()?.recordAttemptFailure?.(requestId, sourceAuthIndex, errorDetails);
         if (errorDetails.retryable === false) return false;
+        if (
+            !errorDetails.coolingDown &&
+            !errorDetails.accountBusy &&
+            !this.playground.isCoolingDown(this.playgroundModel, sourceAuthIndex)
+        )
+            this.playground.fail(this.playgroundModel, sourceAuthIndex, Number(errorDetails.status));
         tracker.nextAuthIndex = null;
         if (Number.isInteger(sourceAuthIndex) && sourceAuthIndex >= 0)
             tracker.attemptedAuthIndices.add(sourceAuthIndex);
         const queue = handler.connectionRegistry.messageQueues.get(requestId)?.queue;
-        if (!queue || queue.closed) return false;
-        const next = this._selectDispatchAuthIndex([...tracker.attemptedAuthIndices], { allowFallback: false });
+        const requestIsActive = () =>
+            queue && !queue.closed && handler.connectionRegistry.messageQueues.get(requestId)?.queue === queue;
+        const next = await this._preparePlaygroundAccount([...tracker.attemptedAuthIndices], requestIsActive);
         if (next < 0) {
-            this.logger.warn(`[Playground] No untried account is ready for request #${requestId}; stopping retries.`);
+            this.logger.warn(
+                `[Playground] No untried eligible account for request #${requestId}; tried=[${[...tracker.attemptedAuthIndices]}], model=${this.playgroundModel}, upstreamStatus=${errorDetails.upstreamStatus || errorDetails.status}.`
+            );
+            if (this.authSource.isAccountCoolingDown?.(sourceAuthIndex))
+                this.browserManager.rebalanceContextPool?.().catch(error => this.logger.warn(error.message));
             return false;
         }
         if (!handler.connectionRegistry.setMessageQueueAuthIndex(requestId, next, queue)) return false;
         tracker.nextAuthIndex = next;
         tracker.attemptedAuthIndices.add(next);
         this.logger.info(
-            `[Playground] Retrying request #${requestId} after ${errorDetails.status}: account #${sourceAuthIndex} -> #${next}.`
+            `[Playground] Retrying request #${requestId} after upstream ${errorDetails.upstreamStatus || errorDetails.status}: account #${sourceAuthIndex} (${JSON.stringify(this._getAccountNameForIndex(sourceAuthIndex))}) -> #${next} (${JSON.stringify(this._getAccountNameForIndex(next))}).`
         );
+        if (
+            this.authSource.isAccountCoolingDown?.(sourceAuthIndex) &&
+            sourceAuthIndex === this.currentAuthIndex &&
+            !this.authSwitcher.isSystemBusy
+        ) {
+            this.authSwitcher
+                .switchToNextAuth({ excludeIndices: [sourceAuthIndex], resetCounters: false })
+                .catch(error => this.logger.warn(`[Playground] Failed to replace cooling account: ${error.message}`));
+        }
+        if (this.authSource.isAccountCoolingDown?.(sourceAuthIndex))
+            this.browserManager.rebalanceContextPool?.().catch(error => this.logger.warn(error.message));
         return true;
     };
 
@@ -107,8 +173,13 @@ function createPlaygroundScope(handler) {
         if (!model) return select.call(this, excludeIndices, options);
         const cooling = this._getReadyAuthIndices().filter(index => this.playground.isCoolingDown(model, index));
         const preferred = select.call(this, [...excludeIndices, ...cooling], { ...options, allowFallback: false });
-        // Every untried account is cooling: let the transport report the cooldown quickly.
-        return preferred >= 0 ? preferred : select.call(this, excludeIndices, options);
+        if (preferred >= 0) return preferred;
+        if (options.allowFallback === false) return -1;
+        const fallback = select.call(this, excludeIndices, options);
+        if (fallback >= 0 && this.playground.isCoolingDown(model, fallback)) {
+            throw this.playground.coolingDownError(model, fallback);
+        }
+        return fallback;
     };
 
     return scope;

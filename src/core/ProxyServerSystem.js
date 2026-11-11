@@ -477,7 +477,7 @@ class ProxyServerSystem extends EventEmitter {
         app.use(this._createAuthMiddleware());
 
         // API routes
-        // Each channel lists its own models: build-* from configs/models.json, pg-* from Playground.
+        // Only Playground models are advertised; Build registration is commented out in channelModels().
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
             const channels = this.requestHandler.channelModels();

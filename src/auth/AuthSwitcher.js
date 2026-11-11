@@ -84,13 +84,13 @@ class AuthSwitcher {
                         return { reason: "Account entered cooldown before switching.", success: false };
                     }
                     await this.browserManager.launchOrSwitchContext(singleIndex);
-                    this.resetCounters();
+                    if (options.resetCounters !== false) this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
                     });
 
                     this.logger.info(
-                        `✅ [Auth] Single account #${singleIndex} restart/refresh successful, usage count reset.`
+                        `✅ [Auth] Single account #${singleIndex} restart/refresh successful, counters ${options.resetCounters === false ? "preserved" : "reset"}.`
                     );
                     return { newIndex: singleIndex, success: true };
                 } catch (error) {
@@ -143,7 +143,7 @@ class AuthSwitcher {
                     await this.browserManager.preCleanupForSwitch(accountIndex);
                     if (this.authSource.isAccountCoolingDown(accountIndex)) continue;
                     await this.browserManager.switchAccount(accountIndex);
-                    this.resetCounters();
+                    if (options.resetCounters !== false) this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
                     });
@@ -154,7 +154,7 @@ class AuthSwitcher {
                         );
                     } else {
                         this.logger.info(
-                            `✅ [Auth] Successfully switched to account #${accountIndex}, counters reset.`
+                            `✅ [Auth] Successfully switched to account #${accountIndex}, counters ${options.resetCounters === false ? "preserved" : "reset"}.`
                         );
                     }
 
@@ -185,12 +185,12 @@ class AuthSwitcher {
                         return { reason: "Fallback account entered cooldown.", success: false };
                     }
                     await this.browserManager.switchAccount(originalStartAccount);
-                    this.resetCounters();
+                    if (options.resetCounters !== false) this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
                     });
                     this.logger.info(
-                        `✅ [Auth] Final attempt succeeded! Switched to account #${originalStartAccount}.`
+                        `✅ [Auth] Final attempt succeeded! Switched to account #${originalStartAccount}, counters ${options.resetCounters === false ? "preserved" : "reset"}.`
                     );
                     return {
                         failedAccounts,
@@ -226,6 +226,18 @@ class AuthSwitcher {
     }
 
     async switchToSpecificAuth(targetIndex) {
+        const coolingDown = () => {
+            const cooldown = this.authSource.getAccountCooldown?.(targetIndex);
+            return this.authSource.isAccountCoolingDown?.(targetIndex)
+                ? {
+                      cooldown,
+                      reason: "Account is temporarily cooling down.",
+                      success: false,
+                  }
+                : null;
+        };
+        const initialCooldown = coolingDown();
+        if (initialCooldown) return initialCooldown;
         if (this.isSystemBusy) {
             this.logger.info("🔄 [Auth] Account switching in progress, skipping duplicate operation");
             return { reason: "Switch already in progress.", success: false };
@@ -245,6 +257,8 @@ class AuthSwitcher {
             this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
             // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
             await this.browserManager.preCleanupForSwitch(targetIndex);
+            const currentCooldown = coolingDown();
+            if (currentCooldown) return currentCooldown;
             await this.browserManager.switchAccount(targetIndex);
             this.resetCounters();
             this.browserManager.rebalanceContextPool().catch(err => {

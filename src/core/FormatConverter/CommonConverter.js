@@ -190,20 +190,30 @@ class FormatConverter {
      */
     /** The upstream model name without gateway suffixes (built-in tools, streaming mode, thinking level). */
     static stripModelSuffixes(modelName) {
-        const { cleanModelName: withoutTools } = FormatConverter.parseModelBuiltInToolSuffixes(modelName);
+        const preset = ModelChannel.playgroundPreset(modelName);
+        const effectiveModel = preset === null ? modelName : ModelChannel.publicName("playground", preset);
+        const { cleanModelName: withoutTools } = FormatConverter.parseModelBuiltInToolSuffixes(effectiveModel);
         const { cleanModelName: withoutStreaming } = FormatConverter.parseModelStreamingModeSuffix(withoutTools);
-        return FormatConverter.parseModelThinkingLevel(withoutStreaming).cleanModelName;
+        const cleanModelName = FormatConverter.parseModelThinkingLevel(withoutStreaming).cleanModelName;
+        const baseModel = preset !== null && AntiTruncation.baseModel(cleanModelName);
+        return baseModel ? ModelChannel.publicName("playground", baseModel) : cleanModelName;
     }
 
     parseModelSuffixes(modelName, { logPrefix = "[Adapter]", modelSource = "model name" } = {}) {
+        const preset = ModelChannel.playgroundPreset(modelName);
+        const effectiveModel = preset === null ? modelName : ModelChannel.publicName("playground", preset);
         const {
             cleanModelName: toolStrippedModel,
             forceCodeExecution,
             forceWebSearch,
-        } = FormatConverter.parseModelBuiltInToolSuffixes(modelName);
-        const { cleanModelName: streamStrippedModel, streamingMode } =
+        } = FormatConverter.parseModelBuiltInToolSuffixes(effectiveModel);
+        const { cleanModelName: streamStrippedModel, streamingMode: requestedStreamingMode } =
             FormatConverter.parseModelStreamingModeSuffix(toolStrippedModel);
-        const { cleanModelName, thinkingLevel } = FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const streamingMode = preset === null ? requestedStreamingMode : "real";
+        const { cleanModelName: thinkingStrippedModel, thinkingLevel } =
+            FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const baseModel = preset !== null && AntiTruncation.baseModel(thinkingStrippedModel);
+        const cleanModelName = baseModel ? ModelChannel.publicName("playground", baseModel) : thinkingStrippedModel;
 
         const forceToolFlags = [];
         if (forceWebSearch) forceToolFlags.push("forceWebSearch=true");
@@ -674,8 +684,8 @@ class FormatConverter {
      * @param {string} geminiReason - Gemini finish reason
      * @returns {string} - OpenAI finish reason
      */
-    _mapFinishReason(geminiReason, modelName = null) {
-        if (AntiTruncation.baseModel(modelName) && AntiTruncation.BLOCKED_FINISH_REASONS.includes(geminiReason)) {
+    _mapFinishReason(geminiReason) {
+        if (AntiTruncation.BLOCKED_FINISH_REASONS.includes(String(geminiReason || "").toUpperCase())) {
             return "content_filter";
         }
         const reasonMap = {

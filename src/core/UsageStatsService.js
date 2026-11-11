@@ -101,6 +101,7 @@ class UsageStatsService {
         if (patch.requestCategory !== undefined)
             tracker.requestCategory = patch.requestCategory || tracker.requestCategory;
         if (patch.streamMode !== undefined) tracker.streamMode = patch.streamMode || null;
+        if (patch.generation !== undefined) tracker.generation = patch.generation;
 
         if (patch.initialAuthIndex !== undefined) {
             tracker.initialAuthIndex = this._normalizeAuthIndex(patch.initialAuthIndex);
@@ -124,6 +125,20 @@ class UsageStatsService {
                 : this._resolveAccountName(normalizedAuthIndex);
 
         this._pushAttempt(tracker, normalizedAuthIndex, resolvedAccountName);
+    }
+
+    /** Keep upstream failures on the account that served that attempt, even if a later retry succeeds. */
+    recordAttemptFailure(requestId, authIndex, error = {}) {
+        if (!this.enabled) return;
+        const attempts = this.activeRequests.get(requestId)?.attempts;
+        const attempt = attempts?.at(-1);
+        if (!attempt || this._parseAccountKey(attempt.accountKey).authIndex !== authIndex) return;
+        const status = Number(error.upstreamStatus || error.status);
+        if (!Number.isInteger(status) || status < 400 || status > 599) return;
+        // The transport may already have recorded the original 403 before a retry sees proxy 503.
+        if (attempt.upstreamStatus && !error.upstreamStatus) return;
+        attempt.upstreamStatus = status;
+        attempt.errorMessage = String(error.message || "Upstream request failed").slice(0, 4096);
     }
 
     finishRequest(requestId, result = {}) {
@@ -158,13 +173,14 @@ class UsageStatsService {
             accountKey,
             apiFormat: tracker.apiFormat,
             attemptCount: tracker.attemptCount,
-            attempts: tracker.attempts.map(item => ({ accountKey: item.accountKey })),
+            attempts: tracker.attempts.map(item => ({ ...item })),
             clientIp: tracker.clientIp,
             durationMs,
             errorMessage: result.errorMessage || null,
             finalAccountName,
             finalAuthIndex,
             finishedAt: new Date(finishedAtMs).toISOString(),
+            ...(tracker.generation ? { generation: tracker.generation } : {}),
             initialAccountName: tracker.initialAccountName,
             initialAuthIndex: tracker.initialAuthIndex,
             isStreaming: tracker.isStreaming,

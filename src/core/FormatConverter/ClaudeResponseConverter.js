@@ -717,10 +717,10 @@ class ClaudeResponseConverter extends FormatConverter {
 
             // Determine stop reason
             let stopReason = "end_turn";
-            if (streamState.hasToolUse) {
-                stopReason = "tool_use";
-            } else if (candidate.finishReason === "MAX_TOKENS") {
+            if (candidate.finishReason === "MAX_TOKENS") {
                 stopReason = "max_tokens";
+            } else if (streamState.hasToolUse && candidate.finishReason === "STOP") {
+                stopReason = "tool_use";
             } else if (candidate.finishReason === "STOP") {
                 stopReason = "end_turn";
             }
@@ -849,10 +849,10 @@ class ClaudeResponseConverter extends FormatConverter {
 
         // Determine stop reason
         let stopReason = "end_turn";
-        if (hasToolUse) {
-            stopReason = "tool_use";
-        } else if (candidate.finishReason === "MAX_TOKENS") {
+        if (candidate.finishReason === "MAX_TOKENS") {
             stopReason = "max_tokens";
+        } else if (hasToolUse && (!candidate.finishReason || candidate.finishReason === "STOP")) {
+            stopReason = "tool_use";
         } else if (candidate.finishReason === "SAFETY") {
             stopReason = "end_turn"; // Claude doesn't have a direct equivalent
         }
