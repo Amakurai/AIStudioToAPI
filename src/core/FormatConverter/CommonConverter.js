@@ -787,11 +787,15 @@ class FormatConverter {
         return null;
     }
 
-    // Preserve Flash/Argon assistant-prefill compatibility by making the next user turn explicit.
+    // Preserve assistant-prefill compatibility for supported text models with an explicit user turn.
     _applyTrailingUserTurnGuard(googleRequest, model) {
         if (!googleRequest || !Array.isArray(googleRequest.contents)) return;
         const modelLower = (AntiTruncation.baseModel(model) || ModelChannel.parse(model).model).toLowerCase();
-        if (!["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"].includes(modelLower))
+        if (
+            !["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon"].includes(
+                modelLower
+            )
+        )
             return;
         if (googleRequest.contents.length === 0) return;
 
