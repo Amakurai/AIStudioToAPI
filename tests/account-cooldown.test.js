@@ -286,3 +286,37 @@ test("cooldown configuration defaults to one minute and accepts an override", t 
         assert.equal(new ConfigLoader(logger).loadConfiguration().rateLimitCooldownMs, 60000);
     }
 });
+
+test("Playground always provisions all accounts even with a legacy fixed pool environment value", t => {
+    const keys = ["MAX_CONTEXTS", "PLAYGROUND_ENABLED", "PLAYGROUND_WEIGHT_TIMEZONE", "PLAYGROUND_PAGE_IDLE_MS"];
+    const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    t.after(() => {
+        for (const key of keys) {
+            if (previous[key] === undefined) delete process.env[key];
+            else process.env[key] = previous[key];
+        }
+    });
+    process.env.MAX_CONTEXTS = "2";
+    process.env.PLAYGROUND_ENABLED = "true";
+    process.env.PLAYGROUND_WEIGHT_TIMEZONE = "Asia/Singapore";
+    process.env.PLAYGROUND_PAGE_IDLE_MS = "60000";
+    const config = new ConfigLoader(logger).loadConfiguration();
+    assert.equal(config.maxContexts, 0);
+    assert.equal(config.playgroundPageIdleMs, 60000);
+    assert.equal(config.playgroundWeightTimeZone, "Asia/Singapore");
+    process.env.PLAYGROUND_ENABLED = "false";
+    assert.equal(new ConfigLoader(logger).loadConfiguration().maxContexts, 2);
+    process.env.PLAYGROUND_WEIGHT_TIMEZONE = "invalid-zone";
+    assert.equal(new ConfigLoader(logger).loadConfiguration().playgroundWeightTimeZone, "Asia/Singapore");
+});
+
+test("Build cooldown cannot evict shared Playground account windows", async () => {
+    const source = makeSource();
+    const { pool, closed } = makePool(source, [0, 1], 0);
+    pool.config.playgroundEnabled = true;
+    source.markAccountCoolingDown(0, 60000, 429);
+    source.markAccountCoolingDown(1, 60000, 429);
+    await pool.rebalanceContextPool();
+    assert.deepEqual(closed, []);
+    assert.deepEqual([...pool.contexts.keys()], [0, 1]);
+});

@@ -127,7 +127,7 @@ class RequestHandler {
         };
     }
 
-    /** Playground shares cooldowns and browser capacity while keeping Build's usage/failure counters separate. */
+    /** Playground shares browser capacity; quota and retry state are per account/model. */
     forRequest(req) {
         const { channel, model, preset } = this._requestModel(req);
         if (channel !== "playground") return this;
@@ -141,6 +141,10 @@ class RequestHandler {
 
     _getUsageStatsService() {
         return this.serverSystem.usageStatsService || null;
+    }
+
+    async _acquireDispatchAuthIndex() {
+        return this._selectDispatchAuthIndex();
     }
 
     _getAccountNameForIndex(authIndex) {

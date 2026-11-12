@@ -203,7 +203,7 @@ test("queued Playground requests recheck a 429 before starting inference", async
             await new Promise(resolve => {
                 release = resolve;
             });
-            throw Object.assign(new Error("rate limited"), { status: 429 });
+            throw Object.assign(new Error("rate limited"), { status: 429, retryAfterMs: 60000 });
         }
         onData(`[[${chunk("unexpected", 1)}]]`);
     };
@@ -237,7 +237,7 @@ test("a queued Playground request for another model is not blocked by a 429", as
             await new Promise(resolve => {
                 release = resolve;
             });
-            throw Object.assign(new Error("rate limited"), { status: 429 });
+            throw Object.assign(new Error("rate limited"), { status: 429, retryAfterMs: 60000 });
         }
         onData(`[[${chunk("other model", 1)}]]`);
     };
@@ -285,7 +285,7 @@ test("an older concurrent Playground success cannot clear a newer 429 cooldown",
         onData(`[[${chunk("success", 1)}]]`);
     };
     secondSession._request = async () => {
-        throw Object.assign(new Error("rate limited"), { status: 429 });
+        throw Object.assign(new Error("rate limited"), { status: 429, retryAfterMs: 60000 });
     };
     h.router.sessions.set(h.context, firstSession);
     h.router.sessions.set(secondContext, secondSession);
@@ -326,7 +326,7 @@ test("an older concurrent Playground error cannot replace a newer 429 cooldown w
         throw Object.assign(new Error("temporary failure"), { status: 503 });
     };
     secondSession._request = async () => {
-        throw Object.assign(new Error("rate limited"), { status: 429 });
+        throw Object.assign(new Error("rate limited"), { status: 429, retryAfterMs: 60000 });
     };
     h.router.sessions.set(h.context, firstSession);
     h.router.sessions.set(secondContext, secondSession);
@@ -354,7 +354,7 @@ test("Playground rechecks cooldown before retrying a failed page reset", async (
         session.request("gemini-4-argon", body(), {
             beforeStart: () => {
                 checks++;
-                if (checks === 2) throw Object.assign(new Error("rate limited"), { status: 429 });
+                if (checks === 2) throw Object.assign(new Error("rate limited"), { status: 429, retryAfterMs: 60000 });
             },
             signal: new AbortController().signal,
         }),
@@ -363,7 +363,7 @@ test("Playground rechecks cooldown before retrying a failed page reset", async (
     assert.equal(attempts, 1);
 });
 
-test("#1 a timeout after dispatch still reports 504 and cools the account down", async t => {
+test("#1 a timeout after dispatch reports 504 without inferring quota exhaustion", async t => {
     const h = harness(t, { fakeStream: 30 });
     h.router.sessions.set(h.context, {
         request(_m, _b, { onStage, signal }) {
@@ -375,7 +375,7 @@ test("#1 a timeout after dispatch still reports 504 and cools the account down",
     h.router.forward(h.spec, 1);
     const error = (await drain(h.queue)).at(-1);
     assert.equal(error.status, 504);
-    assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
 });
 
 test("#2 an active real stream may outlive the total deadline while chunks keep arriving", async t => {
@@ -457,7 +457,7 @@ test("an upgrade dialog is treated as an account/model permission denial before 
     assert.match(error.message, /access verification.*Google AI plan or Gemini API key/i);
     assert.notEqual(error.retryable, false);
     assert.ok(Date.now() - startedAt < 2000, "do not wait for the 60-second submission timeout");
-    assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
+    assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
     assert.equal(h.router.cooldownUntil("gemini-3.8-flash", 1), 0);
     assert.equal(page.closed, true);
     assert.equal(state.payload, null, "the request must not reach inference");

@@ -87,7 +87,7 @@ async function fixture(t, { speech = false, upgrade = false, decoy = false } = {
             { contents: [{ parts: [{ text: "Hi" }], role: "user" }] },
             { onData() {}, signal: new AbortController().signal, timeoutMs: 5000 }
         );
-    return { counts, newPage, request, session };
+    return { context, counts, newPage, request, session };
 }
 
 browserTest("fixture reproduces a cookie overlay intercepting Run", async t => {
@@ -123,10 +123,11 @@ browserTest("cookie overlays cannot block speech dialog creation or Run", async 
 });
 
 browserTest("an asynchronously displayed upgrade dialog fails before inference", async t => {
-    const { counts, request, session } = await fixture(t, { upgrade: true });
+    const { context, counts, request, session } = await fixture(t, { upgrade: true });
     await assert.rejects(request(), error => error.status === 403 && /access verification/.test(error.message));
     assert.equal(counts.inferences, 0);
-    assert.equal(session.page.isClosed(), true);
+    assert.equal(context.pages().length, 0);
+    assert.equal(session.page, null, "closed pages must not remain retained by the session");
 });
 
 browserTest("upgrade wording outside the dialog does not block a normal request", async t => {

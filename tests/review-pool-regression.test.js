@@ -23,6 +23,29 @@ function makePool(count = 6, maxContexts = 4) {
     return { pool, source };
 }
 
+test("Playground preparation reserves its account before background preload can claim it", async () => {
+    const { pool } = makePool(3, 0);
+    pool.config.playgroundEnabled = true;
+    let release;
+    let initialized = 0;
+    pool._ensureBrowser = () =>
+        new Promise(resolve => {
+            release = resolve;
+        });
+    pool._initializeContext = async index => {
+        initialized++;
+        pool.contexts.set(index, {});
+        pool.initializingContexts.delete(index);
+    };
+    const foreground = pool.ensurePlaygroundContext(1);
+    await pool._executePreloadTask([1], 0);
+    assert.equal(initialized, 0, "background sees the foreground reservation");
+    release();
+    assert.equal((await foreground).success, true);
+    assert.equal(initialized, 1);
+    assert.equal(pool.initializingContexts.size, 0);
+});
+
 test("concurrent pool refills keep a single tracked initializer and abort waits for it", async () => {
     const { pool } = makePool();
     const releases = [];

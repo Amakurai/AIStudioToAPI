@@ -212,7 +212,7 @@ test("a tool request failing after preliminary text returns only the 503 and rem
     assert.equal(first.event_type, "error");
     assert.equal(first.status, 503);
     assert.notEqual(first.retryable, false);
-    assert.ok(h.router.isCoolingDown("gemini-4-argon", 1));
+    assert.equal(h.router.isCoolingDown("gemini-4-argon", 1), false);
 });
 
 test("native stream and buffered requests get Gemini output via the existing queue", async t => {
@@ -370,7 +370,7 @@ test("true streaming does not accumulate a second complete response", async t =>
 
 test("cooling Playground accounts fail quickly without dispatch or extending cooldown", async t => {
     const h = harness(t);
-    h.router.fail("gemini-4-argon", 1, 429);
+    h.router.fail("gemini-4-argon", 1, { status: 429, retryAfterMs: 60000 });
     const until = h.router.cooldownUntil("gemini-4-argon", 1);
     h.router.forward(h.spec, 1);
     assert.equal((await h.queue.dequeue()).status, 429);
@@ -378,12 +378,12 @@ test("cooling Playground accounts fail quickly without dispatch or extending coo
     assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), until);
 });
 
-test("Playground preserves the original 403 during cooldown", async t => {
+test("a generic Playground 403 leaves future requests eligible", async t => {
     const h = harness(t);
     h.router.fail("gemini-4-argon", 1, 403);
     h.router.forward(h.spec, 1);
-    assert.equal((await h.queue.dequeue()).status, 403);
-    assert.equal(h.calls(), 0);
+    assert.equal((await h.queue.dequeue()).status, 200);
+    assert.equal(h.calls(), 1);
 });
 
 test("Playground can retry a rate limit after metadata but before output", async t => {
@@ -400,7 +400,7 @@ test("Playground can retry a rate limit after metadata but before output", async
     const error = await h.queue.dequeue();
     assert.equal(error.status, 429);
     assert.notEqual(error.retryable, false);
-    assert.ok(h.router.isCoolingDown("gemini-4-argon", 1));
+    assert.equal(h.router.isCoolingDown("gemini-4-argon", 1), false);
 });
 
 test("first Playground permission failure can switch accounts, but committed streams cannot retry", async t => {
@@ -422,7 +422,7 @@ test("first Playground permission failure can switch accounts, but committed str
         const error = await h.queue.dequeue();
         assert.equal(error.status, 403);
         if (committed) assert.equal(error.retryable, false);
-        assert.ok(h.router.cooldownUntil("gemini-4-argon", 1) > Date.now());
+        assert.equal(h.router.cooldownUntil("gemini-4-argon", 1), 0);
         assert.equal(h.router.cooldownUntil("gemini-4-argon", 2), 0);
     }
 });

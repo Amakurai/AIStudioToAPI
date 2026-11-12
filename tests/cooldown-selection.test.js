@@ -50,35 +50,32 @@ function harness(t, names = ["a@example.com", "b@example.com"]) {
     return { browser, handler, registry, sent, server, source };
 }
 
-test("Playground cooldown excludes an account from both channels and every model, including duplicate logins", t => {
+test("confirmed Playground quota cooldown only excludes that model, including duplicate logins", t => {
     const h = harness(t, ["a@example.com", "b@example.com", "A@example.com"]);
-    h.handler.playground.fail("gemini-4-argon", 0, 403);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
     for (const index of [0, 2]) {
-        const cooldown = h.source.getAccountCooldown(index);
-        assert.equal(cooldown.status, 403);
-        assert.equal(cooldown.channel, "playground");
-        assert.equal(cooldown.model, "gemini-4-argon");
-        assert.ok(cooldown.remainingMs <= 60000 && cooldown.remainingMs > 0);
+        const cooldown = h.handler.playground.coolingDownError("gemini-4-argon", index);
+        assert.equal(cooldown.status, 429);
+        assert.ok(cooldown.retryAfterMs <= 60000 && cooldown.retryAfterMs > 0);
+        assert.equal(h.source.getAccountCooldown(index), null);
     }
     assert.deepEqual(h.source.expiredIndices, []);
-    assert.deepEqual(h.handler._getReadyAuthIndices(), [1]);
-    const pg = h.handler.forRequest({ body: { model: "pg-gemini-other" }, path: "/v1/chat/completions" });
-    for (let i = 0; i < 12; i++) {
-        assert.equal(h.handler._selectDispatchAuthIndex(), 1);
-        assert.equal(pg._selectDispatchAuthIndex(), 1);
-    }
+    assert.deepEqual(h.handler._getReadyAuthIndices(), [0, 1, 2]);
+    const pg = h.handler.forRequest({ body: { model: "pg-gemini-4-argon" }, path: "/v1/chat/completions" });
+    for (let i = 0; i < 12; i++) assert.equal(pg._selectDispatchAuthIndex(), 1);
+    const other = h.handler.forRequest({ body: { model: "pg-gemini-other" }, path: "/v1/chat/completions" });
+    assert.deepEqual(new Set([other._selectDispatchAuthIndex(), other._selectDispatchAuthIndex()]), new Set([0, 1]));
 });
 
-test("cooldown expiry makes the account eligible again without marking authentication expired", t => {
+test("model quota cooldown expiry restores eligibility without marking authentication expired", t => {
     let now = 1000;
     t.mock.method(Date, "now", () => now);
     const h = harness(t);
-    h.handler.playground.fail("gemini-4-argon", 0, 403);
-    assert.deepEqual(h.handler._getReadyAuthIndices(), [1]);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
     now += 59999;
-    assert.equal(h.source.getAccountCooldown(0).remainingMs, 1);
+    assert.equal(h.handler.playground.coolingDownError("gemini-4-argon", 0).retryAfterMs, 1);
     now++;
-    assert.equal(h.source.getAccountCooldown(0), null);
+    assert.equal(h.handler.playground.coolingDownError("gemini-4-argon", 0), null);
     assert.deepEqual(h.handler._getReadyAuthIndices(), [0, 1]);
     assert.equal(h.source.isExpired(0), false);
 });
@@ -126,8 +123,8 @@ test("Playground recovery preserves Build counters when the current account is c
     assert.equal(h.handler.authSwitcher.failureCount, 2);
 });
 
-test("an account cooled after concurrent selection is blocked immediately before forwarding", async t => {
-    for (const channel of ["build", "playground"]) {
+test("a Build account cooled after concurrent selection is blocked immediately before forwarding", async t => {
+    for (const channel of ["build"]) {
         for (const antiTruncation of [false, true]) {
             await t.test(`${channel} antiTruncation=${antiTruncation}`, async t => {
                 const h = harness(t);
@@ -157,7 +154,7 @@ test("an account cooled after concurrent selection is blocked immediately before
     }
 });
 
-test("queued Playground work rechecks a global cooldown before inference, without extending it", async t => {
+test("queued Playground work rechecks its model cooldown before inference, without extending it", async t => {
     const h = harness(t);
     let release;
     let queued;
@@ -186,20 +183,21 @@ test("queued Playground work rechecks a global cooldown before inference, withou
     const queue = h.registry.createMessageQueue(spec.request_id, 0, spec.request_attempt_id);
     h.handler.playground.forward(spec, 0);
     await entered;
-    h.source.markAccountCoolingDown(0, 60000, 403, { channel: "playground", model: "gemini-4-argon" });
-    const until = h.source.getAccountCooldown(0).until;
+    h.handler.playground.fail("gemini-other", 0, { status: 429, retryAfterMs: 60000 });
+    const until = h.handler.playground.cooldownUntil("gemini-other", 0);
     release();
     const error = await queue.dequeue(1000);
-    assert.equal(error.status, 403);
+    assert.equal(error.status, 429);
     assert.equal(error.coolingDown, true);
     assert.equal(inferences, 0);
-    assert.equal(h.source.getAccountCooldown(0).until, until);
+    assert.equal(h.handler.playground.cooldownUntil("gemini-other", 0), until);
     h.registry.removeMessageQueue(spec.request_id);
 });
 
 test("status reports cooldown deadlines and never labels a cooling account current or dispatchable", t => {
     const h = harness(t);
-    h.handler.playground.fail("gemini-4-argon", 0, 403);
+    h.handler.config.playgroundEnabled = false;
+    h.source.markAccountCoolingDown(0, 60000, 403);
     h.handler.channelModels = () => ({ build: [], playground: [] });
     const routes = new StatusRoutes(h.server);
     const result = routes._getStatusData();
@@ -209,4 +207,25 @@ test("status reports cooldown deadlines and never labels a cooling account curre
     assert.equal(cooling.cooldown.status, 403);
     assert.ok(cooling.cooldown.until > result.serverTime);
     assert.equal(result.status.accountDetails.find(account => account.index === 1).isReady, true);
+});
+
+test("status exposes per-model quota without disabling an account for other models", t => {
+    const h = harness(t);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
+    const result = new StatusRoutes(h.server)._getStatusData();
+    const account = result.status.accountDetails.find(item => item.index === 0);
+    assert.equal(account.isReady, true);
+    assert.equal(account.cooldown, null);
+    assert.equal(account.modelQuotas.find(model => model.model === "gemini-4-argon").cooldown.status, 429);
+});
+
+test("Playground status does not present a Build-only restriction as an account-wide cooldown", t => {
+    const h = harness(t);
+    h.source.markAccountCoolingDown(0, 60000, 429);
+    const result = new StatusRoutes(h.server)._getStatusData();
+    const account = result.status.accountDetails.find(item => item.index === 0);
+    assert.equal(account.isReady, true);
+    assert.equal(account.cooldown, null);
+    assert.equal(account.buildCooldown.status, 429);
+    assert.equal(result.status.currentAuthIndex, 0);
 });

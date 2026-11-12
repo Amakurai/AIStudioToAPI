@@ -65,9 +65,13 @@ class ConfigLoader {
             host: "0.0.0.0",
             httpPort: 7860,
             immediateSwitchStatusCodes: [429, 503],
-            maxContexts: 1,
+            maxContexts: 0,
             maxRetries: 3,
             playgroundEnabled: true,
+            playgroundPageIdleMs: 60000,
+            playgroundRetryBudgetMs: 180000,
+            playgroundRetryRounds: 3,
+            playgroundWeightTimeZone: "Asia/Singapore",
             rateLimitCooldownMs: 60000,
             retryDelay: 2000,
             safetySettingsThreshold: "OFF",
@@ -111,6 +115,13 @@ class ConfigLoader {
             const parsed = parseInt(process.env.RETRY_DELAY, 10);
             config.retryDelay = Number.isFinite(parsed) ? Math.max(50, parsed) : config.retryDelay;
         }
+        for (const [env, key, maximum] of [
+            ["PLAYGROUND_RETRY_ROUNDS", "playgroundRetryRounds", 10],
+            ["PLAYGROUND_RETRY_BUDGET_MS", "playgroundRetryBudgetMs", 1800000],
+        ]) {
+            const value = Number(process.env[env]);
+            if (Number.isFinite(value) && value > 0) config[key] = Math.min(maximum, Math.max(1, Math.floor(value)));
+        }
         if (process.env.RATE_LIMIT_COOLDOWN_MS) {
             const parsed = parseInt(process.env.RATE_LIMIT_COOLDOWN_MS, 10);
             config.rateLimitCooldownMs = Number.isFinite(parsed) && parsed > 0 ? parsed : config.rateLimitCooldownMs;
@@ -148,6 +159,21 @@ class ConfigLoader {
         if (process.env.MAX_CONTEXTS) {
             const parsed = parseInt(process.env.MAX_CONTEXTS, 10);
             config.maxContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.maxContexts;
+        }
+        // Playground owns one lane per distinct account; legacy pool limits only apply in Build-only mode.
+        if (config.playgroundEnabled) config.maxContexts = 0;
+        if (process.env.PLAYGROUND_PAGE_IDLE_MS) {
+            const parsed = Number(process.env.PLAYGROUND_PAGE_IDLE_MS);
+            if (Number.isFinite(parsed) && parsed >= 1000)
+                config.playgroundPageIdleMs = Math.min(3600000, Math.floor(parsed));
+        }
+        if (process.env.PLAYGROUND_WEIGHT_TIMEZONE) {
+            try {
+                new Intl.DateTimeFormat("en", { timeZone: process.env.PLAYGROUND_WEIGHT_TIMEZONE });
+                config.playgroundWeightTimeZone = process.env.PLAYGROUND_WEIGHT_TIMEZONE;
+            } catch {
+                this.logger.warn("[Config] Invalid PLAYGROUND_WEIGHT_TIMEZONE; using Asia/Singapore.");
+            }
         }
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {

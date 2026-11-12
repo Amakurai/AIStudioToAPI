@@ -128,7 +128,7 @@ class DuplexOpenAI {
             } finally {
                 res.removeListener("close", onWaitingClose);
             }
-            const authIndex = handler._selectDispatchAuthIndex();
+            const authIndex = await handler._acquireDispatchAuthIndex(requestId, res);
             const spec = {
                 anti_truncation_mode: "tool",
                 anti_truncation_output: output,

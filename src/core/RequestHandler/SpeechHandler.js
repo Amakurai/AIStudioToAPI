@@ -170,7 +170,7 @@ class SpeechHandler extends RetryHandler {
             try {
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this._selectDispatchAuthIndex(),
+                    await this._acquireDispatchAuthIndex(requestId, res),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);

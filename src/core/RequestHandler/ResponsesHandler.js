@@ -123,7 +123,7 @@ class ResponsesHandler extends RetryHandler {
             try {
                 // Dispatch to the least-loaded ready account (falls back to currentAuthIndex)
                 // Create message queue inside try-catch to handle invalid authIndex
-                const dispatchAuthIndex = this._selectDispatchAuthIndex();
+                const dispatchAuthIndex = await this._acquireDispatchAuthIndex(requestId, res);
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
                     dispatchAuthIndex,

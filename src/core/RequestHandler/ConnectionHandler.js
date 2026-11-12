@@ -10,6 +10,7 @@ const { WS_RECONNECT_WAIT_MS, WS_CONNECTION_READY_TIMEOUT_MS } = require("./cons
 
 class ConnectionHandler extends ErrorHandler {
     _cleanupRequestResources(requestId, res, { switchAccountIfNeeded = false } = {}) {
+        this.playground?.scheduler?.release(requestId);
         this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
 
         if (switchAccountIfNeeded && this.needsSwitchingAfterRequest) {
@@ -460,7 +461,7 @@ class ConnectionHandler extends ErrorHandler {
         );
     }
 
-    _getReadyAuthIndices() {
+    _getReadyAuthIndices({ ignoreAccountCooldown = false } = {}) {
         const readyIndices = [];
         if (!this.browserManager?.contexts) {
             return readyIndices;
@@ -471,7 +472,7 @@ class ConnectionHandler extends ErrorHandler {
                 !this.authSource.availableIndices.includes(authIndex)
             )
                 continue;
-            if (this.authSource.isAccountCoolingDown?.(authIndex)) continue;
+            if (!ignoreAccountCooldown && this.authSource.isAccountCoolingDown?.(authIndex)) continue;
             if (this.browserManager.initializingContexts.has(authIndex)) {
                 continue;
             }

@@ -8,42 +8,87 @@ const cancelled = () => Object.assign(new Error("Playground request cancelled"),
 
 /** Uses an existing BrowserManager context. No cookie import, extraction, or second login. */
 class PlaygroundSession {
-    constructor(context, onModels) {
+    constructor(context, onModels, { idleMs = 60000 } = {}) {
         this.context = context;
         this.onModels = onModels;
         this.page = null;
         this.pending = Promise.resolve();
+        this.pendingCount = 0;
+        this.idleMs = idleMs;
+        this.idleTimer = null;
+        context.once?.("close", () => {
+            clearTimeout(this.idleTimer);
+            this.page = null;
+        });
+    }
+
+    _scheduleIdleClose() {
+        if (this.pendingCount || !this.page) return;
+        if (this.page.isClosed()) {
+            this.page = null;
+            return;
+        }
+        clearTimeout(this.idleTimer);
+        this.idleTimer = setTimeout(() => {
+            if (this.pendingCount) return;
+            const page = this.page;
+            this.page = null;
+            this.pageModel = null;
+            // Release the heavy Studio UI while retaining this account's authenticated context.
+            void page?.close().catch(() => {});
+        }, this.idleMs);
+        this.idleTimer.unref?.();
     }
 
     async request(model, body, { signal, onData, timeoutMs, onStage = () => {}, beforeStart, onFailure }) {
         // Each account has one temporary UI used to obtain fresh native request credentials.
         // Separate account contexts remain independent and can run concurrently.
         if (signal.aborted) throw cancelled();
+        clearTimeout(this.idleTimer);
+        this.pendingCount++;
         onStage("queued");
-        const run = this.pending.then(async () => {
-            if (signal.aborted) throw cancelled();
-            try {
-                beforeStart?.();
+        let running = false;
+        const run = this.pending
+            .then(async () => {
+                if (signal.aborted) throw cancelled();
+                running = true;
                 try {
-                    return await this._request(model, body, { onData, onStage, signal, timeoutMs });
-                } catch (error) {
-                    if (error.resetFailed && !signal.aborted) {
-                        beforeStart?.();
+                    beforeStart?.();
+                    try {
                         return await this._request(model, body, { onData, onStage, signal, timeoutMs });
+                    } catch (error) {
+                        if (error.resetFailed && !signal.aborted) {
+                            beforeStart?.();
+                            return await this._request(model, body, { onData, onStage, signal, timeoutMs });
+                        }
+                        throw error;
                     }
+                } catch (error) {
+                    onFailure?.(error);
                     throw error;
                 }
-            } catch (error) {
-                onFailure?.(error);
-                throw error;
-            }
-        });
+            })
+            .finally(() => {
+                this.pendingCount--;
+                this._scheduleIdleClose();
+            });
         // Keep the account lock until the active operation has actually stopped, even if
         // its caller has cancelled. A cancelled waiter must never open a page later.
         this.pending = run.catch(() => {});
         let abort;
         const interrupted = new Promise((_, reject) => {
-            abort = () => reject(cancelled());
+            abort = () => {
+                // A cancelled waiter can sit behind a long generation. Release its large payload
+                // and callbacks immediately instead of retaining them until the queue reaches it.
+                if (!running) {
+                    body = null;
+                    onData = null;
+                    beforeStart = null;
+                    onFailure = null;
+                    onStage = () => {};
+                }
+                reject(cancelled());
+            };
             signal.addEventListener("abort", abort, { once: true });
         });
         try {
@@ -243,7 +288,13 @@ class PlaygroundSession {
                     } catch (error) {
                         return { done: true, error: String(error?.message || error), status: 0 };
                     }
-                    if (!response.ok) return { done: true, error: await response.text(), status: response.status };
+                    if (!response.ok)
+                        return {
+                            done: true,
+                            error: await response.text(),
+                            retryAfter: response.headers.get("retry-after"),
+                            status: response.status,
+                        };
                     window.__gatewayStream = { decoder: new TextDecoder(), reader: response.body.getReader() };
                     return { done: false, status: response.status };
                 },
@@ -282,7 +333,7 @@ class PlaygroundSession {
                 // Include server error, never headers, cookies, snapshots or the request body.
                 throw Object.assign(
                     new Error(`Playground HTTP ${result.status}: ${String(result.error).slice(0, 1500)}`),
-                    { status: result.status }
+                    { retryAfter: result.retryAfter, status: result.status }
                 );
             }
             onStage("complete");
@@ -322,7 +373,7 @@ class PlaygroundSession {
                             new Error(
                                 "Playground page requested account access verification (Google AI plan or Gemini API key dialog)."
                             ),
-                            { status: 403 }
+                            { accessDenied: true, status: 403 }
                         )
                     );
                 } else {

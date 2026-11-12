@@ -965,6 +965,51 @@
                             </div>
                         </div>
                     </div>
+                    <div class="status-card model-quota-card">
+                        <h3 class="card-title">{{ t("modelQuotaTitle") }}</h3>
+                        <p class="quota-explanation">{{ t("modelQuotaHelp") }}</p>
+                        <p class="quota-explanation">{{ t("modelWeightHelp", { zone: state.weightTimeZone }) }}</p>
+                        <select v-model="quotaModelFilter" :aria-label="t('modelQuotaFilter')" class="quota-filter">
+                            <option value="">{{ t("modelQuotaAll") }}</option>
+                            <option v-for="model in quotaModels" :key="model" :value="model">{{ model }}</option>
+                        </select>
+                        <div class="quota-table-scroll">
+                            <table class="quota-table">
+                                <thead>
+                                    <tr>
+                                        <th>{{ t("modelQuotaAccount") }}</th>
+                                        <th>{{ t("modelQuotaModel") }}</th>
+                                        <th>{{ t("modelWeight") }}</th>
+                                        <th>{{ t("modelQuotaUsage") }}</th>
+                                        <th>{{ t("modelQuotaTokens") }}</th>
+                                        <th>{{ t("modelQuotaObserved") }}</th>
+                                        <th>{{ t("modelQuotaStatus") }}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="row in quotaRows" :key="`${row.index}:${row.model}`">
+                                        <td :title="row.name" :data-label="t('modelQuotaAccount')">#{{ row.index }}</td>
+                                        <td :data-label="t('modelQuotaModel')">{{ row.model }}</td>
+                                        <td :data-label="t('modelWeight')">{{ row.scheduling?.weight ?? 100 }}</td>
+                                        <td :data-label="t('modelQuotaUsage')">{{ row.requests24h }}</td>
+                                        <td :data-label="t('modelQuotaTokens')">
+                                            {{ row.tokens24h.toLocaleString() }}
+                                        </td>
+                                        <td :data-label="t('modelQuotaObserved')">
+                                            {{ row.observedBeforeLimit ?? t("modelQuotaUnknown") }}
+                                        </td>
+                                        <td :data-label="t('modelQuotaStatus')">
+                                            <span v-if="isAccountCoolingDown(row)" class="cooldown-badge">
+                                                {{ t(row.cooldown.resetKnown ? "modelQuotaWait" : "modelQuotaProbe") }}
+                                                {{ formatAccountCooldown(row) }}
+                                            </span>
+                                            <span v-else>{{ quotaStatus(row) }}</span>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -1637,8 +1682,12 @@
                                         <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
                                     </svg>
                                     <span>
-                                        {{ t("maxContexts") }}
-                                        <EnvVarTooltip env-var="MAX_CONTEXTS" doc-section="proxy-config" />
+                                        {{ t(state.automaticAccountPool ? "accountConcurrency" : "maxContexts") }}
+                                        <EnvVarTooltip
+                                            v-if="!state.automaticAccountPool"
+                                            env-var="MAX_CONTEXTS"
+                                            doc-section="proxy-config"
+                                        />
                                         <span
                                             style="
                                                 font-size: 0.8em;
@@ -1646,11 +1695,19 @@
                                                 font-weight: normal;
                                                 margin-left: 4px;
                                             "
-                                            >({{ t("maxContextsHint") }})</span
+                                            >({{
+                                                t(
+                                                    state.automaticAccountPool
+                                                        ? "accountConcurrencyHint"
+                                                        : "maxContextsHint"
+                                                )
+                                            }})</span
                                         >
                                     </span>
                                 </span>
+                                <span v-if="state.automaticAccountPool">{{ state.accountConcurrency }}</span>
                                 <el-input-number
+                                    v-else
                                     v-model="state.maxContexts"
                                     :min="0"
                                     :step="1"
@@ -3052,6 +3109,29 @@ const formatAccountCooldown = account => {
     const rest = String(seconds % 60).padStart(2, "0");
     return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
 };
+const quotaModelFilter = ref("");
+const quotaModels = computed(() =>
+    [
+        ...new Set(
+            (state.accountDetails || []).flatMap(account => (account.modelQuotas || []).map(quota => quota.model))
+        ),
+    ].sort()
+);
+const quotaRows = computed(() =>
+    (state.accountDetails || [])
+        .filter(account => !account.isDuplicate && !account.isInvalid)
+        .flatMap(account =>
+            (account.modelQuotas || [])
+                .filter(quota => !quotaModelFilter.value || quota.model === quotaModelFilter.value)
+                .map(quota => ({ ...quota, index: account.index, isExpired: account.isExpired, name: account.name }))
+        )
+);
+const quotaStatus = row => {
+    if (row.isExpired || row.lastStatus === 401) return t("modelQuotaLogin");
+    if (row.lastStatus && row.lastStatus !== 200) return t("modelQuotaLastError", { status: row.lastStatus });
+    return t(row.attempts ? "modelQuotaAvailable" : "modelQuotaUnobserved");
+};
+
 const accountCooldownTitle = account =>
     t("accountCooldownDetail", {
         channel: account.cooldown?.channel === "playground" ? "Playground" : "Build",
@@ -3958,9 +4038,11 @@ const switchTab = tabName => {
 const { theme, setTheme } = useTheme();
 
 const state = reactive({
+    accountConcurrency: 0,
     accountDetails: [],
     activeContextsCount: 0,
     apiKeySource: "",
+    automaticAccountPool: true,
     browserConnected: false,
     checkUpdateEnabled: true,
     currentAuthIndex: -1,
@@ -3982,7 +4064,7 @@ const state = reactive({
     logMaxCount: 100,
     logs: t("loading"),
     logScrollTop: 0,
-    maxContexts: 1,
+    maxContexts: 0,
     maxRetries: 3,
     modelChannels: { build: [], playground: [] },
     releaseUrl: null,
@@ -4089,7 +4171,7 @@ const dedupedAvailableCount = computed(() => {
 const activeContextsDisplay = computed(() => {
     const active = state.activeContextsCount;
     const max = state.maxContexts;
-    return max === 0 ? `${active} / ∞` : `${active} / ${max}`;
+    return `${active} / ${state.automaticAccountPool || max === 0 ? state.accountConcurrency : max}`;
 });
 
 const isBusy = computed(() => state.isSwitchingAccount || state.isSystemBusy);
@@ -4800,7 +4882,10 @@ const updateStatus = data => {
     cooldownNow.value = Date.now() + cooldownClockOffset;
     state.accountDetails = data.status.accountDetails || [];
     state.activeContextsCount = data.status.activeContextsCount || 0;
-    state.maxContexts = data.status.maxContexts ?? 1;
+    state.accountConcurrency = data.status.accountConcurrency ?? dedupedAvailableCount.value;
+    state.automaticAccountPool = data.status.automaticAccountPool !== false;
+    state.weightTimeZone = data.status.weightTimeZone || "Asia/Singapore";
+    state.maxContexts = data.status.maxContexts ?? 0;
     state.maxRetries = data.status.maxRetries ?? 3;
     state.modelChannels = data.status.modelChannels || { build: [], playground: [] };
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
@@ -7647,5 +7732,79 @@ watchEffect(() => {
     width: 28px;
     height: 28px;
     border-radius: 4px;
+}
+
+.model-quota-card {
+    grid-column: 1 / -1;
+}
+.quota-explanation {
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.6;
+}
+.quota-filter {
+    max-width: 100%;
+    margin: 8px 0 16px;
+    padding: 8px;
+    color: inherit;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+.quota-table-scroll {
+    max-height: 420px;
+    overflow: auto;
+}
+.quota-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.quota-table th,
+.quota-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-color);
+    text-align: left;
+    white-space: nowrap;
+}
+.quota-table th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-secondary);
+}
+
+@media (max-width: 600px) {
+    .quota-table thead {
+        display: none;
+    }
+    .quota-table tbody {
+        display: block;
+    }
+    .quota-table tr {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-bottom: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+    }
+    .quota-table td {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        border: none;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+    .quota-table td::before {
+        content: attr(data-label);
+        color: var(--text-secondary);
+        font-size: 11px;
+    }
+    .quota-table td:last-child {
+        grid-column: 1 / -1;
+    }
+    .quota-table .cooldown-badge {
+        align-self: flex-start;
+    }
 }
 </style>

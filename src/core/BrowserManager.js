@@ -124,6 +124,49 @@ class BrowserManager {
         };
     }
 
+    _isPoolAccountCoolingDown(index) {
+        // A Build limit cannot close the shared context needed by other Playground models.
+        return !this.config.playgroundEnabled && !!this.authSource.isAccountCoolingDown?.(index);
+    }
+
+    _getPoolRotationIndices() {
+        return this.config.playgroundEnabled
+            ? this.authSource.getRotationIndices()
+            : this.authSource.getAvailableRotationIndices();
+    }
+
+    async ensurePlaygroundContext(index) {
+        try {
+            if (this.initializingContexts.has(index)) await this._waitForContextInit(index);
+            if (!this.authSource.getRotationIndices().includes(index)) return { success: false };
+            const existing = this.contexts.get(index);
+            if (existing && (!existing.page || existing.page.isClosed())) {
+                // The Build page can close while a separate Playground page is still busy.
+                // Recover an idle context, but never destroy another active generation.
+                if (this._hasActiveQueueForAuth(index)) return { success: false };
+                await this.closeContext(index);
+                if (this.initializingContexts.has(index)) await this._waitForContextInit(index);
+                if (!this.authSource.getRotationIndices().includes(index)) return { success: false };
+            }
+            if (!this.contexts.has(index)) {
+                // Reserve before yielding so background preload cannot create a second context.
+                this.initializingContexts.add(index);
+                try {
+                    await this._ensureBrowser();
+                    this._throwIfContextInitAborted(index);
+                    await this._initializeContext(index);
+                } finally {
+                    this.initializingContexts.delete(index);
+                }
+            }
+            this._cancelPendingContextClosure(index, "playground_dispatch");
+            return { success: true };
+        } catch (error) {
+            this.logger.warn(`[Playground] Account #${index} preparation failed: ${error.message}`);
+            return { success: false };
+        }
+    }
+
     get currentAuthIndex() {
         return this._currentAuthIndex;
     }
@@ -218,7 +261,7 @@ class BrowserManager {
     }
 
     _throwIfContextInitAborted(authIndex, isBackgroundTask = false, logPrefix = null, action = "Context init") {
-        if (isBackgroundTask && this.authSource.isAccountCoolingDown(authIndex)) {
+        if (isBackgroundTask && this._isPoolAccountCoolingDown(authIndex)) {
             throw new ContextAbortedError(authIndex, "account is cooling down");
         }
         if (this.abortedContexts.has(authIndex)) {
@@ -781,7 +824,7 @@ class BrowserManager {
      * @param {number} authIndex - The auth index being activated
      */
     _activateContext(ctx, pg, authIndex) {
-        if (this.authSource.isAccountCoolingDown?.(authIndex)) {
+        if (this._isPoolAccountCoolingDown(authIndex)) {
             throw new ContextAbortedError(authIndex, "account is cooling down");
         }
         this.context = ctx;
@@ -1407,7 +1450,7 @@ class BrowserManager {
      * @returns {Promise<{firstReady: number|null}>}
      */
     async preloadContextPool(startupOrder, maxContexts) {
-        startupOrder = startupOrder.filter(index => !this.authSource.isAccountCoolingDown(index));
+        startupOrder = startupOrder.filter(index => !this._isPoolAccountCoolingDown(index));
         const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
         this.logger.info(
             `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${startupOrder.join(", ")}])...`
@@ -1426,7 +1469,7 @@ class BrowserManager {
 
         for (let i = 0; i < startupOrder.length; i++) {
             const authIndex = startupOrder[i];
-            if (this.authSource.isAccountCoolingDown(authIndex)) continue;
+            if (this._isPoolAccountCoolingDown(authIndex)) continue;
 
             // If already initialized, use it directly
             if (this.contexts.has(authIndex)) {
@@ -1439,7 +1482,7 @@ class BrowserManager {
             if (this.initializingContexts.has(authIndex)) {
                 this.logger.info(`[ContextPool] Context #${authIndex} being initialized, waiting...`);
                 await this._waitForContextInit(authIndex);
-                if (this.authSource.isAccountCoolingDown(authIndex)) continue;
+                if (this._isPoolAccountCoolingDown(authIndex)) continue;
                 if (this.contexts.has(authIndex)) {
                     this.logger.info(`[ContextPool] Context #${authIndex} initialized successfully, reusing`);
                     firstReady = authIndex;
@@ -1453,7 +1496,7 @@ class BrowserManager {
             try {
                 this.logger.info(`[ContextPool] Initializing context #${authIndex}...`);
                 await this._initializeContext(authIndex);
-                if (this.authSource.isAccountCoolingDown(authIndex)) {
+                if (this._isPoolAccountCoolingDown(authIndex)) {
                     await this._closeContextForPoolIfPossible(authIndex, "startup_account_cooling_down");
                     continue;
                 }
@@ -1480,7 +1523,7 @@ class BrowserManager {
 
         // Background: calculate remaining contexts using rotation order (same logic as rebalanceContextPool)
         // This ensures startup pool matches the rotation order used during account switching
-        const rotation = this.authSource.getAvailableRotationIndices();
+        const rotation = this._getPoolRotationIndices();
         const currentCanonical = this.authSource.getCanonicalIndex(firstReady);
         const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
         const ordered = [];
@@ -1518,7 +1561,17 @@ class BrowserManager {
      */
     async _ensureBrowser() {
         if (this.browser) return;
+        // Account windows may prepare concurrently, but must share one browser process.
+        this._browserLaunchTask ||= this._launchBrowser();
+        const task = this._browserLaunchTask;
+        try {
+            await task;
+        } finally {
+            if (this._browserLaunchTask === task) this._browserLaunchTask = null;
+        }
+    }
 
+    async _launchBrowser() {
         const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
         const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
         if (isStickyProxyEnabled) {
@@ -1623,7 +1676,7 @@ class BrowserManager {
         // Keep in-flight work alive while loading replacements, with a strict 2x ceiling.
         // Only cooling, retired contexts borrow this temporary draining allowance.
         const draining = [...occupied].filter(
-            index => this.pendingContextClosures.has(index) && this.authSource.isAccountCoolingDown(index)
+            index => this.pendingContextClosures.has(index) && this._isPoolAccountCoolingDown(index)
         ).length;
         return occupied.size - draining < maxPoolSize && occupied.size < maxPoolSize * 2;
     }
@@ -1669,7 +1722,7 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex && !this.authSource.isAccountCoolingDown(authIndex)) {
+        if (authIndex === this._currentAuthIndex && !this._isPoolAccountCoolingDown(authIndex)) {
             this.logger.debug(
                 `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
             );
@@ -1743,7 +1796,7 @@ class BrowserManager {
                 break;
             }
 
-            if (this.authSource.isAccountCoolingDown(authIndex)) continue;
+            if (this._isPoolAccountCoolingDown(authIndex)) continue;
 
             // Check if browser is available, launch if needed
             if (!this.browser) {
@@ -1866,7 +1919,7 @@ class BrowserManager {
         // Priority 2: Expired accounts (not the target if target is expired)
         // Priority 3: Accounts in rotation, ordered by distance from target (farthest first)
 
-        const rotation = this.authSource.getAvailableRotationIndices();
+        const rotation = this._getPoolRotationIndices();
         const targetCanonical = this.authSource.getCanonicalIndex(targetAuthIndex);
         const duplicateGroups = this.authSource.getDuplicateGroups();
         const expiredIndices = this.authSource.expiredIndices || [];
@@ -1912,7 +1965,7 @@ class BrowserManager {
 
         // Cooling accounts should leave the dispatch pool as soon as their queues drain.
         for (const idx of allContextIndices) {
-            if (idx !== targetAuthIndex && this.authSource.isAccountCoolingDown(idx)) {
+            if (idx !== targetAuthIndex && this._isPoolAccountCoolingDown(idx)) {
                 removalPriority.push(idx);
             }
         }
@@ -2012,11 +2065,11 @@ class BrowserManager {
         const isUnlimited = maxContexts === 0;
 
         // Build full rotation ordered from current account
-        const rotation = this.authSource.getAvailableRotationIndices();
+        const rotation = this._getPoolRotationIndices();
         const startingAuthIndex = this._currentAuthIndex;
         const snapshotIsCurrent = () => {
             if (this.config.maxContexts !== maxContexts || this._currentAuthIndex !== startingAuthIndex) return false;
-            const available = this.authSource.getAvailableRotationIndices();
+            const available = this._getPoolRotationIndices();
             return (
                 available.length === rotation.length &&
                 available.every((index, position) => index === rotation[position])
@@ -2036,7 +2089,7 @@ class BrowserManager {
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
             const nonExpiredAvailable = this.authSource.availableIndices.filter(
-                idx => !this.authSource.isExpired(idx) && !this.authSource.isAccountCoolingDown(idx)
+                idx => !this.authSource.isExpired(idx) && !this._isPoolAccountCoolingDown(idx)
             );
             targets = new Set(nonExpiredAvailable);
         } else {
@@ -2058,7 +2111,7 @@ class BrowserManager {
             currentCanonicalIndex !== this._currentAuthIndex;
 
         for (const idx of this.contexts.keys()) {
-            if (idx === this._currentAuthIndex && !this.authSource.isAccountCoolingDown(idx)) continue;
+            if (idx === this._currentAuthIndex && !this._isPoolAccountCoolingDown(idx)) continue;
 
             // If current is a duplicate AND we're in limited mode, remove the canonical version (we're using the old one)
             if (!isUnlimited && isDuplicateAccount && idx === currentCanonicalIndex) {
@@ -2830,6 +2883,8 @@ class BrowserManager {
         // Set flag to indicate intentional close - prevents ConnectionRegistry from
         // attempting lightweight reconnect when WebSocket disconnects
         this.isClosingIntentionally = true;
+        // A launch already in progress must not create an orphan after shutdown finishes.
+        if (this._browserLaunchTask) await this._browserLaunchTask.catch(() => {});
 
         // Legacy single health monitor cleanup (for backward compatibility)
         if (this.healthMonitorInterval) {

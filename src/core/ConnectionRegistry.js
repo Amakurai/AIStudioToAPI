@@ -93,10 +93,9 @@ class ConnectionRegistry extends EventEmitter {
             this.logger.debug(`[Server] Cleared lightweight reconnect timeout for reconnected authIndex=${authIndex}`);
         }
 
-        // Clear message queues for the reconnecting account.
-        // When WebSocket disconnects, the browser aborts all in-flight requests for that account.
-        // Keeping those queues would cause them to hang until timeout.
-        this.closeMessageQueuesForAuth(authIndex, "reconnect_cleanup");
+        // Only Build uses this WebSocket. Playground runs in a separate page and must
+        // survive a Build reconnect; closing the shared context still cancels both.
+        this.closeMessageQueuesForAuth(authIndex, "reconnect_cleanup", { channel: "build" });
 
         // Store connection by authIndex
         this.connectionsByAuth.set(authIndex, websocket);
@@ -157,7 +156,7 @@ class ConnectionRegistry extends EventEmitter {
                 }
                 // Close pending message queues for this account to prevent in-flight requests
                 // from hanging until timeout
-                this.closeMessageQueuesForAuth(disconnectedAuthIndex, "page_closed");
+                this.closeMessageQueuesForAuth(disconnectedAuthIndex, "page_closed", { channel: "build" });
                 // Emit event after all cleanup is done
                 this.emit("connectionRemoved", websocket);
                 return;
@@ -180,7 +179,7 @@ class ConnectionRegistry extends EventEmitter {
             // Close queues belonging to the disconnected account.
             // Since queues are now bound to authIndex, this is safe even if the current account
             // has since switched — only account #disconnectedAuthIndex's queues are affected.
-            this.closeMessageQueuesForAuth(disconnectedAuthIndex, "grace_period_timeout");
+            this.closeMessageQueuesForAuth(disconnectedAuthIndex, "grace_period_timeout", { channel: "build" });
 
             // Attempt lightweight reconnect if callback is provided and this account is not already reconnecting
             const isAccountReconnecting = this.reconnectingAccounts.get(disconnectedAuthIndex) || false;
@@ -551,11 +550,13 @@ class ConnectionRegistry extends EventEmitter {
      * Close all message queues belonging to a specific account
      * @param {number} authIndex - The account whose queues should be closed
      * @param {string} [reason="auth_context_closed"] - The reason for closing the queues (e.g., "reconnect_cleanup", "page_closed", "grace_period_timeout")
+     * @param {Object} [options] - Optional channel filter; omitted when the account context itself closes
      * @returns {number} Number of queues closed
      */
-    closeMessageQueuesForAuth(authIndex, reason = "auth_context_closed") {
+    closeMessageQueuesForAuth(authIndex, reason = "auth_context_closed", { channel } = {}) {
         let count = 0;
         for (const [requestId, entry] of this.messageQueues.entries()) {
+            if (channel && (entry.channel || "build") !== channel) continue;
             if (entry.authIndex === authIndex) {
                 try {
                     entry.queue.close(reason);

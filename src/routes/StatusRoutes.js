@@ -819,6 +819,10 @@ class StatusRoutes {
             if (!Number.isInteger(newValue) || newValue < 0) {
                 return res.status(400).json({ error: "Invalid max contexts value", message: "settingFailed" });
             }
+            if (this.config.playgroundEnabled && newValue !== 0)
+                return res
+                    .status(400)
+                    .json({ error: "Playground concurrency follows the account count.", message: "settingFailed" });
 
             this.config.maxContexts = newValue;
             this.logger.info(`[WebUI] Max contexts updated to: ${newValue === 0 ? "unlimited" : newValue}`);
@@ -1028,7 +1032,9 @@ class StatusRoutes {
         const allLogs = this.logger.logBuffer || [];
         const displayLogs = allLogs.slice(-limit);
         const accountNameMap = authSource.accountNameMap;
-        const readyIndexSet = new Set(requestHandler._getReadyAuthIndices());
+        const readyIndexSet = new Set(
+            requestHandler._getReadyAuthIndices({ ignoreAccountCooldown: config.playgroundEnabled === true })
+        );
         const connectionRegistry = this.serverSystem.connectionRegistry;
         const accountDetails = initialIndices.map(index => {
             const isInvalid = invalidIndices.includes(index);
@@ -1040,12 +1046,14 @@ class StatusRoutes {
             const isExpired = expiredIndices.includes(index);
 
             const hasContext = browserManager.contexts.has(index);
-            const cooldown = authSource.getAccountCooldown?.(index) || null;
+            const buildCooldown = authSource.getAccountCooldown?.(index) || null;
+            const cooldown = config.playgroundEnabled ? null : buildCooldown;
             // Multi-account dispatch status: ready = can serve dispatched requests right now
             const isReady = !cooldown && readyIndexSet.has(index);
             const inFlightRequests = connectionRegistry.getQueueCountForAuth(index);
 
             return {
+                buildCooldown,
                 canonicalIndex,
                 cooldown,
                 hasContext,
@@ -1056,13 +1064,24 @@ class StatusRoutes {
                 isInvalid,
                 isReady,
                 isRotation,
+                modelQuotas:
+                    requestHandler.playground?.quota
+                        ?.snapshot(
+                            index,
+                            requestHandler.playground.catalog.models().map(model => model.name.replace(/^models\//, ""))
+                        )
+                        .map(quota => ({
+                            ...quota,
+                            scheduling: requestHandler.playground.weights.snapshot(quota.model, index),
+                        })) || [],
                 name,
             };
         });
 
-        const currentAuthIndex = authSource.isAccountCoolingDown?.(requestHandler.currentAuthIndex)
-            ? -1
-            : requestHandler.currentAuthIndex;
+        const currentAuthIndex =
+            !config.playgroundEnabled && authSource.isAccountCoolingDown?.(requestHandler.currentAuthIndex)
+                ? -1
+                : requestHandler.currentAuthIndex;
         const currentAccountName = accountNameMap.get(currentAuthIndex) || "N/A";
 
         const usageCount =
@@ -1080,9 +1099,11 @@ class StatusRoutes {
             logs: displayLogs.join("\n"),
             serverTime: Date.now(),
             status: {
+                accountConcurrency: rotationIndices.length,
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,
+                automaticAccountPool: config.playgroundEnabled === true,
                 browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
                 checkUpdate: config.checkUpdate,
                 currentAccountName,
@@ -1112,10 +1133,12 @@ class StatusRoutes {
                         models.map(model => model.name.replace(/^models\//, "")),
                     ])
                 ),
+                playgroundRuntime: requestHandler.playground?.runtimeSnapshot(),
                 rotationIndicesRaw: rotationIndices,
                 safetySettingsThreshold: config.safetySettingsThreshold,
                 streamingMode: config.streamingMode,
                 usageCount,
+                weightTimeZone: config.playgroundWeightTimeZone || "Asia/Singapore",
             },
         };
     }

@@ -79,6 +79,8 @@ function harness(t, extraConfig = {}) {
         modelList: [{ name: "models/gemini-3.8-flash" }, { name: "models/gemini-4-argon" }],
         playgroundCatalogPath: path.join(dir, "playground-models.json"),
         playgroundEnabled: true,
+        playgroundRetryBudgetMs: 1000,
+        playgroundRetryRounds: 1,
         playgroundModelList: [{ name: "models/gemini-4-argon" }],
         playgroundSettingsPath: path.join(dir, "settings.json"),
         retryDelay: 1,
@@ -431,7 +433,7 @@ test("Playground starts cold spare accounts after 429 or permission denial acros
                     assert.match(res.output, /ok/);
                     assert.deepEqual(tried, [0, 1, 2]);
                     assert.deepEqual(h.initialized, [1, 2]);
-                    assert.deepEqual(h.cooled, [0, 1], "cooling accounts are excluded from every channel");
+                    assert.deepEqual(h.cooled, [], "unclassified errors never cool the whole account");
                     assert.equal(h.handler.authSwitcher.usageCount, 9);
                     assert.equal(h.handler.authSwitcher.failureCount, 2);
                 });
@@ -442,7 +444,7 @@ test("Playground starts cold spare accounts after 429 or permission denial acros
 
 test("a fresh Playground request starts a spare when resident accounts are cooling", async t => {
     const h = coldPoolHarness(t);
-    h.handler.playground.fail("gemini-4-argon", 0, 429);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
     const tried = [];
     h.handler.playground.forward = (spec, index) => {
         tried.push(index);
@@ -456,13 +458,13 @@ test("a fresh Playground request starts a spare when resident accounts are cooli
     assert.deepEqual(h.initialized, [1]);
 });
 
-test("Playground skips denied cold spares and tries every eligible account only once", async t => {
+test("Playground skips quota-limited cold spares and tries every eligible account only once", async t => {
     const h = coldPoolHarness(t);
-    h.handler.playground.fail("gemini-4-argon", 1, 403);
+    h.handler.playground.fail("gemini-4-argon", 1, { status: 429, retryAfterMs: 60000 });
     const tried = [];
     h.handler.playground.forward = (spec, index) => {
         tried.push(index);
-        h.handler.playground.fail("gemini-4-argon", index, 429);
+        h.handler.playground.fail("gemini-4-argon", index, { status: 429, retryAfterMs: 60000 });
         h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue.enqueue({
             event_type: "error",
             message: "quota exhausted",
@@ -496,7 +498,7 @@ test("a Playground retry cannot take over a queue replaced during cold startup",
 
 test("concurrent Playground retries share a cold startup and reserve the resulting account", async t => {
     const h = coldPoolHarness(t, [0, 1]);
-    h.handler.playground.fail("gemini-4-argon", 0, 429);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
     let release;
     let started;
     const startup = new Promise(resolve => {
@@ -539,15 +541,15 @@ test("concurrent Playground retries share a cold startup and reserve the resulti
     }
 });
 
-test("Playground cooldown errors identify the account, model and original denial", t => {
+test("Playground cooldown errors identify the account, model and upstream quota limit", t => {
     const h = poolHarness(t);
-    h.handler.playground.fail("gemini-4-argon", 0, 403);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
     const error = h.handler.playground.coolingDownError("gemini-4-argon", 0);
     assert.equal(error.authIndex, 0);
-    assert.equal(error.status, 403);
-    assert.equal(error.upstreamStatus, 403);
+    assert.equal(error.status, 429);
+    assert.equal(error.upstreamStatus, 429);
     assert.ok(error.retryAfterMs > 0 && error.retryAfterMs <= 60000);
-    assert.match(error.message, /gemini-4-argon.*account #0.*403.*retry in/);
+    assert.match(error.message, /gemini-4-argon.*account #0.*429.*retry in/);
 });
 
 test("Build zero-quota 429 can reach a cold spare without cooling its other models", async t => {
@@ -617,13 +619,13 @@ test("all public Playground APIs preserve 403 when every account temporarily fai
                 assert.equal(res.statusCode, 403, res.output);
                 assert.deepEqual(tried, [0, 1]);
                 assert.deepEqual(h.handler.authSource.expiredIndices, []);
-                assert.ok(h.handler.authSource.getAccountCooldown(0).remainingMs <= 60000);
+                assert.equal(h.handler.authSource.getAccountCooldown(0), null);
             });
         }
     }
 });
 
-test("a Playground 429 shares account cooldown while preserving Build counters", async t => {
+test("a Playground 429 without quota evidence retries without cooldown while preserving Build counters", async t => {
     const h = poolHarness(t);
     const accounts = [];
     h.handler.playground.forward = (spec, authIndex) => {
@@ -639,15 +641,15 @@ test("a Playground 429 shares account cooldown while preserving Build counters",
     assert.equal(res.statusCode, 200, res.output);
     assert.equal(accounts.length, 2);
     assert.notEqual(accounts[0], accounts[1]);
-    assert.deepEqual(h.cooled, [0]);
-    assert.ok(h.switches.includes("rebalance"));
+    assert.deepEqual(h.cooled, []);
+    assert.equal(h.handler.playground.isCoolingDown("gemini-4-argon", 0), false);
     assert.equal(h.handler.authSwitcher.usageCount, 0);
     assert.equal(h.handler.authSwitcher.failureCount, 2);
     assert.equal(h.handler.needsSwitchingAfterRequest, false);
     assert.equal(h.build.length, 0, "no instruction reaches a Build page");
 });
 
-test("a Playground model access denial retries an eligible account and skips the denied one", async t => {
+test("a Playground model access denial retries an eligible account without globally disabling it", async t => {
     const h = poolHarness(t);
     h.handler.config.immediateSwitchStatusCodes = [429, 503];
     h.handler.config.streamingMode = "real";
@@ -672,18 +674,18 @@ test("a Playground model access denial retries an eligible account and skips the
         assert.equal(res.statusCode, 200, res.output);
         assert.match(res.output, /ok/);
     }
-    assert.deepEqual(accounts, [0, 1, 1]);
-    assert.deepEqual(h.cooled, [0]);
-    assert.ok(h.handler.authSource.isAccountCoolingDown(0));
+    assert.deepEqual(accounts, [0, 1, 1], "the next request prefers the account that did not return 403");
+    assert.deepEqual(h.cooled, []);
+    assert.equal(h.handler.authSource.isAccountCoolingDown(0), false);
 });
 
 test("a Playground 429 does not get masked by another account's existing cooldown", async t => {
     const h = poolHarness(t);
     const accounts = [];
-    h.handler.playground.fail("gemini-4-argon", 1, 403);
+    h.handler.playground.fail("gemini-4-argon", 1, { status: 429, retryAfterMs: 60000 });
     h.handler.playground.forward = (spec, authIndex) => {
         accounts.push(authIndex);
-        h.handler.playground.fail("gemini-4-argon", authIndex, 429);
+        h.handler.playground.fail("gemini-4-argon", authIndex, { status: 429, retryAfterMs: 60000 });
         h.handler.connectionRegistry.messageQueues
             .get(spec.request_id)
             .queue.enqueue({ event_type: "error", message: "Resource exhausted", status: 429 });
@@ -695,11 +697,11 @@ test("a Playground 429 does not get masked by another account's existing cooldow
     assert.equal(res.statusCode, 429, res.output);
     assert.deepEqual(accounts, [0]);
     assert.ok(h.handler.playground.isCoolingDown("gemini-4-argon", 0));
-    assert.deepEqual(h.cooled, [1, 0]);
-    assert.ok(h.switches.includes("rebalance"));
+    assert.deepEqual(h.cooled, []);
+    assert.equal(h.handler.playground.isCoolingDown("gemini-new", 0), false);
 });
 
-test("exhausted Playground accounts cool globally without incrementing Build failure counters", async t => {
+test("unavailable Playground accounts retry without quota cooldown without incrementing Build failure counters", async t => {
     const h = poolHarness(t);
     h.handler.config.immediateSwitchStatusCodes = [429, 503];
     h.handler.playground.forward = spec =>
@@ -711,8 +713,8 @@ test("exhausted Playground accounts cool globally without incrementing Build fai
     await h.handler.forRequest(req).processClaudeRequest(req, res);
     assert.equal(res.statusCode, 503);
     await new Promise(resolve => setImmediate(resolve));
-    assert.ok(h.switches.includes("rebalance"));
-    assert.deepEqual(h.cooled, [0, 1]);
+    assert.equal(h.handler.playground.isCoolingDown("gemini-4-argon", 0), false);
+    assert.deepEqual(h.cooled, []);
     assert.equal(h.handler.authSwitcher.failureCount, 0);
 });
 
@@ -784,8 +786,8 @@ test("a Playground tool request retries a 429 before output on another account",
     assert.equal(JSON.parse(res.output).choices[0].message.content, "前文，后文。");
     assert.equal(accounts.length, 2);
     assert.notEqual(accounts[0], accounts[1]);
-    assert.deepEqual(h.cooled, [0]);
-    assert.ok(h.switches.includes("rebalance"));
+    assert.deepEqual(h.cooled, []);
+    assert.equal(h.handler.playground.isCoolingDown("gemini-4-argon", 0), false);
     assert.equal(h.handler.authSwitcher.usageCount, 0);
     assert.equal(h.build.length, 0);
 });
@@ -908,15 +910,15 @@ test("an invalid API key is account-specific and keeps the normal retry", async 
     assert.equal(attempts, 2);
 });
 
-test("repeated Playground 403 failures keep a short cooldown without declaring membership invalid", t => {
+test("repeated Playground 403 failures never create a quota cooldown without declaring membership invalid", t => {
     let now = 1000;
     t.mock.method(Date, "now", () => now);
     const h = poolHarness(t);
     const transport = h.handler.playground;
     for (let i = 0; i < 9; i++) {
         transport.fail("gemini-4-argon", 0, 403);
-        assert.equal(transport.cooldownUntil("gemini-4-argon", 0) - now, 60000);
-        assert.equal(h.handler.authSource.getAccountCooldown(0).remainingMs, 60000);
+        assert.equal(transport.cooldownUntil("gemini-4-argon", 0), 0);
+        assert.equal(h.handler.authSource.getAccountCooldown(0), null);
     }
     assert.equal(h.handler.authSource.isExpired(0), false);
     assert.equal(h.handler.authSource.isAccountCoolingDown(1), false);
@@ -927,29 +929,29 @@ test("repeated Playground 403 failures keep a short cooldown without declaring m
 test("Playground dispatch skips accounts cooling down for the model, including when all are cooling", t => {
     const h = poolHarness(t);
     const transport = h.handler.playground;
-    transport.fail("gemini-4-argon", 0, 403);
+    transport.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
     const scope = h.handler.forRequest(apiRequest("openai", "pg-gemini-4-argon-high"));
     assert.equal(scope.playgroundModel, "gemini-4-argon");
     for (let i = 0; i < 4; i++) assert.equal(scope._selectDispatchAuthIndex(), 1);
-    // The same temporary account cooldown also excludes this account from other models.
+    // A different model remains available on both accounts.
     const other = h.handler.forRequest(apiRequest("openai", "pg-gemini-new"));
-    assert.deepEqual(new Set([0, 1, 2, 3].map(() => other._selectDispatchAuthIndex())), new Set([1]));
-    transport.fail("gemini-4-argon", 1, 429);
+    assert.deepEqual(new Set([0, 1, 2, 3].map(() => other._selectDispatchAuthIndex())), new Set([0, 1]));
+    transport.fail("gemini-4-argon", 1, { status: 429, retryAfterMs: 60000 });
     assert.throws(() => scope._selectDispatchAuthIndex(), { coolingDown: true });
     assert.equal(scope._selectDispatchAuthIndex([0, 1], { allowFallback: false }), -1);
 });
 
-test("all Playground accounts cooling after 503 return an error without dispatch", async t => {
+test("all Playground accounts with quota delays beyond the retry budget return an error without dispatch", async t => {
     const h = poolHarness(t);
-    h.handler.playground.fail("gemini-4-argon", 0, 503);
-    h.handler.playground.fail("gemini-4-argon", 1, 503);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
+    h.handler.playground.fail("gemini-4-argon", 1, { status: 429, retryAfterMs: 60000 });
     let sent = 0;
     h.handler.playground.forward = () => sent++;
     const res = new FakeResponse();
     await h.handler
         .forRequest(apiRequest("openai", "pg-gemini-4-argon"))
         .processOpenAIRequest(apiRequest("openai", "pg-gemini-4-argon"), res);
-    assert.equal(res.statusCode, 503, res.output);
+    assert.equal(res.statusCode, 429, res.output);
     assert.equal(sent, 0);
 });
 
@@ -1010,7 +1012,7 @@ test("an ordinary Build 429 still cools the account down", async t => {
     assert.deepEqual(h.cooled, [0]);
 });
 
-test("accounts cooling down for Build quota are also excluded from Playground", async t => {
+test("a Build cooldown does not disable Playground models on the same account", async t => {
     const h = poolHarness(t);
     h.handler.authSource.isAccountCoolingDown = () => true;
     h.handler.authSource.getRotationIndices = () => [0, 1];
@@ -1028,8 +1030,28 @@ test("accounts cooling down for Build quota are also excluded from Playground", 
     const req = apiRequest("openai", "pg-gemini-4-argon");
     const res = new FakeResponse();
     await h.handler.forRequest(req).processOpenAIRequest(req, res);
-    assert.equal(res.statusCode, 429, res.output);
-    assert.equal(served, 0);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(served, 1);
+});
+
+test("N distinct accounts reserve N concurrent slots and overflow queues within those accounts", async t => {
+    const h = coldPoolHarness(t, [0, 1, 2, 3]);
+    h.handler.config.maxContexts = 0;
+    for (const index of [1, 2, 3]) h.ready.add(index);
+    h.handler.browserManager.contexts = new Map([0, 1, 2, 3].map(index => [index, {}]));
+    const scope = h.handler.forRequest(apiRequest("openai", "pg-gemini-4-argon"));
+    const slots = await Promise.all(
+        [0, 1, 2, 3].map(index => scope._acquireDispatchAuthIndex(`lane-${index}`, new FakeResponse()))
+    );
+    assert.equal(new Set(slots).size, 4);
+    slots.forEach((index, slot) => scope.connectionRegistry.createMessageQueue(`lane-${slot}`, index));
+    const overflow = await scope._acquireDispatchAuthIndex("overflow", new FakeResponse());
+    assert.ok(slots.includes(overflow));
+    assert.deepEqual(h.initialized, []);
+    scope.connectionRegistry.createMessageQueue("overflow", overflow);
+    for (const id of ["lane-0", "lane-1", "lane-2", "lane-3", "overflow"])
+        h.handler.connectionRegistry.removeMessageQueue(id);
+    assert.equal(h.handler.playground.scheduler.reservations.size, 0);
 });
 
 function failingPool(t, accounts, respond) {
@@ -1563,4 +1585,144 @@ test("native Gemini requests are tracked under their public channel name", t => 
         ),
         "build-gemini-4-argon-抗截断"
     );
+});
+
+test("generic 403 succeeds on a later retry round across all public APIs without cooling accounts", async t => {
+    for (const api of Object.keys(processors))
+        for (const mode of ["fake", "real"]) {
+            await t.test(`${api} ${mode}`, async t => {
+                const h = poolHarness(t);
+                Object.assign(h.handler.config, { playgroundRetryRounds: 3, streamingMode: mode });
+                const tried = [];
+                h.handler.playground.forward = (spec, index) => {
+                    tried.push(index);
+                    const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+                    if (tried.length <= 2)
+                        return queue.enqueue({
+                            event_type: "error",
+                            status: 403,
+                            message: "The caller does not have permission",
+                        });
+                    queue.enqueue({ event_type: "response_headers", status: 200 });
+                    queue.enqueue({
+                        event_type: "chunk",
+                        data: mode === "real" ? `data: ${JSON.stringify(reply)}\n\n` : JSON.stringify(reply),
+                    });
+                    queue.enqueue({ type: "STREAM_END" });
+                };
+                const req = apiRequest(api, "pg-gemini-4-argon");
+                req.body.stream = true;
+                if (api === "gemini" && mode === "real")
+                    req.path = req.path.replace(":generateContent", ":streamGenerateContent");
+                const res = new FakeResponse();
+                await h.handler.forRequest(req)[processors[api]](req, res);
+                assert.equal(res.statusCode, 200, res.output);
+                assert.deepEqual(tried, [0, 1, 0]);
+                assert.deepEqual(h.cooled, []);
+                assert.equal(h.handler.playground.isCoolingDown("gemini-4-argon", 0), false);
+            });
+        }
+});
+
+test("persistent unknown 429 stops at the configured round limit without quota cooldown", async t => {
+    const h = poolHarness(t);
+    h.handler.config.playgroundRetryRounds = 2;
+    const tried = [];
+    h.handler.playground.forward = (spec, index) => {
+        tried.push(index);
+        h.handler.connectionRegistry.messageQueues
+            .get(spec.request_id)
+            .queue.enqueue({ event_type: "error", status: 429, message: "Resource exhausted" });
+    };
+    const req = apiRequest("openai", "pg-gemini-4-argon");
+    const res = new FakeResponse();
+    await h.handler.forRequest(req).processOpenAIRequest(req, res);
+    assert.deepEqual(tried, [0, 1, 0, 1]);
+    assert.equal(res.statusCode, 429);
+    assert.equal(h.handler.playground.isCoolingDown("gemini-4-argon", 0), false);
+});
+
+test("a short confirmed quota wait is retried automatically and cancellation stops backoff", async t => {
+    const h = poolHarness(t);
+    Object.assign(h.handler.config, { playgroundRetryRounds: 3, retryDelay: 5 });
+    let calls = 0;
+    h.handler.playground.forward = spec => {
+        calls++;
+        const queue = h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue;
+        if (calls <= 2) queue.enqueue({ event_type: "error", status: 429, retryAfterMs: 15, message: "rate limit" });
+        else answer(queue);
+    };
+    const req = apiRequest("openai", "pg-gemini-4-argon");
+    const res = new FakeResponse();
+    await h.handler.forRequest(req).processOpenAIRequest(req, res);
+    assert.equal(res.statusCode, 200, res.output);
+    assert.equal(calls, 3);
+    const scope = h.handler.forRequest(req);
+    const queue = scope.connectionRegistry.createMessageQueue("cancel-backoff", 0);
+    const tracker = scope._createImmediateSwitchTracker(0);
+    tracker.attemptedAuthIndices.add(1);
+    h.handler.config.retryDelay = 100;
+    const retry = scope._prepareImmediateStatusRetry({ status: 403 }, "cancel-backoff", tracker, 0);
+    setTimeout(() => queue.close("client_disconnect"), 5);
+    assert.equal(await retry, false);
+    assert.equal(tracker.nextAuthIndex, null);
+    h.handler.connectionRegistry.removeMessageQueue("cancel-backoff");
+});
+
+test("sequential requests rotate the whole pool and reuse each account for other models", async t => {
+    const h = coldPoolHarness(t);
+    const served = [];
+    h.handler.playground.forward = (spec, index) => {
+        served.push(index);
+        answer(h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue);
+    };
+    for (let i = 0; i < 6; i++) {
+        const req = apiRequest("openai", "pg-gemini-4-argon");
+        await h.handler.forRequest(req).processOpenAIRequest(req, new FakeResponse());
+    }
+    assert.deepEqual(served, [0, 1, 2, 0, 1, 2]);
+    h.handler.playground.fail("gemini-4-argon", 0, { status: 429, retryAfterMs: 60000 });
+    const req = apiRequest("openai", "pg-gemini-3.8-flash");
+    await h.handler.forRequest(req).processOpenAIRequest(req, new FakeResponse());
+    assert.equal(served.at(-1), 0);
+});
+
+test("dispatch reserves concurrent slots and does not start a third busy context", async t => {
+    const h = coldPoolHarness(t);
+    h.handler.config.maxContexts = 2;
+    h.ready.add(1);
+    h.handler.browserManager.contexts = new Map([
+        [0, {}],
+        [1, {}],
+    ]);
+    const scope = h.handler.forRequest(apiRequest("openai", "pg-gemini-4-argon"));
+    const [first, second] = await Promise.all([
+        scope._acquireDispatchAuthIndex("slot-a", new FakeResponse()),
+        scope._acquireDispatchAuthIndex("slot-b", new FakeResponse()),
+    ]);
+    assert.notEqual(first, second);
+    scope.connectionRegistry.createMessageQueue("slot-a", first);
+    scope.connectionRegistry.createMessageQueue("slot-b", second);
+    const third = await scope._acquireDispatchAuthIndex("slot-c", new FakeResponse());
+    assert.ok([first, second].includes(third));
+    assert.deepEqual(h.initialized, []);
+    scope.connectionRegistry.createMessageQueue("slot-c", third);
+    for (const id of ["slot-a", "slot-b", "slot-c"]) h.handler.connectionRegistry.removeMessageQueue(id);
+    assert.equal(h.handler.playground.scheduler.reservations.size, 0);
+});
+
+test("equally unused warm slots run first, then cold accounts join the fair rotation", async t => {
+    const h = coldPoolHarness(t);
+    h.ready.add(2);
+    const tried = [];
+    h.handler.playground.forward = (spec, index) => {
+        tried.push(index);
+        answer(h.handler.connectionRegistry.messageQueues.get(spec.request_id).queue);
+    };
+    for (let i = 0; i < 3; i++) {
+        const req = apiRequest("openai", "pg-gemini-4-argon");
+        await h.handler.forRequest(req).processOpenAIRequest(req, new FakeResponse());
+    }
+    assert.deepEqual(tried, [0, 2, 1]);
+    assert.deepEqual(h.initialized, [1]);
 });

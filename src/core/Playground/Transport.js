@@ -1,10 +1,12 @@
-const crypto = require("crypto");
 const AntiTruncation = require("../AntiTruncation");
 const ModelChannel = require("../ModelChannel");
 const PlaygroundCatalog = require("./Catalog");
 const PlaygroundSession = require("./Session");
 const PlaygroundSettings = require("./Settings");
 const PlaygroundDiagnostics = require("./Diagnostics");
+const { PlaygroundQuota } = require("./Quota");
+const PlaygroundScheduler = require("./Scheduler");
+const PlaygroundWeights = require("./Weights");
 const { WireCodec, WireStream } = require("./WireCodec");
 const { DEFAULT_TIMEOUTS } = require("../RequestHandler/constants");
 
@@ -23,12 +25,25 @@ class PlaygroundTransport {
     constructor(handler) {
         this.handler = handler;
         this.sessions = new WeakMap();
-        this.cooldowns = new Map();
+        this.quota = new PlaygroundQuota(handler);
+        this.cooldowns = this.quota.cooldowns;
+        this.weights = new PlaygroundWeights(handler.authSource, handler.config.playgroundWeightTimeZone);
+        this.scheduler = new PlaygroundScheduler(handler);
         this.catalog = new PlaygroundCatalog(handler.config, handler.logger);
         this.settings = new PlaygroundSettings(handler.config, handler.logger);
     }
     get enabled() {
         return !!this.handler.config.playgroundEnabled;
+    }
+    runtimeSnapshot() {
+        let generationPages = 0;
+        let pendingRequests = 0;
+        for (const { context } of this.handler.browserManager.contexts?.values() || []) {
+            const session = this.sessions.get(context);
+            if (session?.page && !session.page.isClosed()) generationPages++;
+            pendingRequests += session?.pendingCount || 0;
+        }
+        return { generationPages, idlePageMs: this.handler.config.playgroundPageIdleMs || 60000, pendingRequests };
     }
     /** Upstream models plus preset and anti-truncation aliases. */
     models() {
@@ -55,11 +70,7 @@ class PlaygroundTransport {
         return [...models, ...aliases, ...presets];
     }
     cooldownKey(model, authIndex) {
-        const name = this.handler.authSource?.accountNameMap?.get(authIndex);
-        // Duplicate auth files of one email share a cooldown; other accounts are unaffected.
-        const identity =
-            typeof name === "string" && name.includes("@") ? name.trim().toLowerCase() : `index:${authIndex}`;
-        return crypto.createHash("sha256").update(`${identity}\n${model}`).digest("hex");
+        return this.quota.key(model, authIndex);
     }
     cooldownUntil(model, authIndex) {
         return this.cooldowns.get(this.cooldownKey(model, authIndex))?.until || 0;
@@ -84,16 +95,10 @@ class PlaygroundTransport {
             }
         );
     }
-    fail(model, authIndex, status) {
-        if (![401, 403, 429, 502, 503, 504].includes(status)) return;
-        const key = this.cooldownKey(model, authIndex);
-        const previous = this.cooldowns.get(key);
-        // A generic 403 is not proof of a missing membership. Treat it as a transient failure,
-        // with the same bounded cooldown as rate limits, and never mark the auth as expired.
-        const ms = this.handler.config.rateLimitCooldownMs || 60000;
-        const until = Math.max(previous?.until || 0, Date.now() + ms);
-        this.cooldowns.set(key, { status, until });
-        this.handler.authSource?.markAccountCoolingDown?.(authIndex, ms, status, { channel: "playground", model });
+    fail(model, authIndex, error) {
+        const failure = typeof error === "number" ? { status: error } : error;
+        this.weights.fail(model, authIndex, failure);
+        return this.quota.fail(model, authIndex, failure);
     }
 
     /** Enforce only the caller's explicit forced function selection; AUTO remains model-directed. */
@@ -238,7 +243,7 @@ class PlaygroundTransport {
                     ([401, 403].includes(currentCooldown.status) && ![401, 403].includes(status)))
             )
                 return;
-            this.fail(model, authIndex, status);
+            this.fail(model, authIndex, { ...error, message: error.message, status });
         };
         const realStream = spec.streaming_mode === "real" && spec.path.endsWith(":streamGenerateContent");
         // Speech streams dozens of short PCM parts that clients cannot play one by one (each becomes
@@ -264,7 +269,9 @@ class PlaygroundTransport {
             if (!context) throw Object.assign(new Error("Playground account context is unavailable"), { status: 503 });
             let session = this.sessions.get(context);
             if (!session) {
-                session = new PlaygroundSession(context, raw => this.catalog.discover(raw));
+                session = new PlaygroundSession(context, raw => this.catalog.discover(raw), {
+                    idleMs: this.handler.config.playgroundPageIdleMs,
+                });
                 this.sessions.set(context, session);
             }
             const request = this.settings.apply(JSON.parse(spec.body), model, {
@@ -300,13 +307,17 @@ class PlaygroundTransport {
                 }
             });
             this.handler.logger.info(`[Playground] ${model} (account #${authIndex}).`);
+            let attemptRecorded = false;
             await session.request(model, request, {
                 beforeStart: () => {
-                    const accountCooldown = this.handler._accountCooldownError?.(authIndex);
-                    if (accountCooldown) throw accountCooldown;
                     const coolingDown = this.coolingDownError(model, authIndex);
                     if (coolingDown) throw coolingDown;
                     cooldownAtStart = this.cooldowns.get(cooldownKey);
+                    if (!attemptRecorded) {
+                        this.quota.start(model, authIndex);
+                        this.weights.start(model, authIndex);
+                    }
+                    attemptRecorded = true;
                 },
                 onData: value => {
                     if (!active() || typeof value !== "string") return;
@@ -329,6 +340,8 @@ class PlaygroundTransport {
             }
             if (hasClientTools) this._validateRequiredToolCalls(request, merged);
             if (this.cooldowns.get(cooldownKey) === cooldownAtStart) this.cooldowns.delete(cooldownKey);
+            this.quota.success(model, authIndex, diagnostics.response.usage);
+            this.weights.success(model, authIndex, diagnostics.response.usage);
             if (!progressive) {
                 headers();
                 const body = JSON.stringify(WireCodec.joinAudio(merged));
@@ -351,6 +364,7 @@ class PlaygroundTransport {
                 entry.requestAttemptId === spec.request_attempt_id
             ) {
                 queue.enqueue({
+                    accessDenied: error.accessDenied === true,
                     accountBusy: queuedTimeout,
                     coolingDown: error.coolingDown === true,
                     event_type: "error",
@@ -359,7 +373,10 @@ class PlaygroundTransport {
                         : timedOut
                           ? "Playground request timed out"
                           : error.message,
+                    quotaRecorded: failureRecorded,
                     retryable: outputStarted ? false : queuedTimeout ? undefined : error.retryable,
+                    retryAfter: error.retryAfter,
+                    retryAfterMs: error.retryAfterMs,
                     status: queuedTimeout ? 503 : timedOut ? 504 : upstreamStatus,
                     upstreamStatus: timedOut ? 504 : error.upstreamStatus || upstreamStatus,
                 });
@@ -368,18 +385,6 @@ class PlaygroundTransport {
             clearTimeout(timer);
             queue.removeListener("close", abort);
             if (entry.playgroundAbort === controller) delete entry.playgroundAbort;
-            if (outputStarted && this.handler.authSource?.isAccountCoolingDown?.(authIndex)) {
-                // Delivered content cannot be replayed, but future requests still need a healthy account.
-                if (authIndex === this.handler.currentAuthIndex && !this.handler.authSwitcher.isSystemBusy) {
-                    this.handler.authSwitcher
-                        .switchToNextAuth({ excludeIndices: [authIndex], resetCounters: false })
-                        .catch(error => this.handler.logger.warn(error.message));
-                } else {
-                    this.handler.browserManager
-                        .rebalanceContextPool?.()
-                        .catch(error => this.handler.logger.warn(error.message));
-                }
-            }
         }
     }
 }

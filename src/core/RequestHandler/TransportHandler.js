@@ -201,7 +201,11 @@ class TransportHandler extends RequestHandler {
 
     _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
         // Another concurrent request may have cooled this account after its queue was reserved.
-        const cooldown = this._accountCooldownError(authIndex);
+        const model = this.playgroundModel || proxyRequest.path?.match(/\/models\/([^/:]+)/)?.[1];
+        const cooldown =
+            proxyRequest.channel === "playground"
+                ? this.playground.coolingDownError(AntiTruncation.baseModel(model) || model, authIndex)
+                : this._accountCooldownError(authIndex);
         if (cooldown) {
             const entry = this.connectionRegistry.messageQueues.get(proxyRequest.request_id);
             if (entry && entry.requestAttemptId === (proxyRequest.request_attempt_id ?? null)) {
