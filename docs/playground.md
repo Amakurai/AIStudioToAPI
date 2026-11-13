@@ -20,7 +20,7 @@
 
 ## 预设模型
 
-聊天模型新增 `-预设` 别名，默认提供 `pg-gemini-4-argon-预设` 和 `pg-gemini-3.8-flash-预设`，无需等待 Playground 页面发现模型即可从模型列表选择。后缀放在最后，例如 `pg-gemini-4-argon-high-fake-search-预设`。
+聊天模型新增 `-预设` 别名，默认提供 `pg-gemini-4-hydrogen-预设`、`pg-gemini-4-argon-预设` 和 `pg-gemini-3.8-flash-预设`，无需等待 Playground 页面发现模型即可从模型列表选择。Gemini 4 Hydrogen 的原版模型名为 `pg-gemini-4-hydrogen`，两种版本使用同一个上游模型。后缀放在最后，例如 `pg-gemini-4-hydrogen-high-fake-search-预设`。
 
 - 纯文本请求在客户端请求流式时使用真流式，即使全局设置或 `-fake` 后缀指定假流式；省略 `stream` 或传 `stream: false` 时返回普通 JSON。
 - 带自定义工具的请求等待本轮完整生成后再返回，生成期间不提前发送正文、思考或工具参数。`stream: true` 仍按客户端的 SSE 协议一次性发送完整结果，非流式返回 JSON。
